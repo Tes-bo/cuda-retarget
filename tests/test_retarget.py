@@ -28,8 +28,12 @@ from cuda_retarget.dialect import (
     PACKED_ABS_HELPERS,
     PACKED_HELPERS,
     PACKED_MINMAX_HELPERS,
+    BIT_HELPERS,
+    MUL24_HELPERS,
+    PACKED_AVG_HELPERS,
     PACKED_CMP_HELPERS,
     PACKED_SAD_HELPERS,
+    PACKED_SET_HELPERS,
     VOTE_HELPERS,
 )
 from cuda_retarget.translate import TranslateError, translate_path, translate_source
@@ -494,6 +498,95 @@ __global__ void compare(unsigned* out) {
             self.assertIn("0xffu", translated)
         self.assertEqual(translate_source(source, "maca"), source)
 
+    def test_hip_and_musa_lower_lane_predicates(self) -> None:
+        source = """\
+#include <cuda_runtime.h>
+__global__ void compare(unsigned* out) {
+    const char* label = "__vsetgts2";
+    unsigned a = 0x1234aba5u;
+    unsigned b = 0x1234aba6u;
+    unsigned t = 0x7FFF0000u;
+    out[0] = __vsetgts2(__vseteq2(a, b), t);
+    out[1] = __vsetgtu4(0x8001807Fu, 0x7F017F00u);
+    out[2] = label[0];
+}
+"""
+        for target in ("hip", "musa"):
+            translated = translate_source(source, target)
+            self.assertIn('"__vsetgts2"', translated)
+            self.assertIn("cts_vsetgts2(cts_vseteq2(a, b), t)", translated)
+            self.assertIn("cts_vsetgtu4(0x8001807Fu, 0x7F017F00u)", translated)
+            self.assertNotIn("__vsetgts2(", translated)
+            self.assertNotIn("__vseteq2(", translated)
+            self.assertIn("1u <<", translated)
+        self.assertEqual(translate_source(source, "maca"), source)
+
+    def test_hip_and_musa_lower_packed_averages(self) -> None:
+        source = """\
+#include <cuda_runtime.h>
+__global__ void average(unsigned* out) {
+    const char* label = "__vavgs2";
+    out[0] = __vavgs2(__vhaddu2(0x00010001u, 0x00020002u), 0u);
+    out[1] = __vavgu2(0xFFFFFFFFu, 0x00010001u);
+    out[2] = label[0];
+}
+"""
+        for target in ("hip", "musa"):
+            translated = translate_source(source, target)
+            self.assertIn('"__vavgs2"', translated)
+            self.assertIn("cts_vavgs2(cts_vhaddu2(0x00010001u, 0x00020002u), 0u)", translated)
+            self.assertIn("cts_vavgu2(0xFFFFFFFFu, 0x00010001u)", translated)
+            self.assertNotIn("__vavgs2(", translated)
+            self.assertNotIn("__vhaddu2(", translated)
+            self.assertIn("sum < 0", translated)
+            self.assertIn("(aa | bb)", translated)
+        self.assertEqual(translate_source(source, "maca"), source)
+
+    def test_hip_and_musa_lower_bit_scans(self) -> None:
+        source = """\
+#include <cuda_runtime.h>
+__global__ void bits(int* s, unsigned* u, unsigned long long* z) {
+    const char* label = "__clz";
+    *s = __clz(__ffs(0));
+    *s += __clzll(0);
+    *u = __brev(1u);
+    *z = __brevll(1ull);
+    *s += label[0];
+}
+"""
+        for target in ("hip", "musa"):
+            translated = translate_source(source, target)
+            self.assertIn('"__clz"', translated)
+            self.assertIn("cts_clz(cts_ffs(0))", translated)
+            self.assertIn("cts_clzll(0)", translated)
+            self.assertIn("cts_brev(1u)", translated)
+            self.assertIn("cts_brevll(1ull)", translated)
+            self.assertNotIn("__clz(", translated)
+            self.assertNotIn("__clzll(", translated)
+            self.assertNotIn("__brev(", translated)
+        self.assertEqual(translate_source(source, "maca"), source)
+
+    def test_hip_and_musa_lower_mul24(self) -> None:
+        source = """\
+#include <cuda_runtime.h>
+__global__ void product(int* s, unsigned* u) {
+    const char* label = "__mul24";
+    *s = __mul24(__mul24((int)0xFF000001, 2), 1);
+    *u = __umul24(0xFF800000u, 2u);
+    *s += label[0];
+}
+"""
+        for target in ("hip", "musa"):
+            translated = translate_source(source, target)
+            self.assertIn('"__mul24"', translated)
+            self.assertIn("cts_mul24(cts_mul24((int)0xFF000001, 2), 1)", translated)
+            self.assertIn("cts_umul24(0xFF800000u, 2u)", translated)
+            self.assertNotIn("__mul24(", translated)
+            self.assertNotIn("__umul24(", translated)
+            self.assertIn("0x800000", translated)
+            self.assertIn("0xffffffu", translated)
+        self.assertEqual(translate_source(source, "maca"), source)
+
     def test_unparsed_source_is_refused(self) -> None:
         with self.assertRaises(TranslateError):
             translate_source("int main( {\n", "hip", filename="broken.cu")
@@ -735,6 +828,84 @@ class CorpusTests(unittest.TestCase):
             self.assertEqual(translated.count("cts_vcmpgts2("), 2)
         self.assertIn("__vcmpgts2", maca)
         self.assertNotIn("cts_vcmpgts2", maca)
+
+    def test_hip_and_musa_lower_the_census_packed_set(self) -> None:
+        path = CENSUS / "packed_set" / "main.cu"
+        if not path.is_file():
+            self.skipTest("packed_set is not in the census corpus")
+        hip = translate_path(path, "hip")
+        musa = translate_path(path, "musa")
+        maca = translate_path(path, "maca")
+        for translated in (hip, musa):
+            self.assertIn("cts_vseteq2(0x1234aba5u, 0x1234aba6u)", translated)
+            self.assertIn("cts_vsetne2(0x1234aba5u, 0x1234aba6u)", translated)
+            self.assertIn("cts_vsetgts2(s, t)", translated)
+            self.assertIn("cts_vsetgtu2(s, t)", translated)
+            self.assertIn("cts_vsetgts4(c, d)", translated)
+            self.assertIn("cts_vsetgtu4(c, d)", translated)
+            self.assertNotIn("__vseteq2(", translated)
+            self.assertEqual(translated.count("cts_vsetgts2("), 2)
+        self.assertIn("__vsetgts2", maca)
+        self.assertNotIn("cts_vsetgts2", maca)
+
+    def test_hip_and_musa_lower_the_census_packed_avg(self) -> None:
+        path = CENSUS / "packed_avg" / "main.cu"
+        if not path.is_file():
+            self.skipTest("packed_avg is not in the census corpus")
+        hip = translate_path(path, "hip")
+        musa = translate_path(path, "musa")
+        maca = translate_path(path, "maca")
+        for translated in (hip, musa):
+            self.assertIn("cts_vavgs2(0x00010001u, 0x00020002u)", translated)
+            self.assertIn("cts_vavgs2(0xFFFDFFFEu, 0xFFFEFFFDu)", translated)
+            self.assertIn("cts_vavgs2(0x80008000u, 0x80008000u)", translated)
+            self.assertIn("cts_vavgu2(0x00010001u, 0x00020002u)", translated)
+            self.assertIn("cts_vhaddu2(0xFFFFFFFFu, 0x00010001u)", translated)
+            self.assertNotIn("__vavgs2(", translated)
+            self.assertEqual(translated.count("cts_vavgs2("), 4)
+        self.assertIn("__vavgs2", maca)
+        self.assertNotIn("cts_vavgs2", maca)
+
+    def test_hip_and_musa_lower_the_census_bit_scan(self) -> None:
+        path = CENSUS / "bit_scan" / "main.cu"
+        if not path.is_file():
+            self.skipTest("bit_scan is not in the census corpus")
+        hip = translate_path(path, "hip")
+        musa = translate_path(path, "musa")
+        maca = translate_path(path, "maca")
+        for translated in (hip, musa):
+            self.assertIn("cts_clz(0)", translated)
+            self.assertIn("cts_clz((int)0x80000000)", translated)
+            self.assertIn("cts_ffs(0)", translated)
+            self.assertIn("cts_ffs((int)0x80000000)", translated)
+            self.assertIn("cts_clzll(0)", translated)
+            self.assertIn("cts_popc(0xffffffffu)", translated)
+            self.assertIn("cts_brev(1u)", translated)
+            self.assertIn("cts_brevll(1ull)", translated)
+            self.assertNotIn("__clz(", translated)
+            self.assertNotIn("__clzll(", translated)
+            self.assertEqual(translated.count("cts_clz("), 3)
+        self.assertIn("__clz", maca)
+        self.assertNotIn("cts_clz", maca)
+
+    def test_hip_and_musa_lower_the_census_mul24(self) -> None:
+        path = CENSUS / "mul24" / "main.cu"
+        if not path.is_file():
+            self.skipTest("mul24 is not in the census corpus")
+        hip = translate_path(path, "hip")
+        musa = translate_path(path, "musa")
+        maca = translate_path(path, "maca")
+        for translated in (hip, musa):
+            self.assertIn("cts_mul24((int)0xFF000001, 2)", translated)
+            self.assertIn("cts_mul24((int)0x00800000, 1)", translated)
+            self.assertIn("cts_mul24((int)0x00FFFFFF, (int)0x00FFFFFF)", translated)
+            self.assertIn("cts_mul24((int)0x00800000, (int)0x00800000)", translated)
+            self.assertIn("cts_umul24(0x00FFFFFFu, 0x00FFFFFFu)", translated)
+            self.assertIn("cts_umul24(0xFF800000u, 2u)", translated)
+            self.assertNotIn("__mul24(", translated)
+            self.assertEqual(translated.count("cts_mul24("), 5)
+        self.assertIn("__mul24", maca)
+        self.assertNotIn("cts_mul24", maca)
 
     def test_only_hip_pins_warp_size(self) -> None:
         path = CENSUS / "warp_size" / "main.cu"
@@ -1815,6 +1986,191 @@ int main() {{
             )
         self.assertEqual(ran.returncode, 0, ran.stderr)
         self.assertEqual(ran.stdout.strip(), "mismatch=0")
+
+    def _nvcc_mismatch(self, name: str, source: str) -> None:
+        nvcc = shutil.which("nvcc")
+        if nvcc is None:
+            self.skipTest("nvcc is not installed")
+        device = _idle_gpu()
+        if device is None:
+            self.skipTest("every GPU has a compute process")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / f"{name}.cu"
+            binary = Path(directory) / name
+            path.write_text(source, encoding="utf-8")
+            env = {**os.environ, "CUDA_VISIBLE_DEVICES": device}
+            compiled = subprocess.run(
+                [nvcc, "-arch=native", str(path), "-o", str(binary)],
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+            )
+            if compiled.returncode != 0:
+                self.fail(compiled.stderr)
+            ran = subprocess.run(
+                [str(binary)],
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+            )
+        self.assertEqual(ran.returncode, 0, ran.stderr)
+        self.assertEqual(ran.stdout.strip(), "mismatch=0")
+
+    def test_lane_predicate_helpers_agree_with_the_intrinsics(self) -> None:
+        helpers = "\n".join(helper.strip("\n") for _name, helper in PACKED_SET_HELPERS.values())
+        checks = []
+        for intrinsic, (name, _helper) in PACKED_SET_HELPERS.items():
+            for left, right in (("a", "b"), ("s", "t"), ("c", "d"), ("s", "s")):
+                checks.append(
+                    f"if ({intrinsic}({left}, {right}) != {name}({left}, {right})) atomicExch(bad, 1);"
+                )
+        body = "\n    ".join(checks)
+        self._nvcc_mismatch(
+            "pset",
+            f"""\
+#include <cstdio>
+#include <cuda_runtime.h>
+{helpers}
+__global__ void compare(int* bad) {{
+    unsigned a = 0x1234aba5u;
+    unsigned b = 0x1234aba6u;
+    unsigned s = 0x80000001u;
+    unsigned t = 0x7FFF0000u;
+    unsigned c = 0x8001807Fu;
+    unsigned d = 0x7F017F00u;
+    {body}
+}}
+int main() {{
+    int* bad = nullptr;
+    if (cudaMalloc(&bad, sizeof(*bad)) != cudaSuccess) return 2;
+    if (cudaMemset(bad, 0, sizeof(*bad)) != cudaSuccess) return 2;
+    compare<<<1, 1>>>(bad);
+    if (cudaDeviceSynchronize() != cudaSuccess) return 3;
+    int mismatch = 0;
+    if (cudaMemcpy(&mismatch, bad, sizeof(mismatch), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
+    std::printf("mismatch=%d\\n", mismatch);
+    cudaFree(bad);
+    return 0;
+}}
+""",
+        )
+
+    def test_packed_average_helpers_agree_with_the_intrinsics(self) -> None:
+        helpers = "\n".join(helper.strip("\n") for _name, helper in PACKED_AVG_HELPERS.values())
+        self._nvcc_mismatch(
+            "pavg",
+            f"""\
+#include <cstdio>
+#include <cuda_runtime.h>
+{helpers}
+__global__ void compare(int* bad) {{
+    if (__vavgs2(0x00010001u, 0x00020002u) != cts_vavgs2(0x00010001u, 0x00020002u)) atomicExch(bad, 1);
+    if (__vavgs2(0xFFFDFFFEu, 0xFFFEFFFDu) != cts_vavgs2(0xFFFDFFFEu, 0xFFFEFFFDu)) atomicExch(bad, 1);
+    if (__vavgs2(0x80008000u, 0x80008000u) != cts_vavgs2(0x80008000u, 0x80008000u)) atomicExch(bad, 1);
+    if (__vavgs2(0x80007FFFu, 0x7FFF8000u) != cts_vavgs2(0x80007FFFu, 0x7FFF8000u)) atomicExch(bad, 1);
+    if (__vavgu2(0x00010001u, 0x00020002u) != cts_vavgu2(0x00010001u, 0x00020002u)) atomicExch(bad, 1);
+    if (__vhaddu2(0x00010001u, 0x00020002u) != cts_vhaddu2(0x00010001u, 0x00020002u)) atomicExch(bad, 1);
+    if (__vhaddu2(0xFFFFFFFFu, 0x00010001u) != cts_vhaddu2(0xFFFFFFFFu, 0x00010001u)) atomicExch(bad, 1);
+    if (__vavgs4(0xFEFDFEFDu, 0xFDFEFDFEu) != cts_vavgs4(0xFEFDFEFDu, 0xFDFEFDFEu)) atomicExch(bad, 1);
+    if (__vavgs4(0x80808080u, 0x80808080u) != cts_vavgs4(0x80808080u, 0x80808080u)) atomicExch(bad, 1);
+    if (__vavgu4(0x01010101u, 0x02020202u) != cts_vavgu4(0x01010101u, 0x02020202u)) atomicExch(bad, 1);
+    if (__vhaddu4(0xFFFFFFFFu, 0x01010101u) != cts_vhaddu4(0xFFFFFFFFu, 0x01010101u)) atomicExch(bad, 1);
+}}
+int main() {{
+    int* bad = nullptr;
+    if (cudaMalloc(&bad, sizeof(*bad)) != cudaSuccess) return 2;
+    if (cudaMemset(bad, 0, sizeof(*bad)) != cudaSuccess) return 2;
+    compare<<<1, 1>>>(bad);
+    if (cudaDeviceSynchronize() != cudaSuccess) return 3;
+    int mismatch = 0;
+    if (cudaMemcpy(&mismatch, bad, sizeof(mismatch), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
+    std::printf("mismatch=%d\\n", mismatch);
+    cudaFree(bad);
+    return 0;
+}}
+""",
+        )
+
+    def test_bit_scan_helpers_agree_with_the_intrinsics(self) -> None:
+        helpers = "\n".join(helper.strip("\n") for _name, helper in BIT_HELPERS.values())
+        self._nvcc_mismatch(
+            "bits",
+            f"""\
+#include <cstdio>
+#include <cuda_runtime.h>
+{helpers}
+__global__ void compare(int* bad) {{
+    long long m = (long long)0x8000000000000000ull;
+    if (__clz(0) != cts_clz(0)) atomicExch(bad, 1);
+    if (__clz(1) != cts_clz(1)) atomicExch(bad, 1);
+    if (__clz((int)0x80000000) != cts_clz((int)0x80000000)) atomicExch(bad, 1);
+    if (__clz(-1) != cts_clz(-1)) atomicExch(bad, 1);
+    if (__clzll(0) != cts_clzll(0)) atomicExch(bad, 1);
+    if (__clzll(1) != cts_clzll(1)) atomicExch(bad, 1);
+    if (__clzll(m) != cts_clzll(m)) atomicExch(bad, 1);
+    if (__ffs(0) != cts_ffs(0)) atomicExch(bad, 1);
+    if (__ffs(1) != cts_ffs(1)) atomicExch(bad, 1);
+    if (__ffs((int)0x80000000) != cts_ffs((int)0x80000000)) atomicExch(bad, 1);
+    if (__ffs(-1) != cts_ffs(-1)) atomicExch(bad, 1);
+    if (__ffsll(0) != cts_ffsll(0)) atomicExch(bad, 1);
+    if (__ffsll(m) != cts_ffsll(m)) atomicExch(bad, 1);
+    if (__popc(0xffffffffu) != cts_popc(0xffffffffu)) atomicExch(bad, 1);
+    if (__popc(0) != cts_popc(0)) atomicExch(bad, 1);
+    if (__popcll(~0ull) != cts_popcll(~0ull)) atomicExch(bad, 1);
+    if (__brev(1u) != cts_brev(1u)) atomicExch(bad, 1);
+    if (__brev(0x80000000u) != cts_brev(0x80000000u)) atomicExch(bad, 1);
+    if (__brevll(1ull) != cts_brevll(1ull)) atomicExch(bad, 1);
+}}
+int main() {{
+    int* bad = nullptr;
+    if (cudaMalloc(&bad, sizeof(*bad)) != cudaSuccess) return 2;
+    if (cudaMemset(bad, 0, sizeof(*bad)) != cudaSuccess) return 2;
+    compare<<<1, 1>>>(bad);
+    if (cudaDeviceSynchronize() != cudaSuccess) return 3;
+    int mismatch = 0;
+    if (cudaMemcpy(&mismatch, bad, sizeof(mismatch), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
+    std::printf("mismatch=%d\\n", mismatch);
+    cudaFree(bad);
+    return 0;
+}}
+""",
+        )
+
+    def test_mul24_helpers_agree_with_the_intrinsics(self) -> None:
+        helpers = "\n".join(helper.strip("\n") for _name, helper in MUL24_HELPERS.values())
+        self._nvcc_mismatch(
+            "m24",
+            f"""\
+#include <cstdio>
+#include <cuda_runtime.h>
+{helpers}
+__global__ void compare(int* bad) {{
+    if (__mul24((int)0xFF000001, 2) != cts_mul24((int)0xFF000001, 2)) atomicExch(bad, 1);
+    if (__mul24((int)0x00800000, 1) != cts_mul24((int)0x00800000, 1)) atomicExch(bad, 1);
+    if (__mul24((int)0x00FFFFFF, (int)0x00FFFFFF) != cts_mul24((int)0x00FFFFFF, (int)0x00FFFFFF))
+        atomicExch(bad, 1);
+    if (__mul24((int)0x00800000, (int)0x00800000) != cts_mul24((int)0x00800000, (int)0x00800000))
+        atomicExch(bad, 1);
+    if (__umul24(0x00FFFFFFu, 0x00FFFFFFu) != cts_umul24(0x00FFFFFFu, 0x00FFFFFFu)) atomicExch(bad, 1);
+    if (__umul24(0xFF800000u, 2u) != cts_umul24(0xFF800000u, 2u)) atomicExch(bad, 1);
+    if (__umul24(0x01000000u, 3u) != cts_umul24(0x01000000u, 3u)) atomicExch(bad, 1);
+}}
+int main() {{
+    int* bad = nullptr;
+    if (cudaMalloc(&bad, sizeof(*bad)) != cudaSuccess) return 2;
+    if (cudaMemset(bad, 0, sizeof(*bad)) != cudaSuccess) return 2;
+    compare<<<1, 1>>>(bad);
+    if (cudaDeviceSynchronize() != cudaSuccess) return 3;
+    int mismatch = 0;
+    if (cudaMemcpy(&mismatch, bad, sizeof(mismatch), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
+    std::printf("mismatch=%d\\n", mismatch);
+    cudaFree(bad);
+    return 0;
+}}
+""",
+        )
 
 
 if __name__ == "__main__":

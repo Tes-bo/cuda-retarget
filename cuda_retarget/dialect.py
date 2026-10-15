@@ -273,6 +273,23 @@ class Dialect:
     mask. A true halfword lane is filled with `0xFFFF` and a true byte
     lane with `0xFF`. Ordering comparisons treat `0x8000` as signed or
     unsigned. Equality compares the lane bits.
+    `lower_packed_set` replaces the `__vset*` lane predicates. A true
+    halfword writes `0x0001` and a true byte writes `0x01`. That is not
+    the all-ones mask from `__vcmp*`, and lanes that fail stay zero
+    instead of clearing the whole result.
+    `lower_packed_avg` replaces `__vavgs2`, `__vavgs4`, `__vavgu2`,
+    `__vavgu4`, `__vhaddu2`, and `__vhaddu4`. The signed average rounds
+    a half away from zero, so 1 and 2 become 2 while -2 and -3 become
+    -3. Two minimum lanes stay the minimum. The unsigned rounded form
+    does the same for magnitudes. The plain unsigned average truncates,
+    so `0xFFFF` and 1 become `0x8000` rather than 0.
+    `lower_bitops` replaces `__clz`, `__ffs`, `__popc`, `__brev`, and
+    the 64-bit forms. `__clz(0)` is 32 and `__clzll(0)` is 64. `__ffs(0)`
+    is 0, and a set bit is counted from 1. `__brev` reverses the bits.
+    `lower_mul24` replaces `__mul24` and `__umul24`. The high 8 bits of
+    each input are ignored. Bit 23 is the sign of the signed form. The
+    low 32 bits of the product are kept, so the square of the minimum
+    24-bit value is 0.
     """
 
     name: str
@@ -294,6 +311,10 @@ class Dialect:
     lower_sad: bool
     lower_packed_sad: bool
     lower_packed_cmp: bool
+    lower_packed_set: bool
+    lower_packed_avg: bool
+    lower_bitops: bool
+    lower_mul24: bool
 
 
 DIALECTS = {
@@ -317,6 +338,10 @@ DIALECTS = {
         lower_sad=True,
         lower_packed_sad=True,
         lower_packed_cmp=True,
+        lower_packed_set=True,
+        lower_packed_avg=True,
+        lower_bitops=True,
+        lower_mul24=True,
     ),
     "musa": Dialect(
         name="musa",
@@ -338,6 +363,10 @@ DIALECTS = {
         lower_sad=True,
         lower_packed_sad=True,
         lower_packed_cmp=True,
+        lower_packed_set=True,
+        lower_packed_avg=True,
+        lower_bitops=True,
+        lower_mul24=True,
     ),
     "maca": Dialect(
         name="maca",
@@ -359,6 +388,10 @@ DIALECTS = {
         lower_sad=False,
         lower_packed_sad=False,
         lower_packed_cmp=False,
+        lower_packed_set=False,
+        lower_packed_avg=False,
+        lower_bitops=False,
+        lower_mul24=False,
     ),
 }
 
@@ -783,6 +816,238 @@ PACKED_CMP_HELPERS = {
         _packed_cmp_helper(f"cts_{intrinsic[2:]}", lanes, op, signed),
     )
     for intrinsic, lanes, op, signed in _packed_cmp_specs()
+}
+
+
+def _packed_set_helper(name: str, lanes: int, op: str, signed: bool) -> str:
+    shift = 32 // lanes
+    mask = (1 << shift) - 1
+    if signed:
+        left = _signed_lane(lanes, shift, mask, "a")
+        right = _signed_lane(lanes, shift, mask, "b")
+        return f"""
+static __device__ unsigned {name}(unsigned a, unsigned b) {{
+    unsigned out = 0;
+#pragma unroll
+    for (int i = 0; i < {lanes}; ++i) {{
+        int aa = {left};
+        int bb = {right};
+        if (aa {op} bb) out |= 1u << ({shift} * i);
+    }}
+    return out;
+}}
+"""
+    return f"""
+static __device__ unsigned {name}(unsigned a, unsigned b) {{
+    unsigned out = 0;
+#pragma unroll
+    for (int i = 0; i < {lanes}; ++i) {{
+        unsigned aa = (a >> ({shift} * i)) & {mask:#x}u;
+        unsigned bb = (b >> ({shift} * i)) & {mask:#x}u;
+        if (aa {op} bb) out |= 1u << ({shift} * i);
+    }}
+    return out;
+}}
+"""
+
+
+PACKED_SET_HELPERS = {
+    intrinsic.replace("__vcmp", "__vset", 1): (
+        f"cts_{intrinsic.replace('__vcmp', '__vset', 1)[2:]}",
+        _packed_set_helper(
+            f"cts_{intrinsic.replace('__vcmp', '__vset', 1)[2:]}",
+            lanes,
+            op,
+            signed,
+        ),
+    )
+    for intrinsic, lanes, op, signed in _packed_cmp_specs()
+}
+
+
+def _packed_avg_helper(name: str, lanes: int, mode: str) -> str:
+    shift = 32 // lanes
+    mask = (1 << shift) - 1
+    if mode == "savg":
+        left = _signed_lane(lanes, shift, mask, "a")
+        right = _signed_lane(lanes, shift, mask, "b")
+        return f"""
+static __device__ unsigned {name}(unsigned a, unsigned b) {{
+    unsigned out = 0;
+#pragma unroll
+    for (int i = 0; i < {lanes}; ++i) {{
+        int aa = {left};
+        int bb = {right};
+        int sum = aa + bb;
+        int avg = sum < 0 ? (sum >> 1) : ((sum + 1) >> 1);
+        out |= (static_cast<unsigned>(avg) & {mask:#x}u) << ({shift} * i);
+    }}
+    return out;
+}}
+"""
+    expr = "(aa | bb) - ((aa ^ bb) >> 1)" if mode == "uavg" else "(aa & bb) + ((aa ^ bb) >> 1)"
+    return f"""
+static __device__ unsigned {name}(unsigned a, unsigned b) {{
+    unsigned out = 0;
+#pragma unroll
+    for (int i = 0; i < {lanes}; ++i) {{
+        unsigned aa = (a >> ({shift} * i)) & {mask:#x}u;
+        unsigned bb = (b >> ({shift} * i)) & {mask:#x}u;
+        unsigned avg = {expr};
+        out |= (avg & {mask:#x}u) << ({shift} * i);
+    }}
+    return out;
+}}
+"""
+
+
+PACKED_AVG_HELPERS = {
+    intrinsic: (
+        f"cts_{intrinsic[2:]}",
+        _packed_avg_helper(f"cts_{intrinsic[2:]}", lanes, mode),
+    )
+    for intrinsic, lanes, mode in (
+        ("__vavgs2", 2, "savg"),
+        ("__vavgs4", 4, "savg"),
+        ("__vavgu2", 2, "uavg"),
+        ("__vavgu4", 4, "uavg"),
+        ("__vhaddu2", 2, "uhadd"),
+        ("__vhaddu4", 4, "uhadd"),
+    )
+}
+
+
+BIT_HELPERS = {
+    "__clz": (
+        "cts_clz",
+        """
+static __device__ int cts_clz(int value) {
+    unsigned bits = static_cast<unsigned>(value);
+    int count = 0;
+    for (int i = 31; i >= 0; --i) {
+        if ((bits >> i) & 1u) return count;
+        count += 1;
+    }
+    return 32;
+}
+""",
+    ),
+    "__clzll": (
+        "cts_clzll",
+        """
+static __device__ int cts_clzll(long long value) {
+    unsigned long long bits = static_cast<unsigned long long>(value);
+    int count = 0;
+    for (int i = 63; i >= 0; --i) {
+        if ((bits >> i) & 1ull) return count;
+        count += 1;
+    }
+    return 64;
+}
+""",
+    ),
+    "__ffs": (
+        "cts_ffs",
+        """
+static __device__ int cts_ffs(int value) {
+    unsigned bits = static_cast<unsigned>(value);
+    if (bits == 0) return 0;
+    int count = 1;
+    while ((bits & 1u) == 0) {
+        bits >>= 1;
+        count += 1;
+    }
+    return count;
+}
+""",
+    ),
+    "__ffsll": (
+        "cts_ffsll",
+        """
+static __device__ int cts_ffsll(long long value) {
+    unsigned long long bits = static_cast<unsigned long long>(value);
+    if (bits == 0) return 0;
+    int count = 1;
+    while ((bits & 1ull) == 0) {
+        bits >>= 1;
+        count += 1;
+    }
+    return count;
+}
+""",
+    ),
+    "__popc": (
+        "cts_popc",
+        """
+static __device__ int cts_popc(unsigned value) {
+    int count = 0;
+    while (value != 0) {
+        count += value & 1u;
+        value >>= 1;
+    }
+    return count;
+}
+""",
+    ),
+    "__popcll": (
+        "cts_popcll",
+        """
+static __device__ int cts_popcll(unsigned long long value) {
+    int count = 0;
+    while (value != 0) {
+        count += value & 1ull;
+        value >>= 1;
+    }
+    return count;
+}
+""",
+    ),
+    "__brev": (
+        "cts_brev",
+        """
+static __device__ unsigned cts_brev(unsigned value) {
+    unsigned out = 0;
+#pragma unroll
+    for (int i = 0; i < 32; ++i) out |= ((value >> i) & 1u) << (31 - i);
+    return out;
+}
+""",
+    ),
+    "__brevll": (
+        "cts_brevll",
+        """
+static __device__ unsigned long long cts_brevll(unsigned long long value) {
+    unsigned long long out = 0;
+#pragma unroll
+    for (int i = 0; i < 64; ++i) out |= ((value >> i) & 1ull) << (63 - i);
+    return out;
+}
+""",
+    ),
+}
+
+
+MUL24_HELPERS = {
+    "__mul24": (
+        "cts_mul24",
+        """
+static __device__ int cts_mul24(int x, int y) {
+    int a = x & 0xffffff;
+    int b = y & 0xffffff;
+    if (a & 0x800000) a -= 0x1000000;
+    if (b & 0x800000) b -= 0x1000000;
+    return static_cast<int>(static_cast<long long>(a) * static_cast<long long>(b));
+}
+""",
+    ),
+    "__umul24": (
+        "cts_umul24",
+        """
+static __device__ unsigned cts_umul24(unsigned x, unsigned y) {
+    return (x & 0xffffffu) * (y & 0xffffffu);
+}
+""",
+    ),
 }
 
 

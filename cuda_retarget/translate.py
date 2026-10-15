@@ -26,8 +26,12 @@ from cuda_retarget.dialect import (
     PACKED_ABS_HELPERS,
     PACKED_HELPERS,
     PACKED_MINMAX_HELPERS,
+    PACKED_AVG_HELPERS,
     PACKED_CMP_HELPERS,
     PACKED_SAD_HELPERS,
+    PACKED_SET_HELPERS,
+    BIT_HELPERS,
+    MUL24_HELPERS,
     MATCH_ANY_HELPER,
     VOTE_HELPERS,
     Dialect,
@@ -239,6 +243,30 @@ def _call_edit(
             raise TranslateError(f"{token.spelling} must have two arguments")
         replacement, _helper = PACKED_CMP_HELPERS[token.spelling]
         return (token.start, token.end, replacement)
+    if dialect.lower_packed_set and token.spelling in PACKED_SET_HELPERS:
+        parsed = _arguments(tokens, index + 1)
+        if parsed is None or len(parsed[0]) != 2:
+            raise TranslateError(f"{token.spelling} must have two arguments")
+        replacement, _helper = PACKED_SET_HELPERS[token.spelling]
+        return (token.start, token.end, replacement)
+    if dialect.lower_packed_avg and token.spelling in PACKED_AVG_HELPERS:
+        parsed = _arguments(tokens, index + 1)
+        if parsed is None or len(parsed[0]) != 2:
+            raise TranslateError(f"{token.spelling} must have two arguments")
+        replacement, _helper = PACKED_AVG_HELPERS[token.spelling]
+        return (token.start, token.end, replacement)
+    if dialect.lower_bitops and token.spelling in BIT_HELPERS:
+        parsed = _arguments(tokens, index + 1)
+        if parsed is None or len(parsed[0]) != 1:
+            raise TranslateError(f"{token.spelling} must have one argument")
+        replacement, _helper = BIT_HELPERS[token.spelling]
+        return (token.start, token.end, replacement)
+    if dialect.lower_mul24 and token.spelling in MUL24_HELPERS:
+        parsed = _arguments(tokens, index + 1)
+        if parsed is None or len(parsed[0]) != 2:
+            raise TranslateError(f"{token.spelling} must have two arguments")
+        replacement, _helper = MUL24_HELPERS[token.spelling]
+        return (token.start, token.end, replacement)
     return None
 
 
@@ -356,6 +384,22 @@ def _helpers(dialect: Dialect, rewritten: str) -> str:
                 blocks.append(helper.strip("\n"))
     if dialect.lower_packed_cmp:
         for name, helper in PACKED_CMP_HELPERS.values():
+            if f"{name}(" in rewritten:
+                blocks.append(helper.strip("\n"))
+    if dialect.lower_packed_set:
+        for name, helper in PACKED_SET_HELPERS.values():
+            if f"{name}(" in rewritten:
+                blocks.append(helper.strip("\n"))
+    if dialect.lower_packed_avg:
+        for name, helper in PACKED_AVG_HELPERS.values():
+            if f"{name}(" in rewritten:
+                blocks.append(helper.strip("\n"))
+    if dialect.lower_bitops:
+        for name, helper in BIT_HELPERS.values():
+            if f"{name}(" in rewritten:
+                blocks.append(helper.strip("\n"))
+    if dialect.lower_mul24:
+        for name, helper in MUL24_HELPERS.values():
             if f"{name}(" in rewritten:
                 blocks.append(helper.strip("\n"))
     return "\n\n".join(blocks)
