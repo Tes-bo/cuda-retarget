@@ -319,7 +319,12 @@ class Dialect:
     half. A value past 65504 stays at the finite maximum when rounding
     toward zero. A NaN becomes `0x7fff`, with the sign dropped.
     `__half2float` of that NaN is the float `0x7fffffff`. Infinity keeps
-    its sign, and `-0` stays `-0`.
+    its sign, and `-0` stays `-0`. Integer and double values use the same
+    half packing. `__int2half_rn(2049)` stays on 2048 and round-up takes
+    2050. `65520` rounds to infinity, and toward zero it stays at the
+    finite maximum. A double just above `2^-25` becomes the smallest half
+    subnormal; casting that double to float first loses it. A double NaN
+    becomes `0x7fff`, and `-0` stays `-0`.
     """
 
     name: str
@@ -1917,6 +1922,54 @@ static __device__ float cts_h2f(unsigned short bits) {
 }
 """
 
+HALF_FROM_INT = """
+static __device__ unsigned short cts_u2h(unsigned long long mag, int sign, int mode) {
+    if (mag == 0) return (unsigned short)(sign ? 0x8000 : 0);
+    int k = 0;
+    unsigned long long scan = mag;
+    while (scan > 1ull) {
+        scan >>= 1;
+        k++;
+    }
+    int hexp = k + 15;
+    unsigned long long packed;
+    if (k <= 33) packed = mag << (33 - k);
+    else {
+        int need = k - 33;
+        unsigned long long lost = mag & ((1ull << need) - 1ull);
+        packed = mag >> need;
+        if (lost) packed |= 1ull;
+    }
+    return cts_hpack(sign, hexp, packed, mode);
+}
+
+static __device__ unsigned short cts_s2h(long long value, int mode) {
+    int sign = value < 0;
+    unsigned long long mag = sign ? ((unsigned long long)(-(value + 1)) + 1ull) : (unsigned long long)value;
+    return cts_u2h(mag, sign, mode);
+}
+"""
+
+HALF_FROM_DOUBLE = """
+static __device__ unsigned short cts_d2h(double value) {
+    union { double as_double; unsigned long long as_bits; } in;
+    in.as_double = value;
+    unsigned sign = (unsigned)(in.as_bits >> 63);
+    int exp = (int)((in.as_bits >> 52) & 0x7ff);
+    unsigned long long frac = in.as_bits & 0xfffffffffffffull;
+    if (exp == 2047) {
+        if (frac) return (unsigned short)0x7fff;
+        return (unsigned short)((sign << 15) | 0x7c00);
+    }
+    unsigned long long sig = exp ? (frac | (1ull << 52)) : frac;
+    int hexp = exp ? (exp - 1008) : (1 - 1008);
+    unsigned long long lost = sig & ((1ull << 19) - 1ull);
+    unsigned long long mag = sig >> 19;
+    if (lost) mag |= 1ull;
+    return cts_hpack((int)sign, hexp, mag, 0);
+}
+"""
+
 _HALF_CODE = {"rn": 0, "rz": 1, "ru": 2, "rd": 3}
 
 
@@ -1936,6 +1989,47 @@ HALF_HELPERS: dict[str, tuple[str, str]] = {}
 for _mode in ("rn", "rz", "ru", "rd"):
     HALF_HELPERS[f"__float2half_{_mode}"] = (f"cts_float2half_{_mode}", _float_to_half(_mode))
 HALF_HELPERS["__float2half"] = HALF_HELPERS["__float2half_rn"]
+
+
+def _int_to_half(ctype: str, stem: str, mode: str, signed: bool) -> str:
+    code = _HALF_CODE[mode]
+    if signed:
+        call = f"cts_s2h((long long)x, {code})"
+    else:
+        call = f"cts_u2h((unsigned long long)x, 0, {code})"
+    return f"""
+static __device__ __half {stem}_{mode}({ctype} x) {{
+    union {{ unsigned short as_bits; __half as_half; }} out;
+    out.as_bits = {call};
+    return out.as_half;
+}}
+"""
+
+
+for _ctype, _stem, _signed in (
+    ("int", "cts_int2half", True),
+    ("unsigned int", "cts_uint2half", False),
+    ("short", "cts_short2half", True),
+    ("unsigned short", "cts_ushort2half", False),
+    ("long long", "cts_ll2half", True),
+    ("unsigned long long", "cts_ull2half", False),
+):
+    for _mode in ("rn", "rz", "ru", "rd"):
+        HALF_HELPERS[f"__{_stem[4:]}_{_mode}"] = (
+            f"{_stem}_{_mode}",
+            _int_to_half(_ctype, _stem, _mode, _signed),
+        )
+
+HALF_HELPERS["__double2half"] = (
+    "cts_double2half",
+    """
+static __device__ __half cts_double2half(double x) {
+    union { unsigned short as_bits; __half as_half; } out;
+    out.as_bits = cts_d2h(x);
+    return out.as_half;
+}
+""",
+)
 HALF_HELPERS["__half2float"] = (
     "cts_half2float",
     """
@@ -1949,7 +2043,33 @@ static __device__ float cts_half2float(__half value) {
 
 
 def half_needs_from_float(names: set[str]) -> bool:
-    return any(name.startswith("cts_float2half") for name in names)
+    prefixes = (
+        "cts_float2half",
+        "cts_int2half_",
+        "cts_uint2half_",
+        "cts_short2half_",
+        "cts_ushort2half_",
+        "cts_ll2half_",
+        "cts_ull2half_",
+        "cts_double2half",
+    )
+    return any(name.startswith(prefixes) for name in names)
+
+
+def half_needs_int(names: set[str]) -> bool:
+    prefixes = (
+        "cts_int2half_",
+        "cts_uint2half_",
+        "cts_short2half_",
+        "cts_ushort2half_",
+        "cts_ll2half_",
+        "cts_ull2half_",
+    )
+    return any(name.startswith(prefixes) for name in names)
+
+
+def half_needs_double(names: set[str]) -> bool:
+    return any(name.startswith("cts_double2half") for name in names)
 
 
 def half_needs_to_float(names: set[str]) -> bool:

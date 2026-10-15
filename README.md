@@ -64,7 +64,7 @@ Comments and string literals stay. A name inside a `#define` is rewritten at the
 | `musa` | the same rule with the `musa` prefix | `musa_runtime.h` | unchanged | lowered |
 | `maca` | unchanged | `cuda_runtime.h` | unchanged | unchanged |
 
-The helpers are bitcasts and double hi/lo words, funnel shifts, `__dp4a`, packed add/sub/min/max/abs, `__byte_perm`, averages, high-half products, absolute differences, packed absolute-difference sums, comparison masks, lane predicates, packed averages, bit scans, 24-bit products, rounding conversions, double-to-float rounding, float-to-half rounding, `__saturatef`, and directed float add, sub, mul, and fused multiply-add.
+The helpers are bitcasts and double hi/lo words, funnel shifts, `__dp4a`, packed add/sub/min/max/abs, `__byte_perm`, averages, high-half products, absolute differences, packed absolute-difference sums, comparison masks, lane predicates, packed averages, bit scans, 24-bit products, rounding conversions, double-to-float rounding, float-to-half rounding, integer and double conversions into half, `__saturatef`, and directed float add, sub, mul, and fused multiply-add.
 
 Inserted helpers are `static __device__` and sit after the last `#include`.
 
@@ -98,6 +98,11 @@ These are the results a prefix swap gets wrong. HIP and MUSA both get the helper
 | `__float2half_rz` of a value past 65504 | `31743`, the finite maximum. Round-up is infinity `31744` |
 | a NaN passed to `__float2half_*` | `32767`, and the sign is dropped. `__half2float` of that NaN is `2147483647` |
 | `-0` through `__float2half_rd` | `32768` |
+| `__int2half_rn(2049)` / `__int2half_ru(2049)` / `__int2half_rd(-2049)` | `26624` / `26625` / `59393` |
+| `__int2half_rn(65520)` / `__int2half_rz(65520)` | infinity `31744` / the finite maximum `31743` |
+| `__int2half_rn(-65519)` / `__int2half_rd(-65520)` | `64511` / `64512` |
+| `__double2half` of the double just above `2^-25` | `1`. Casting that double to float first gives `0` |
+| a double NaN passed to `__double2half` | `32767`. `-0` stays `32768` |
 | `__saturatef` of a NaN or of `-0` | `+0`. Values outside `[0, 1]` clamp |
 | `__fadd_ru` of 1 and a value below one ulp | the next float above 1. The nearest-even tie stays on the even float |
 | `__fadd_rd(+0, -0)` / `__fadd_rd(+0, +0)` | `-0` / `+0`. Same-sign zeros keep their sign |

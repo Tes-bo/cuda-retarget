@@ -45,14 +45,18 @@ from cuda_retarget.dialect import (
     FARITH_HELPERS,
     FARITH_MUL,
     FARITH_PACK,
+    HALF_FROM_DOUBLE,
     HALF_FROM_FLOAT,
+    HALF_FROM_INT,
     HALF_HELPERS,
     HALF_TO_FLOAT,
     Dialect,
     farith_needs_add,
     farith_needs_fma,
     farith_needs_mul,
+    half_needs_double,
     half_needs_from_float,
+    half_needs_int,
     half_needs_to_float,
     round_needs_bits,
     round_needs_d2f,
@@ -473,6 +477,10 @@ def _helpers(dialect: Dialect, rewritten: str) -> str:
         if names:
             if half_needs_from_float(names):
                 blocks.append(HALF_FROM_FLOAT.strip("\n"))
+            if half_needs_int(names):
+                blocks.append(HALF_FROM_INT.strip("\n"))
+            if half_needs_double(names):
+                blocks.append(HALF_FROM_DOUBLE.strip("\n"))
             if half_needs_to_float(names):
                 blocks.append(HALF_TO_FLOAT.strip("\n"))
             seen: set[str] = set()
