@@ -28,6 +28,7 @@ from cuda_retarget.dialect import (
     PACKED_ABS_HELPERS,
     PACKED_HELPERS,
     PACKED_MINMAX_HELPERS,
+    PACKED_CMP_HELPERS,
     PACKED_SAD_HELPERS,
     VOTE_HELPERS,
 )
@@ -469,6 +470,30 @@ __global__ void distance(unsigned* out) {
             self.assertIn("unsigned sum = 0;", translated)
         self.assertEqual(translate_source(source, "maca"), source)
 
+    def test_hip_and_musa_lower_packed_compares(self) -> None:
+        source = """\
+#include <cuda_runtime.h>
+__global__ void compare(unsigned* out) {
+    const char* label = "__vcmpgts2";
+    unsigned a = 0x1234aba5u;
+    unsigned b = 0x1234aba6u;
+    unsigned t = 0x7FFF0000u;
+    out[0] = __vcmpgts2(__vcmpeq2(a, b), t);
+    out[1] = __vcmpgtu4(0x8001807Fu, 0x7F017F00u);
+    out[2] = label[0];
+}
+"""
+        for target in ("hip", "musa"):
+            translated = translate_source(source, target)
+            self.assertIn('"__vcmpgts2"', translated)
+            self.assertIn("cts_vcmpgts2(cts_vcmpeq2(a, b), t)", translated)
+            self.assertIn("cts_vcmpgtu4(0x8001807Fu, 0x7F017F00u)", translated)
+            self.assertNotIn("__vcmpgts2(", translated)
+            self.assertNotIn("__vcmpeq2(", translated)
+            self.assertIn("0xffffu", translated)
+            self.assertIn("0xffu", translated)
+        self.assertEqual(translate_source(source, "maca"), source)
+
     def test_unparsed_source_is_refused(self) -> None:
         with self.assertRaises(TranslateError):
             translate_source("int main( {\n", "hip", filename="broken.cu")
@@ -690,6 +715,26 @@ class CorpusTests(unittest.TestCase):
             self.assertEqual(translated.count("cts_vsads2("), 4)
         self.assertIn("__vsads2", maca)
         self.assertNotIn("cts_vsads2", maca)
+
+    def test_hip_and_musa_lower_the_census_packed_cmp(self) -> None:
+        path = CENSUS / "packed_cmp" / "main.cu"
+        if not path.is_file():
+            self.skipTest("packed_cmp is not in the census corpus")
+        hip = translate_path(path, "hip")
+        musa = translate_path(path, "musa")
+        maca = translate_path(path, "maca")
+        for translated in (hip, musa):
+            self.assertIn("cts_vcmpeq2(0x1234aba5u, 0x1234aba6u)", translated)
+            self.assertIn("cts_vcmpne2(0x1234aba5u, 0x1234aba6u)", translated)
+            self.assertIn("cts_vcmpgts2(s, t)", translated)
+            self.assertIn("cts_vcmpgtu2(s, t)", translated)
+            self.assertIn("cts_vcmplts2(s, t)", translated)
+            self.assertIn("cts_vcmpgts4(c, d)", translated)
+            self.assertNotIn("__vcmpeq2(", translated)
+            self.assertNotIn("__vcmpgts4(", translated)
+            self.assertEqual(translated.count("cts_vcmpgts2("), 2)
+        self.assertIn("__vcmpgts2", maca)
+        self.assertNotIn("cts_vcmpgts2", maca)
 
     def test_only_hip_pins_warp_size(self) -> None:
         path = CENSUS / "warp_size" / "main.cu"
@@ -1687,6 +1732,69 @@ int main() {{
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "psad.cu"
             binary = Path(directory) / "psad"
+            path.write_text(source, encoding="utf-8")
+            env = {**os.environ, "CUDA_VISIBLE_DEVICES": device}
+            compiled = subprocess.run(
+                [nvcc, "-arch=native", str(path), "-o", str(binary)],
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+            )
+            if compiled.returncode != 0:
+                self.fail(compiled.stderr)
+            ran = subprocess.run(
+                [str(binary)],
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+            )
+        self.assertEqual(ran.returncode, 0, ran.stderr)
+        self.assertEqual(ran.stdout.strip(), "mismatch=0")
+
+    def test_packed_cmp_helpers_agree_with_the_intrinsics(self) -> None:
+        nvcc = shutil.which("nvcc")
+        if nvcc is None:
+            self.skipTest("nvcc is not installed")
+        device = _idle_gpu()
+        if device is None:
+            self.skipTest("every GPU has a compute process")
+        helpers = "\n".join(helper.strip("\n") for _name, helper in PACKED_CMP_HELPERS.values())
+        checks = []
+        for intrinsic, (name, _helper) in PACKED_CMP_HELPERS.items():
+            for left, right in (("a", "b"), ("s", "t"), ("c", "d"), ("s", "s")):
+                checks.append(f"if ({intrinsic}({left}, {right}) != {name}({left}, {right})) atomicExch(bad, 1);")
+        body = "\n    ".join(checks)
+        source = f"""\
+#include <cstdio>
+#include <cuda_runtime.h>
+{helpers}
+__global__ void compare(int* bad) {{
+    unsigned a = 0x1234aba5u;
+    unsigned b = 0x1234aba6u;
+    unsigned s = 0x80000001u;
+    unsigned t = 0x7FFF0000u;
+    unsigned c = 0x8001807Fu;
+    unsigned d = 0x7F017F00u;
+    {body}
+}}
+int main() {{
+    int* bad = nullptr;
+    if (cudaMalloc(&bad, sizeof(*bad)) != cudaSuccess) return 2;
+    if (cudaMemset(bad, 0, sizeof(*bad)) != cudaSuccess) return 2;
+    compare<<<1, 1>>>(bad);
+    if (cudaDeviceSynchronize() != cudaSuccess) return 3;
+    int mismatch = 0;
+    if (cudaMemcpy(&mismatch, bad, sizeof(mismatch), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
+    std::printf("mismatch=%d\\n", mismatch);
+    cudaFree(bad);
+    return 0;
+}}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pcmp.cu"
+            binary = Path(directory) / "pcmp"
             path.write_text(source, encoding="utf-8")
             env = {**os.environ, "CUDA_VISIBLE_DEVICES": device}
             compiled = subprocess.run(

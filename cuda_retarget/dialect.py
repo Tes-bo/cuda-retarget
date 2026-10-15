@@ -269,6 +269,10 @@ class Dialect:
     signed `0xFFFF` lane is 1 and an unsigned one is 65535. A `0x8000`
     lane contributes 32768, so two of them sum to 65536. The result is
     a scalar sum, not a packed word.
+    `lower_packed_cmp` replaces the `__vcmp*` lane comparisons with a
+    mask. A true halfword lane is filled with `0xFFFF` and a true byte
+    lane with `0xFF`. Ordering comparisons treat `0x8000` as signed or
+    unsigned. Equality compares the lane bits.
     """
 
     name: str
@@ -289,6 +293,7 @@ class Dialect:
     lower_mulhi: bool
     lower_sad: bool
     lower_packed_sad: bool
+    lower_packed_cmp: bool
 
 
 DIALECTS = {
@@ -311,6 +316,7 @@ DIALECTS = {
         lower_mulhi=True,
         lower_sad=True,
         lower_packed_sad=True,
+        lower_packed_cmp=True,
     ),
     "musa": Dialect(
         name="musa",
@@ -331,6 +337,7 @@ DIALECTS = {
         lower_mulhi=True,
         lower_sad=True,
         lower_packed_sad=True,
+        lower_packed_cmp=True,
     ),
     "maca": Dialect(
         name="maca",
@@ -351,6 +358,7 @@ DIALECTS = {
         lower_mulhi=False,
         lower_sad=False,
         lower_packed_sad=False,
+        lower_packed_cmp=False,
     ),
 }
 
@@ -723,6 +731,58 @@ PACKED_SAD_HELPERS = {
         ("__vsads4", 4, True),
         ("__vsadu4", 4, False),
     )
+}
+
+
+def _packed_cmp_helper(name: str, lanes: int, op: str, signed: bool) -> str:
+    shift = 32 // lanes
+    mask = (1 << shift) - 1
+    if signed:
+        left = _signed_lane(lanes, shift, mask, "a")
+        right = _signed_lane(lanes, shift, mask, "b")
+        return f"""
+static __device__ unsigned {name}(unsigned a, unsigned b) {{
+    unsigned out = 0;
+#pragma unroll
+    for (int i = 0; i < {lanes}; ++i) {{
+        int aa = {left};
+        int bb = {right};
+        if (aa {op} bb) out |= {mask:#x}u << ({shift} * i);
+    }}
+    return out;
+}}
+"""
+    return f"""
+static __device__ unsigned {name}(unsigned a, unsigned b) {{
+    unsigned out = 0;
+#pragma unroll
+    for (int i = 0; i < {lanes}; ++i) {{
+        unsigned aa = (a >> ({shift} * i)) & {mask:#x}u;
+        unsigned bb = (b >> ({shift} * i)) & {mask:#x}u;
+        if (aa {op} bb) out |= {mask:#x}u << ({shift} * i);
+    }}
+    return out;
+}}
+"""
+
+
+def _packed_cmp_specs() -> tuple[tuple[str, int, str, bool], ...]:
+    specs: list[tuple[str, int, str, bool]] = []
+    for lanes in (2, 4):
+        specs.append((f"__vcmpeq{lanes}", lanes, "==", False))
+        specs.append((f"__vcmpne{lanes}", lanes, "!=", False))
+        for rel, op in (("gt", ">"), ("ge", ">="), ("lt", "<"), ("le", "<=")):
+            specs.append((f"__vcmp{rel}s{lanes}", lanes, op, True))
+            specs.append((f"__vcmp{rel}u{lanes}", lanes, op, False))
+    return tuple(specs)
+
+
+PACKED_CMP_HELPERS = {
+    intrinsic: (
+        f"cts_{intrinsic[2:]}",
+        _packed_cmp_helper(f"cts_{intrinsic[2:]}", lanes, op, signed),
+    )
+    for intrinsic, lanes, op, signed in _packed_cmp_specs()
 }
 
 
