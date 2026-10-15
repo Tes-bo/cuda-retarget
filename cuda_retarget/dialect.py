@@ -230,6 +230,10 @@ class Dialect:
     `lower_dp4a` replaces `__dp4a` with signed and unsigned four-byte
     dot-product helpers. A 0x80 byte is -128 on the signed overload and
     128 on the unsigned overload.
+    `lower_packed_arith` replaces `__vadd2`, `__vaddss2`, `__vaddus2`,
+    `__vsub2`, `__vsubss2`, `__vsubus2`, and the 4-byte forms. Plain
+    calls wrap each lane. `ss` saturates as signed. `us` saturates as
+    unsigned. A 32-bit add is a different program.
     """
 
     name: str
@@ -242,6 +246,7 @@ class Dialect:
     syncwarp_mask_32: bool
     lower_funnelshifts: bool
     lower_dp4a: bool
+    lower_packed_arith: bool
 
 
 DIALECTS = {
@@ -256,6 +261,7 @@ DIALECTS = {
         syncwarp_mask_32=True,
         lower_funnelshifts=True,
         lower_dp4a=True,
+        lower_packed_arith=True,
     ),
     "musa": Dialect(
         name="musa",
@@ -268,6 +274,7 @@ DIALECTS = {
         syncwarp_mask_32=False,
         lower_funnelshifts=True,
         lower_dp4a=True,
+        lower_packed_arith=True,
     ),
     "maca": Dialect(
         name="maca",
@@ -280,6 +287,7 @@ DIALECTS = {
         syncwarp_mask_32=False,
         lower_funnelshifts=False,
         lower_dp4a=False,
+        lower_packed_arith=False,
     ),
 }
 
@@ -389,6 +397,76 @@ static __device__ unsigned cts_dp4a(unsigned a, unsigned b, unsigned c) {
     return sum;
 }
 """
+
+
+# Packed 16-bit and 8-bit add/sub. Wrap, signed saturation, unsigned saturation.
+def _packed_helper(name: str, lanes: int, mode: str, op: str) -> str:
+    shift = 32 // lanes
+    mask = (1 << shift) - 1
+    if mode == "wrap":
+        body = f"unsigned lane = (aa {op} bb) & {mask:#x}u;"
+    elif mode == "signed":
+        limit = (1 << (shift - 1)) - 1
+        floor = -(1 << (shift - 1))
+        cast = "short" if lanes == 2 else "signed char"
+        extract = (
+            f"static_cast<{cast}>(a >> ({shift} * i))"
+            if lanes == 2
+            else f"static_cast<{cast}>((a >> ({shift} * i)) & {mask:#x}u)"
+        )
+        extract_b = extract.replace("(a >>", "(b >>")
+        return f"""
+static __device__ unsigned {name}(unsigned a, unsigned b) {{
+    unsigned out = 0;
+#pragma unroll
+    for (int i = 0; i < {lanes}; ++i) {{
+        int aa = {extract};
+        int bb = {extract_b};
+        int lane = aa {op} bb;
+        if (lane > {limit}) lane = {limit};
+        if (lane < {floor}) lane = {floor};
+        out |= (static_cast<unsigned>(lane) & {mask:#x}u) << ({shift} * i);
+    }}
+    return out;
+}}
+"""
+    else:
+        if op == "+":
+            body = f"unsigned lane = aa + bb; if (lane > {mask:#x}u) lane = {mask:#x}u;"
+        else:
+            body = "unsigned lane = aa < bb ? 0u : aa - bb;"
+    return f"""
+static __device__ unsigned {name}(unsigned a, unsigned b) {{
+    unsigned out = 0;
+#pragma unroll
+    for (int i = 0; i < {lanes}; ++i) {{
+        unsigned aa = (a >> ({shift} * i)) & {mask:#x}u;
+        unsigned bb = (b >> ({shift} * i)) & {mask:#x}u;
+        {body}
+        out |= lane << ({shift} * i);
+    }}
+    return out;
+}}
+"""
+
+
+PACKED_HELPERS = {
+    intrinsic: (f"cts_{intrinsic[2:]}", _packed_helper(f"cts_{intrinsic[2:]}", lanes, mode, op))
+    for intrinsic, lanes, mode, op in (
+        ("__vadd2", 2, "wrap", "+"),
+        ("__vaddss2", 2, "signed", "+"),
+        ("__vaddus2", 2, "unsigned", "+"),
+        ("__vsub2", 2, "wrap", "-"),
+        ("__vsubss2", 2, "signed", "-"),
+        ("__vsubus2", 2, "unsigned", "-"),
+        ("__vadd4", 4, "wrap", "+"),
+        ("__vaddss4", 4, "signed", "+"),
+        ("__vaddus4", 4, "unsigned", "+"),
+        ("__vsub4", 4, "wrap", "-"),
+        ("__vsubss4", 4, "signed", "-"),
+        ("__vsubus4", 4, "unsigned", "-"),
+    )
+}
 
 
 def runtime_name(spelling: str, dialect: Dialect) -> str | None:

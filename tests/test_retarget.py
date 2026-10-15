@@ -21,6 +21,7 @@ from cuda_retarget.dialect import (
     FUNNEL_HELPERS,
     MATCH_ALL_HELPER,
     MATCH_ANY_HELPER,
+    PACKED_HELPERS,
     VOTE_HELPERS,
 )
 from cuda_retarget.translate import TranslateError, translate_path, translate_source
@@ -236,6 +237,35 @@ __global__ void dot4(int* s, unsigned* u) {
             self.assertEqual(translated.count("cts_dp4a("), 4)
         self.assertEqual(translate_source(source, "maca"), source)
 
+    def test_hip_and_musa_lower_packed_arith(self) -> None:
+        source = """\
+#include <cuda_runtime.h>
+__global__ void lanes(unsigned* out) {
+    const char* label = "__vadd2";
+    unsigned a = 0x7FFF0001u;
+    unsigned b = 0x0001FFFFu;
+    out[0] = __vadd2(a, b);
+    out[1] = __vaddss2(a, b);
+    out[2] = __vaddus2(a, b);
+    out[3] = __vsubus4(__vadd4(a, b), b);
+    out[4] = label[0];
+}
+"""
+        for target in ("hip", "musa"):
+            translated = translate_source(source, target)
+            self.assertIn('"__vadd2"', translated)
+            self.assertIn("cts_vadd2(a, b)", translated)
+            self.assertIn("cts_vaddss2(a, b)", translated)
+            self.assertIn("cts_vaddus2(a, b)", translated)
+            self.assertIn("cts_vsubus4(cts_vadd4(a, b), b)", translated)
+            self.assertNotIn("__vadd2(", translated)
+            self.assertNotIn("__vaddss2(", translated)
+            self.assertNotIn("__vadd4(", translated)
+            self.assertIn("32767", translated)
+            self.assertIn("0xffffu", translated)
+            self.assertIn("0xffu", translated)
+        self.assertEqual(translate_source(source, "maca"), source)
+
     def test_unparsed_source_is_refused(self) -> None:
         with self.assertRaises(TranslateError):
             translate_source("int main( {\n", "hip", filename="broken.cu")
@@ -313,6 +343,23 @@ class CorpusTests(unittest.TestCase):
             self.assertNotIn("__dp4a(", translated)
         self.assertIn("__dp4a", maca)
         self.assertNotIn("cts_dp4a", maca)
+
+    def test_hip_and_musa_lower_the_census_packed_add(self) -> None:
+        path = CENSUS / "packed_add" / "main.cu"
+        if not path.is_file():
+            self.skipTest("packed_add is not in the census corpus")
+        hip = translate_path(path, "hip")
+        musa = translate_path(path, "musa")
+        maca = translate_path(path, "maca")
+        for translated in (hip, musa):
+            self.assertIn("cts_vadd2(a2, b2)", translated)
+            self.assertIn("cts_vaddss2(a2, b2)", translated)
+            self.assertIn("cts_vaddus2(a2, b2)", translated)
+            self.assertIn("cts_vsubss4(s4, t4)", translated)
+            self.assertNotIn("__vadd2(", translated)
+            self.assertEqual(translated.count("cts_vadd2("), 2)
+        self.assertIn("__vadd2", maca)
+        self.assertNotIn("cts_vadd2", maca)
 
     def test_only_hip_pins_warp_size(self) -> None:
         path = CENSUS / "warp_size" / "main.cu"
@@ -804,8 +851,80 @@ int main() {{
         self.assertEqual(ran.returncode, 0, ran.stderr)
         self.assertEqual(ran.stdout.strip(), "mismatch=0")
 
+    def test_packed_helpers_agree_with_the_intrinsics(self) -> None:
+        nvcc = shutil.which("nvcc")
+        if nvcc is None:
+            self.skipTest("nvcc is not installed")
+        device = _idle_gpu()
+        if device is None:
+            self.skipTest("every GPU has a compute process")
+        helpers = "\n".join(helper.strip("\n") for _name, helper in PACKED_HELPERS.values())
+        source = f"""\
+#include <cstdio>
+#include <cuda_runtime.h>
+{helpers}
+__global__ void compare(int* bad) {{
+    unsigned a2 = 0x7FFF0001u;
+    unsigned b2 = 0x0001FFFFu;
+    unsigned s2 = 0x80000000u;
+    unsigned t2 = 0x00010001u;
+    unsigned a4 = 0x7F0180FFu;
+    unsigned b4 = 0x01010101u;
+    unsigned s4 = 0x80018000u;
+    unsigned t4 = 0x01010101u;
+    if (__vadd2(a2, b2) != cts_vadd2(a2, b2)) atomicExch(bad, 1);
+    if (__vaddss2(a2, b2) != cts_vaddss2(a2, b2)) atomicExch(bad, 1);
+    if (__vaddus2(a2, b2) != cts_vaddus2(a2, b2)) atomicExch(bad, 1);
+    if (__vsub2(s2, t2) != cts_vsub2(s2, t2)) atomicExch(bad, 1);
+    if (__vsubss2(s2, t2) != cts_vsubss2(s2, t2)) atomicExch(bad, 1);
+    if (__vsubus2(s2, t2) != cts_vsubus2(s2, t2)) atomicExch(bad, 1);
+    if (__vadd4(a4, b4) != cts_vadd4(a4, b4)) atomicExch(bad, 1);
+    if (__vaddss4(a4, b4) != cts_vaddss4(a4, b4)) atomicExch(bad, 1);
+    if (__vaddus4(a4, b4) != cts_vaddus4(a4, b4)) atomicExch(bad, 1);
+    if (__vsub4(s4, t4) != cts_vsub4(s4, t4)) atomicExch(bad, 1);
+    if (__vsubss4(s4, t4) != cts_vsubss4(s4, t4)) atomicExch(bad, 1);
+    if (__vsubus4(s4, t4) != cts_vsubus4(s4, t4)) atomicExch(bad, 1);
+}}
+int main() {{
+    int* bad = nullptr;
+    if (cudaMalloc(&bad, sizeof(*bad)) != cudaSuccess) return 2;
+    if (cudaMemset(bad, 0, sizeof(*bad)) != cudaSuccess) return 2;
+    compare<<<1, 1>>>(bad);
+    if (cudaDeviceSynchronize() != cudaSuccess) return 3;
+    int mismatch = 0;
+    if (cudaMemcpy(&mismatch, bad, sizeof(mismatch), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
+    std::printf("mismatch=%d\\n", mismatch);
+    cudaFree(bad);
+    return 0;
+}}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "packed.cu"
+            binary = Path(directory) / "packed"
+            path.write_text(source, encoding="utf-8")
+            env = {**os.environ, "CUDA_VISIBLE_DEVICES": device}
+            compiled = subprocess.run(
+                [nvcc, "-arch=native", str(path), "-o", str(binary)],
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+            )
+            if compiled.returncode != 0:
+                self.fail(compiled.stderr)
+            ran = subprocess.run(
+                [str(binary)],
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+            )
+        self.assertEqual(ran.returncode, 0, ran.stderr)
+        self.assertEqual(ran.stdout.strip(), "mismatch=0")
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 
