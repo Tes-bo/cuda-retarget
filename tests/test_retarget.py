@@ -19,6 +19,7 @@ from cuda_retarget.dialect import (
     BYTE_PERM_HELPER,
     HADD_HELPERS,
     MULHI_HELPERS,
+    SAD_HELPERS,
     DOUBLE_WORD_HELPERS,
     DP4A_HELPER,
     FUNNEL_HELPERS,
@@ -421,6 +422,29 @@ __global__ void product(long long* w) {
         )
         self.assertEqual(translate_source(source, "maca"), source)
 
+    def test_hip_and_musa_lower_absolute_differences(self) -> None:
+        source = """\
+#include <cuda_runtime.h>
+__global__ void distance(unsigned* out) {
+    const char* label = "__sad";
+    int a = (int)0x80000000;
+    out[0] = __usad(__sad(-1, 1, 0u), 0u, 1u);
+    out[1] = __sad(a, 0, 0u);
+    out[2] = __usad(0xffffffffu, 0u, 0u);
+    out[3] = label[0];
+}
+"""
+        for target in ("hip", "musa"):
+            translated = translate_source(source, target)
+            self.assertIn('"__sad"', translated)
+            self.assertIn("cts_usad(cts_sad(-1, 1, 0u), 0u, 1u)", translated)
+            self.assertIn("cts_sad(a, 0, 0u)", translated)
+            self.assertIn("cts_usad(0xffffffffu, 0u, 0u)", translated)
+            self.assertNotIn("__sad(", translated)
+            self.assertNotIn("__usad(", translated)
+            self.assertIn("static_cast<long long>", translated)
+        self.assertEqual(translate_source(source, "maca"), source)
+
     def test_unparsed_source_is_refused(self) -> None:
         with self.assertRaises(TranslateError):
             translate_source("int main( {\n", "hip", filename="broken.cu")
@@ -602,6 +626,26 @@ class CorpusTests(unittest.TestCase):
             self.assertEqual(translated.count("cts_mulhi("), 4)
         self.assertIn("__mulhi", maca)
         self.assertNotIn("cts_mulhi", maca)
+
+    def test_hip_and_musa_lower_the_census_sad(self) -> None:
+        path = CENSUS / "sad" / "main.cu"
+        if not path.is_file():
+            self.skipTest("sad is not in the census corpus")
+        hip = translate_path(path, "hip")
+        musa = translate_path(path, "musa")
+        maca = translate_path(path, "maca")
+        for translated in (hip, musa):
+            self.assertIn("cts_sad(-1, 1, 0u)", translated)
+            self.assertIn("cts_sad(a, 0, 0u)", translated)
+            self.assertIn("cts_sad(a, 1, 0u)", translated)
+            self.assertIn("cts_sad(1, 0, 0xffffffffu)", translated)
+            self.assertIn("cts_usad(0xffffffffu, 0u, 0u)", translated)
+            self.assertIn("cts_usad(0u, 1u, 0xffffffffu)", translated)
+            self.assertNotIn("__sad(", translated)
+            self.assertNotIn("__usad(", translated)
+            self.assertEqual(translated.count("cts_sad("), 5)
+        self.assertIn("__sad", maca)
+        self.assertNotIn("cts_sad", maca)
 
     def test_only_hip_pins_warp_size(self) -> None:
         path = CENSUS / "warp_size" / "main.cu"
@@ -1466,6 +1510,68 @@ int main() {{
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "mulhi.cu"
             binary = Path(directory) / "mulhi"
+            path.write_text(source, encoding="utf-8")
+            env = {**os.environ, "CUDA_VISIBLE_DEVICES": device}
+            compiled = subprocess.run(
+                [nvcc, "-arch=native", str(path), "-o", str(binary)],
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+            )
+            if compiled.returncode != 0:
+                self.fail(compiled.stderr)
+            ran = subprocess.run(
+                [str(binary)],
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+            )
+        self.assertEqual(ran.returncode, 0, ran.stderr)
+        self.assertEqual(ran.stdout.strip(), "mismatch=0")
+
+    def test_sad_helpers_agree_with_the_intrinsics(self) -> None:
+        nvcc = shutil.which("nvcc")
+        if nvcc is None:
+            self.skipTest("nvcc is not installed")
+        device = _idle_gpu()
+        if device is None:
+            self.skipTest("every GPU has a compute process")
+        helpers = "\n".join(helper.strip("\n") for _name, helper in SAD_HELPERS.values())
+        source = f"""\
+#include <cstdio>
+#include <cuda_runtime.h>
+{helpers}
+__global__ void compare(int* bad) {{
+    int a = (int)0x80000000;
+    if (__sad(-1, 1, 0u) != cts_sad(-1, 1, 0u)) atomicExch(bad, 1);
+    if (__sad(a, 0, 0u) != cts_sad(a, 0, 0u)) atomicExch(bad, 1);
+    if (__sad(a, 1, 0u) != cts_sad(a, 1, 0u)) atomicExch(bad, 1);
+    if (__sad(a, 2147483647, 0u) != cts_sad(a, 2147483647, 0u)) atomicExch(bad, 1);
+    if (__sad(a, a, 0u) != cts_sad(a, a, 0u)) atomicExch(bad, 1);
+    if (__sad(1, 0, 0xffffffffu) != cts_sad(1, 0, 0xffffffffu)) atomicExch(bad, 1);
+    if (__sad(a, 2147483647, 1u) != cts_sad(a, 2147483647, 1u)) atomicExch(bad, 1);
+    if (__usad(0xffffffffu, 0u, 0u) != cts_usad(0xffffffffu, 0u, 0u)) atomicExch(bad, 1);
+    if (__usad(0u, 1u, 0xffffffffu) != cts_usad(0u, 1u, 0xffffffffu)) atomicExch(bad, 1);
+    if (__usad(0xffffffffu, 0u, 1u) != cts_usad(0xffffffffu, 0u, 1u)) atomicExch(bad, 1);
+}}
+int main() {{
+    int* bad = nullptr;
+    if (cudaMalloc(&bad, sizeof(*bad)) != cudaSuccess) return 2;
+    if (cudaMemset(bad, 0, sizeof(*bad)) != cudaSuccess) return 2;
+    compare<<<1, 1>>>(bad);
+    if (cudaDeviceSynchronize() != cudaSuccess) return 3;
+    int mismatch = 0;
+    if (cudaMemcpy(&mismatch, bad, sizeof(mismatch), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
+    std::printf("mismatch=%d\\n", mismatch);
+    cudaFree(bad);
+    return 0;
+}}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "sad.cu"
+            binary = Path(directory) / "sad"
             path.write_text(source, encoding="utf-8")
             env = {**os.environ, "CUDA_VISIBLE_DEVICES": device}
             compiled = subprocess.run(

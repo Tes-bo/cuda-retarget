@@ -21,6 +21,7 @@ from cuda_retarget.dialect import (
     FUNNEL_HELPERS,
     HADD_HELPERS,
     MULHI_HELPERS,
+    SAD_HELPERS,
     MATCH_ALL_HELPER,
     PACKED_ABS_HELPERS,
     PACKED_HELPERS,
@@ -218,6 +219,12 @@ def _call_edit(
             raise TranslateError(f"{token.spelling} must have two arguments")
         replacement, _helper = MULHI_HELPERS[token.spelling]
         return (token.start, token.end, replacement)
+    if dialect.lower_sad and token.spelling in SAD_HELPERS:
+        parsed = _arguments(tokens, index + 1)
+        if parsed is None or len(parsed[0]) != 3:
+            raise TranslateError(f"{token.spelling} must have three arguments")
+        replacement, _helper = SAD_HELPERS[token.spelling]
+        return (token.start, token.end, replacement)
     return None
 
 
@@ -324,6 +331,10 @@ def _helpers(dialect: Dialect, rewritten: str) -> str:
             used.add("cts_umul64hi")
         for name, helper in MULHI_HELPERS.values():
             if name in used:
+                blocks.append(helper.strip("\n"))
+    if dialect.lower_sad:
+        for name, helper in SAD_HELPERS.values():
+            if f"{name}(" in rewritten:
                 blocks.append(helper.strip("\n"))
     return "\n\n".join(blocks)
 

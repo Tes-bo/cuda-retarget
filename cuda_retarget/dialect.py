@@ -259,6 +259,11 @@ class Dialect:
     from 32-bit halves. A negative product sign-extends, so the high
     half of a small negative product is all ones. `INT_MIN * INT_MIN`
     keeps the high half `2^30` instead of wrapping a 32-bit multiply.
+    `lower_sad` replaces `__sad` and `__usad`. Each result is the
+    absolute difference plus the third argument. The signed form widens
+    before the subtraction, so the absolute value of `INT_MIN` is
+    `2^31` and `|INT_MIN - 1|` is `2^31 + 1`. The unsigned form treats
+    the same bits as a magnitude. The sum wraps modulo `2^32`.
     """
 
     name: str
@@ -277,6 +282,7 @@ class Dialect:
     lower_byte_perm: bool
     lower_hadd: bool
     lower_mulhi: bool
+    lower_sad: bool
 
 
 DIALECTS = {
@@ -297,6 +303,7 @@ DIALECTS = {
         lower_byte_perm=True,
         lower_hadd=True,
         lower_mulhi=True,
+        lower_sad=True,
     ),
     "musa": Dialect(
         name="musa",
@@ -315,6 +322,7 @@ DIALECTS = {
         lower_byte_perm=True,
         lower_hadd=True,
         lower_mulhi=True,
+        lower_sad=True,
     ),
     "maca": Dialect(
         name="maca",
@@ -333,6 +341,7 @@ DIALECTS = {
         lower_byte_perm=False,
         lower_hadd=False,
         lower_mulhi=False,
+        lower_sad=False,
     ),
 }
 
@@ -658,6 +667,29 @@ PACKED_ABS_HELPERS = {
         ("__vabsdiffs4", 4, "diffs", 2),
         ("__vabsdiffu4", 4, "diffu", 2),
     )
+}
+
+
+SAD_HELPERS = {
+    "__sad": (
+        "cts_sad",
+        """
+static __device__ unsigned cts_sad(int x, int y, unsigned z) {
+    long long diff = static_cast<long long>(x) - static_cast<long long>(y);
+    if (diff < 0) diff = -diff;
+    return static_cast<unsigned>(static_cast<unsigned long long>(diff) + z);
+}
+""",
+    ),
+    "__usad": (
+        "cts_usad",
+        """
+static __device__ unsigned cts_usad(unsigned x, unsigned y, unsigned z) {
+    unsigned diff = x >= y ? x - y : y - x;
+    return diff + z;
+}
+""",
+    ),
 }
 
 
