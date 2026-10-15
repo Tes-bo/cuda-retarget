@@ -12,12 +12,20 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
-from cuda_retarget.dialect import BITCAST_HELPERS, DIALECTS, Dialect, runtime_name
+from cuda_retarget.dialect import (
+    BITCAST_HELPERS,
+    DIALECTS,
+    MATCH_ALL_HELPER,
+    MATCH_ANY_HELPER,
+    Dialect,
+    runtime_name,
+)
 from cuda_retarget.parse import ParseError, Tok, parse_file
 
 _FULL_MASKS = {"0xffffffff", "0xffffffffu", "0xffffffffl", "0xffffffffll", "0xffffffffull"}
 # Same default width as __shfl_sync: the last argument defaults to warpSize.
 _SHUFFLES = {"__shfl_sync", "__shfl_xor_sync", "__shfl_up_sync", "__shfl_down_sync"}
+_MATCHES = {"__match_any_sync": 2, "__match_all_sync": 3}
 
 
 class TranslateError(Exception):
@@ -112,6 +120,14 @@ def _call_edit(
             # The identifier loop still rewrites runtime names inside the call.
             paren = tokens[close].start
             return (paren, paren, ", 32")
+    if dialect.match_width_32 and token.spelling in _MATCHES:
+        parsed = _arguments(tokens, index + 1)
+        if parsed is None:
+            raise TranslateError(f"{token.spelling} arguments are not a simple call")
+        args, _close = parsed
+        if len(args) == _MATCHES[token.spelling] and _is_full_mask(text, args[0]):
+            replacement = "cts_match_any_sync" if token.spelling == "__match_any_sync" else "cts_match_all_sync"
+            return (token.start, token.end, replacement)
     if dialect.lower_bitcasts and token.spelling in BITCAST_HELPERS:
         parsed = _arguments(tokens, index + 1)
         if parsed is None or len(parsed[0]) != 1:
@@ -173,12 +189,17 @@ def _apply(text: str, edits: list[tuple[int, int, str]]) -> bytes:
 
 
 def _helpers(dialect: Dialect, rewritten: str) -> str:
-    if not dialect.lower_bitcasts:
-        return ""
     blocks = []
-    for name, helper in BITCAST_HELPERS.values():
-        if f"{name}(" in rewritten:
-            blocks.append(helper.strip("\n"))
+    if dialect.lower_bitcasts:
+        for name, helper in BITCAST_HELPERS.values():
+            if f"{name}(" in rewritten:
+                blocks.append(helper.strip("\n"))
+    if dialect.match_width_32 and (
+        "cts_match_any_sync(" in rewritten or "cts_match_all_sync(" in rewritten
+    ):
+        blocks.append(MATCH_ANY_HELPER.strip("\n"))
+        if "cts_match_all_sync(" in rewritten:
+            blocks.append(MATCH_ALL_HELPER.strip("\n"))
     return "\n\n".join(blocks)
 
 

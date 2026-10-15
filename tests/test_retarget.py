@@ -14,7 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from cuda_retarget.dialect import BITCAST_HELPERS
+from cuda_retarget.dialect import BITCAST_HELPERS, MATCH_ALL_HELPER, MATCH_ANY_HELPER
 from cuda_retarget.translate import TranslateError, translate_path, translate_source
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -73,6 +73,30 @@ class EdgeTests(unittest.TestCase):
     def test_unknown_target_is_refused(self) -> None:
         with self.assertRaises(TranslateError):
             translate_source("int main(){return 0;}\n", "spirv")
+
+    def test_only_hip_lowers_full_mask_match(self) -> None:
+        source = """\
+#include <cuda_runtime.h>
+__global__ void match_keys(unsigned* out) {
+    const char* label = "__match_any_sync";
+    unsigned key = threadIdx.x & 31u;
+    int pred = 0;
+    unsigned partial = __match_any_sync(0x0000ffff, key);
+    unsigned full = __match_any_sync(0xffffffff, key);
+    unsigned all = __match_all_sync(0xffffffff, key, &pred);
+    *out = partial + full + all + pred + label[0];
+}
+"""
+        hip = translate_source(source, "hip")
+        self.assertIn("__match_any_sync(0x0000ffff, key)", hip)
+        self.assertIn("cts_match_any_sync(0xffffffff, key)", hip)
+        self.assertIn("cts_match_all_sync(0xffffffff, key, &pred)", hip)
+        self.assertIn('"__match_any_sync"', hip)
+        self.assertIn("__shfl_sync(mask, value, src, 32)", hip)
+        musa = translate_source(source, "musa")
+        self.assertIn("__match_any_sync(0xffffffff, key)", musa)
+        self.assertNotIn("cts_match_any_sync", musa)
+        self.assertEqual(translate_source(source, "maca"), source)
 
     def test_hip_and_musa_lower_bitcasts(self) -> None:
         for target in ("hip", "musa"):
@@ -244,6 +268,82 @@ int main() {{
             )
         self.assertEqual(ran.returncode, 0, ran.stderr)
         self.assertEqual(ran.stdout.strip(), f"bits={BITS}\nfbits={FLOAT_BITS}")
+
+    def test_match_helper_agrees_with_the_intrinsic(self) -> None:
+        nvcc = shutil.which("nvcc")
+        if nvcc is None:
+            self.skipTest("nvcc is not installed")
+        device = _idle_gpu()
+        if device is None:
+            self.skipTest("every GPU has a compute process")
+        helpers = MATCH_ANY_HELPER.strip("\n") + "\n" + MATCH_ALL_HELPER.strip("\n")
+        source = f"""\
+#include <cstdio>
+#include <cuda_runtime.h>
+{helpers}
+__global__ void compare_keys(int* bad, unsigned* lane0) {{
+    unsigned key = threadIdx.x & 31u;
+    int pred_i = 0;
+    int pred_h = 0;
+    unsigned any_i = __match_any_sync(0xffffffff, key);
+    unsigned any_h = cts_match_any_sync(0xffffffff, key);
+    unsigned all_i = __match_all_sync(0xffffffff, key, &pred_i);
+    unsigned all_h = cts_match_all_sync(0xffffffff, key, &pred_h);
+    if (any_i != any_h || all_i != all_h || pred_i != pred_h)
+        atomicExch(bad, 1);
+    if (threadIdx.x == 0)
+        *lane0 = any_i;
+}}
+__global__ void compare_zeros(int* bad) {{
+    float value = threadIdx.x == 0 ? -0.f : 0.f;
+    unsigned any_i = __match_any_sync(0xffffffff, value);
+    unsigned any_h = cts_match_any_sync(0xffffffff, value);
+    if (any_i != any_h)
+        atomicExch(bad, 1);
+}}
+int main() {{
+    int* bad = nullptr;
+    unsigned* lane0 = nullptr;
+    if (cudaMalloc(&bad, sizeof(*bad)) != cudaSuccess) return 2;
+    if (cudaMalloc(&lane0, sizeof(*lane0)) != cudaSuccess) return 2;
+    if (cudaMemset(bad, 0, sizeof(*bad)) != cudaSuccess) return 2;
+    compare_keys<<<1, 64>>>(bad, lane0);
+    compare_zeros<<<1, 32>>>(bad);
+    if (cudaDeviceSynchronize() != cudaSuccess) return 3;
+    int mismatch = 0;
+    unsigned lane = 0;
+    if (cudaMemcpy(&mismatch, bad, sizeof(mismatch), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
+    if (cudaMemcpy(&lane, lane0, sizeof(lane), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
+    std::printf("mismatch=%d\\n", mismatch);
+    std::printf("lane0=%u\\n", lane);
+    cudaFree(bad);
+    cudaFree(lane0);
+    return 0;
+}}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "match.cu"
+            binary = Path(directory) / "match"
+            path.write_text(source, encoding="utf-8")
+            env = {**os.environ, "CUDA_VISIBLE_DEVICES": device}
+            compiled = subprocess.run(
+                [nvcc, "-arch=native", str(path), "-o", str(binary)],
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+            )
+            if compiled.returncode != 0:
+                self.fail(compiled.stderr)
+            ran = subprocess.run(
+                [str(binary)],
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+            )
+        self.assertEqual(ran.returncode, 0, ran.stderr)
+        self.assertEqual(ran.stdout.strip(), "mismatch=0\nlane0=1")
 
 
 if __name__ == "__main__":

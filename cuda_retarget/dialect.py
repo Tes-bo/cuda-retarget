@@ -107,6 +107,10 @@ class Dialect:
     program. A `#define` name is left in place.
     `lower_bitcasts` replaces the CUDA float and double bitcast intrinsics
     with union helpers. The IEEE bit pattern of the value does not change.
+    `match_width_32` lowers a full-mask `__match_any_sync` or
+    `__match_all_sync` to a 32-lane helper. CUDA's result is a mask of one
+    warp. A 64-lane wavefront would include the paired lane from the next
+    warp.
     """
 
     name: str
@@ -114,6 +118,7 @@ class Dialect:
     headers: dict[str, str]
     shuffle_width_32: bool
     lower_bitcasts: bool
+    match_width_32: bool
 
 
 DIALECTS = {
@@ -123,6 +128,7 @@ DIALECTS = {
         headers={"cuda_runtime.h": "hip/hip_runtime.h"},
         shuffle_width_32=True,
         lower_bitcasts=True,
+        match_width_32=True,
     ),
     "musa": Dialect(
         name="musa",
@@ -130,6 +136,7 @@ DIALECTS = {
         headers={"cuda_runtime.h": "musa_runtime.h"},
         shuffle_width_32=False,
         lower_bitcasts=True,
+        match_width_32=False,
     ),
     "maca": Dialect(
         name="maca",
@@ -137,8 +144,58 @@ DIALECTS = {
         headers={},
         shuffle_width_32=False,
         lower_bitcasts=False,
+        match_width_32=False,
     ),
 }
+
+
+MATCH_ANY_HELPER = """
+template <class T>
+static __device__ int cts_same_bits(T left, T right) {
+    return left == right;
+}
+
+static __device__ int cts_same_bits(float left, float right) {
+    union {
+        float as_float;
+        unsigned as_bits;
+    } a, b;
+    a.as_float = left;
+    b.as_float = right;
+    return a.as_bits == b.as_bits;
+}
+
+static __device__ int cts_same_bits(double left, double right) {
+    union {
+        double as_double;
+        unsigned long long as_bits;
+    } a, b;
+    a.as_double = left;
+    b.as_double = right;
+    return a.as_bits == b.as_bits;
+}
+
+template <class T>
+static __device__ unsigned cts_match_any_sync(unsigned mask, T value) {
+    unsigned bits = 0;
+#pragma unroll
+    for (int src = 0; src < 32; ++src) {
+        T other = __shfl_sync(mask, value, src, 32);
+        if (cts_same_bits(other, value))
+            bits |= 1u << src;
+    }
+    return bits;
+}
+"""
+
+MATCH_ALL_HELPER = """
+template <class T>
+static __device__ unsigned cts_match_all_sync(unsigned mask, T value, int* pred) {
+    unsigned same = cts_match_any_sync(mask, value) == mask;
+    *pred = static_cast<int>(same);
+    return same ? mask : 0u;
+}
+"""
 
 
 def runtime_name(spelling: str, dialect: Dialect) -> str | None:
