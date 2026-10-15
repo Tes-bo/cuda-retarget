@@ -14,7 +14,7 @@ from cuda_retarget.translate import TranslateError, translate_path, translate_so
 _SAMPLE = """\
 #include <cuda_runtime.h>
 __global__ void broadcast(int* out) {
-    *out = __shfl_sync(0xffffffff, threadIdx.x, 0);
+    *out = __shfl_sync(0xffffffff, threadIdx.x, 0) + warpSize;
 }
 int main() {
     int* p = nullptr;
@@ -58,13 +58,16 @@ def cmd_self_check(_args: argparse.Namespace) -> int:
     if "hipMalloc" not in hip or "<hip/hip_runtime.h>" not in hip:
         print("HIP runtime rename failed", file=sys.stderr)
         return 1
-    if "__shfl_sync(0xffffffff, threadIdx.x, 0, 32)" not in hip:
+    if "__shfl_sync(0xffffffff, threadIdx.x, 0, 32)" not in hip or "+ 32" not in hip:
         print("HIP kept a 32-lane shuffle on the default wavefront width", file=sys.stderr)
+        return 1
+    if "warpSize" in hip:
+        print("HIP left warpSize as the device builtin", file=sys.stderr)
         return 1
     if "musaMalloc" not in musa or "<musa_runtime.h>" not in musa:
         print("MUSA runtime rename failed", file=sys.stderr)
         return 1
-    if "__shfl_sync(0xffffffff, threadIdx.x, 0);" not in musa or ", 32)" in musa:
+    if "__shfl_sync(0xffffffff, threadIdx.x, 0) + warpSize;" not in musa or ", 32)" in musa:
         print("MUSA shuffle width was rewritten", file=sys.stderr)
         return 1
     if maca != _SAMPLE:

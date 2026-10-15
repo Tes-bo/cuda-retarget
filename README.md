@@ -4,7 +4,7 @@ Translate CUDA source to HIP, to MUSA, and to the CUDA spelling MetaX compiles. 
 
 Clang tokenises the file. The rewrite rules in this repository decide what changes. `cuda-retarget` does not invoke HIPIFY, musify, or cu-bridge, and it does not ship their source. It also does not compile. AMD's runtime, Moore Threads' runtime, MetaX's runtime, and each vendor's instruction set stay theirs. A renamed `cudaMalloc` is not a binary.
 
-The semantic edits are the part a prefix swap drops. On HIP, a 3-argument `__shfl_sync` whose mask is the full 32-bit literal keeps CUDA's subgroup width of 32, because an omitted width follows the device wavefront and AMD's is 64. On MUSA that call stays 3 arguments, because the documented warp is 32 lanes. `__double_as_longlong` becomes a device union helper on HIP and MUSA so the IEEE bits of the value do not depend on a CUDA intrinsic. MetaX keeps every CUDA spelling: that compiler accepts CUDA, and an identity translation is the honest output.
+The semantic edits are the part a prefix swap drops. On HIP, a 3-argument `__shfl_sync`, `__shfl_xor_sync`, `__shfl_up_sync`, or `__shfl_down_sync` whose mask is the full 32-bit literal keeps CUDA's subgroup width of 32, because an omitted width follows the device wavefront and AMD's is 64. A use of `warpSize` becomes the literal `32` for the same reason. The name in a `#define` stays. On MUSA those calls stay 3 arguments and `warpSize` stays, because the documented warp is 32 lanes. `__double_as_longlong` becomes a device union helper on HIP and MUSA so the IEEE bits of the value do not depend on a CUDA intrinsic. MetaX keeps every CUDA spelling: that compiler accepts CUDA, and an identity translation is the honest output.
 
 This project is not affiliated with NVIDIA, AMD, Hygon, Moore Threads, or MetaX. It does not score itself inside [cuda-census](https://github.com/Tes-bo/cuda-census). cuda-census runs official toolchains only.
 
@@ -12,7 +12,7 @@ This project is not affiliated with NVIDIA, AMD, Hygon, Moore Threads, or MetaX.
 
 | `--target` | Names | Header | 32-lane `__shfl_sync` | `__double_as_longlong` |
 | --- | --- | --- | --- | --- |
-| `hip` | `cudaMalloc` becomes `hipMalloc`, and the same prefix rule for every `cuda` identifier whose next character is uppercase | `hip/hip_runtime.h` | a full-mask 3-argument call gains `, 32` | `cts_double_bits` |
+| `hip` | `cudaMalloc` becomes `hipMalloc`, and the same prefix rule for every `cuda` identifier whose next character is uppercase. A `warpSize` use becomes `32` | `hip/hip_runtime.h` | a full-mask 3-argument `__shfl_sync`, `__shfl_xor_sync`, `__shfl_up_sync`, or `__shfl_down_sync` gains `, 32` | `cts_double_bits` |
 | `musa` | the same rule with the `musa` prefix | `musa_runtime.h` | unchanged | `cts_double_bits` |
 | `maca` | unchanged | `cuda_runtime.h` | unchanged | unchanged |
 
@@ -23,7 +23,7 @@ This project is not affiliated with NVIDIA, AMD, Hygon, Moore Threads, or MetaX.
 These are not rewritten, and a later vendor compile may reject them or change their meaning:
 
 - Inline PTX.
-- A `__shfl_sync` whose width is already written. That width is kept, including `warpSize`.
+- A shuffle whose width argument is already a literal. That literal is kept.
 - A 3-argument `__shfl_sync` whose mask is not the literal `0xffffffff` (any of `u`, `l`, `ll`, `ull`). A variable mask is still CUDA's width 32 on NVIDIA and the wavefront width on AMD. This rewriter does not guess which mask the programmer meant to widen.
 - `lane & 31` and any other width arithmetic.
 - CUDA Graph instantiate signatures that drift between runtimes. The 5-argument call is renamed and its arguments stay.

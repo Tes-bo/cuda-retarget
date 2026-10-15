@@ -16,6 +16,8 @@ from cuda_retarget.dialect import DIALECTS, DOUBLE_BITS_HELPER, Dialect, runtime
 from cuda_retarget.parse import ParseError, Tok, parse_file
 
 _FULL_MASKS = {"0xffffffff", "0xffffffffu", "0xffffffffl", "0xffffffffll", "0xffffffffull"}
+# Same default width as __shfl_sync: the last argument defaults to warpSize.
+_SHUFFLES = {"__shfl_sync", "__shfl_xor_sync", "__shfl_up_sync", "__shfl_down_sync"}
 
 
 class TranslateError(Exception):
@@ -62,9 +64,17 @@ def _edits(text: str, tokens: list[Tok], dialect: Dialect) -> list[tuple[int, in
             edits.append(call)
         token = tokens[index]
         if token.kind == "IDENTIFIER":
-            renamed = runtime_name(token.spelling, dialect)
-            if renamed is not None:
-                edits.append((token.start, token.end, renamed))
+            if (
+                dialect.shuffle_width_32
+                and token.spelling == "warpSize"
+                and not _is_define_name(tokens, index)
+            ):
+                # CUDA's builtin is 32. On AMD the same name follows the wavefront.
+                edits.append((token.start, token.end, "32"))
+            else:
+                renamed = runtime_name(token.spelling, dialect)
+                if renamed is not None:
+                    edits.append((token.start, token.end, renamed))
         index += 1
     _reject_overlaps(edits)
     return edits
@@ -92,10 +102,10 @@ def _call_edit(
         return None
     if index + 1 >= len(tokens) or tokens[index + 1].spelling != "(":
         return None
-    if token.spelling == "__shfl_sync" and dialect.shuffle_width_32:
+    if token.spelling in _SHUFFLES and dialect.shuffle_width_32:
         parsed = _arguments(tokens, index + 1)
         if parsed is None:
-            raise TranslateError("__shfl_sync arguments are not a simple call")
+            raise TranslateError(f"{token.spelling} arguments are not a simple call")
         args, close = parsed
         if len(args) == 3 and _is_full_mask(text, args[0]):
             # Insert before the closing parenthesis. CUDA's omitted width is 32.
@@ -108,6 +118,10 @@ def _call_edit(
             raise TranslateError("__double_as_longlong must have one argument")
         return (token.start, token.end, "cts_double_bits")
     return None
+
+
+def _is_define_name(tokens: list[Tok], index: int) -> bool:
+    return index >= 2 and tokens[index - 2].spelling == "#" and tokens[index - 1].spelling == "define"
 
 
 def _arguments(tokens: list[Tok], open_index: int) -> tuple[list[tuple[int, int]], int] | None:

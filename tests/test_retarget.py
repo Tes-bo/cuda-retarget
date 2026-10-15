@@ -33,6 +33,11 @@ class EdgeTests(unittest.TestCase):
         self.assertIn("__shfl_sync(0xffffffff, lane, 5, 16)", hip)
         self.assertIn("__shfl_sync(0x0000ffff, lane, 1)", hip)
         self.assertNotIn("__shfl_sync(0xffffffff, lane, 5, 16, 32)", hip)
+        self.assertIn("__shfl_xor_sync(0xffffffff, lane, 1, 32)", hip)
+        self.assertIn("__shfl_up_sync(0xffffffff, lane, 1, 32)", hip)
+        self.assertIn("__shfl_down_sync(0xffffffff, lane, 1, 32)", hip)
+        self.assertIn("#define warpSize 32", hip)
+        self.assertIn("int width = 32;", hip)
         self.assertIn("hipFoo", hip)
         self.assertNotIn("cudaFoo", hip)
         self.assertIn("<hip/hip_runtime.h>", hip)
@@ -40,6 +45,8 @@ class EdgeTests(unittest.TestCase):
     def test_musa_does_not_pin_shuffle_width(self) -> None:
         musa = translate_path(FIXTURE, "musa")
         self.assertIn("__shfl_sync(0xffffffff, lane, 5);", musa)
+        self.assertIn("__shfl_xor_sync(0xffffffff, lane, 1);", musa)
+        self.assertIn("int width = warpSize;", musa)
         self.assertNotIn(", 32)", musa)
         self.assertIn("musaFoo", musa)
         self.assertIn("<musa_runtime.h>", musa)
@@ -85,6 +92,16 @@ class CorpusTests(unittest.TestCase):
         self.assertIn("__shfl_sync(0xffffffff, lane, 5, 32)", hip)
         self.assertIn("__shfl_sync(0xffffffff, lane, 5);", musa)
         self.assertNotIn(", 32)", musa)
+
+    def test_only_hip_pins_warp_size(self) -> None:
+        path = CENSUS / "warp_size" / "main.cu"
+        if not path.is_file():
+            self.skipTest("warp_size is not in the census corpus")
+        hip = translate_path(path, "hip")
+        musa = translate_path(path, "musa")
+        self.assertIn("*out = 32;", hip)
+        self.assertNotIn("warpSize", hip)
+        self.assertIn("*out = warpSize;", musa)
 
     def test_double_bits_helper_is_hip_and_musa_only(self) -> None:
         path = CENSUS / "double_as_longlong" / "main.cu"

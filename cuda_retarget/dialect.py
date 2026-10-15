@@ -28,10 +28,12 @@ class Dialect:
 
     `prefix` replaces the `cuda` prefix on runtime identifiers. None means the
     vendor compiler accepts CUDA spellings, so names stay.
-    `shuffle_width_32` rewrites a 3-argument full-mask `__shfl_sync` so the
-    subgroup width stays 32. NVIDIA's default width is 32. AMD's default
-    wavefront is 64, and a renamed call without an explicit width is a
-    different program.
+    `shuffle_width_32` keeps CUDA's subgroup of 32 lanes. A 3-argument
+    full-mask `__shfl_sync`, `__shfl_xor_sync`, `__shfl_up_sync`, or
+    `__shfl_down_sync` gains an explicit width of 32, and a `warpSize`
+    use becomes the literal 32. NVIDIA's default width is 32. AMD's
+    default wavefront is 64, so leaving either one alone is a different
+    program. A `#define` name is left in place.
     `lower_double_bits` replaces `__double_as_longlong` with a union helper.
     The IEEE bit pattern of the value does not change.
     """
