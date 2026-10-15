@@ -98,6 +98,25 @@ __global__ void match_keys(unsigned* out) {
         self.assertNotIn("cts_match_any_sync", musa)
         self.assertEqual(translate_source(source, "maca"), source)
 
+    def test_only_hip_writes_the_syncwarp_mask(self) -> None:
+        source = """\
+#include <cuda_runtime.h>
+__global__ void exchange(int* out) {
+    const char* label = "__syncwarp";
+    __syncwarp();
+    __syncwarp(0x0000ffff);
+    *out = label[0];
+}
+"""
+        hip = translate_source(source, "hip")
+        self.assertIn("__syncwarp(0xffffffff)", hip)
+        self.assertIn("__syncwarp(0x0000ffff)", hip)
+        self.assertNotIn("__syncwarp()", hip)
+        self.assertIn('"__syncwarp"', hip)
+        musa = translate_source(source, "musa")
+        self.assertIn("__syncwarp()", musa)
+        self.assertEqual(translate_source(source, "maca"), source)
+
     def test_only_hip_lowers_full_mask_vote(self) -> None:
         source = """\
 #include <cuda_runtime.h>
@@ -167,6 +186,18 @@ class CorpusTests(unittest.TestCase):
         musa = translate_path(path, "musa")
         self.assertIn("__shfl_sync(0xffffffff, lane, 5, 32)", hip)
         self.assertIn("__shfl_sync(0xffffffff, lane, 5);", musa)
+        self.assertNotIn(", 32)", musa)
+
+    def test_hip_pins_the_census_xor_reduce(self) -> None:
+        path = CENSUS / "warp_reduce" / "main.cu"
+        if not path.is_file():
+            self.skipTest("warp_reduce is not in the census corpus")
+        hip = translate_path(path, "hip")
+        musa = translate_path(path, "musa")
+        self.assertEqual(hip.count("__shfl_xor_sync(0xffffffff, value, "), 5)
+        self.assertIn("__shfl_xor_sync(0xffffffff, value, 16, 32)", hip)
+        self.assertIn("__shfl_xor_sync(0xffffffff, value, 1, 32)", hip)
+        self.assertIn("__shfl_xor_sync(0xffffffff, value, 16);", musa)
         self.assertNotIn(", 32)", musa)
 
     def test_only_hip_pins_warp_size(self) -> None:

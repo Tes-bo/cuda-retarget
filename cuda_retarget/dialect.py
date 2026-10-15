@@ -114,6 +114,9 @@ class Dialect:
     `vote_width_32` lowers a full-mask `__ballot_sync`, `__any_sync`,
     `__all_sync`, or `__uni_sync` the same way. A predicate that is uniform
     inside one warp of 32 can be mixed across a 64-lane wavefront.
+    `syncwarp_mask_32` rewrites a no-argument `__syncwarp()` to
+    `__syncwarp(0xffffffff)`. CUDA's default mask names 32 lanes. A header
+    default on a 64-lane wavefront does not.
     """
 
     name: str
@@ -123,6 +126,7 @@ class Dialect:
     lower_bitcasts: bool
     match_width_32: bool
     vote_width_32: bool
+    syncwarp_mask_32: bool
 
 
 DIALECTS = {
@@ -134,6 +138,7 @@ DIALECTS = {
         lower_bitcasts=True,
         match_width_32=True,
         vote_width_32=True,
+        syncwarp_mask_32=True,
     ),
     "musa": Dialect(
         name="musa",
@@ -143,6 +148,7 @@ DIALECTS = {
         lower_bitcasts=True,
         match_width_32=False,
         vote_width_32=False,
+        syncwarp_mask_32=False,
     ),
     "maca": Dialect(
         name="maca",
@@ -152,6 +158,7 @@ DIALECTS = {
         lower_bitcasts=False,
         match_width_32=False,
         vote_width_32=False,
+        syncwarp_mask_32=False,
     ),
 }
 

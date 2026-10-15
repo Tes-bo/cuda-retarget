@@ -142,6 +142,14 @@ def _call_edit(
         args, _close = parsed
         if len(args) == 2 and _is_full_mask(text, args[0]):
             return (token.start, token.end, _VOTES[token.spelling])
+    if dialect.syncwarp_mask_32 and token.spelling == "__syncwarp":
+        parsed = _arguments(tokens, index + 1)
+        if parsed is None:
+            raise TranslateError("__syncwarp arguments are not a simple call")
+        args, close = parsed
+        if len(args) == 0:
+            # CUDA's omitted mask is 0xffffffff, one warp of 32 lanes.
+            return (token.start, tokens[close].end, "__syncwarp(0xffffffff)")
     if dialect.lower_bitcasts and token.spelling in BITCAST_HELPERS:
         parsed = _arguments(tokens, index + 1)
         if parsed is None or len(parsed[0]) != 1:
