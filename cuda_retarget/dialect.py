@@ -227,6 +227,9 @@ class Dialect:
     `lower_funnelshifts` replaces `__funnelshift_l`, `__funnelshift_lc`,
     `__funnelshift_r`, and `__funnelshift_rc` with 64-bit shift helpers.
     Wrap (`l`, `r`) uses `shift & 31`. Clamp (`lc`, `rc`) uses `min(shift, 32)`.
+    `lower_dp4a` replaces `__dp4a` with signed and unsigned four-byte
+    dot-product helpers. A 0x80 byte is -128 on the signed overload and
+    128 on the unsigned overload.
     """
 
     name: str
@@ -238,6 +241,7 @@ class Dialect:
     vote_width_32: bool
     syncwarp_mask_32: bool
     lower_funnelshifts: bool
+    lower_dp4a: bool
 
 
 DIALECTS = {
@@ -251,6 +255,7 @@ DIALECTS = {
         vote_width_32=True,
         syncwarp_mask_32=True,
         lower_funnelshifts=True,
+        lower_dp4a=True,
     ),
     "musa": Dialect(
         name="musa",
@@ -262,6 +267,7 @@ DIALECTS = {
         vote_width_32=False,
         syncwarp_mask_32=False,
         lower_funnelshifts=True,
+        lower_dp4a=True,
     ),
     "maca": Dialect(
         name="maca",
@@ -273,6 +279,7 @@ DIALECTS = {
         vote_width_32=False,
         syncwarp_mask_32=False,
         lower_funnelshifts=False,
+        lower_dp4a=False,
     ),
 }
 
@@ -356,6 +363,32 @@ static __device__ int cts_uni_sync(unsigned mask, int predicate) {
 }
 """,
 }
+
+
+# Four-byte dot product. Signed bytes vs unsigned bytes are different programs.
+DP4A_HELPER = """
+static __device__ int cts_dp4a(int a, int b, int c) {
+    int sum = c;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        int aa = static_cast<signed char>(static_cast<unsigned>(a) >> (8 * i));
+        int bb = static_cast<signed char>(static_cast<unsigned>(b) >> (8 * i));
+        sum += aa * bb;
+    }
+    return sum;
+}
+
+static __device__ unsigned cts_dp4a(unsigned a, unsigned b, unsigned c) {
+    unsigned sum = c;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        unsigned aa = (a >> (8 * i)) & 0xffu;
+        unsigned bb = (b >> (8 * i)) & 0xffu;
+        sum += aa * bb;
+    }
+    return sum;
+}
+"""
 
 
 def runtime_name(spelling: str, dialect: Dialect) -> str | None:

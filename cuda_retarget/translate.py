@@ -16,6 +16,7 @@ from cuda_retarget.dialect import (
     BITCAST_HELPERS,
     DIALECTS,
     DOUBLE_WORD_HELPERS,
+    DP4A_HELPER,
     FUNNEL_HELPERS,
     MATCH_ALL_HELPER,
     MATCH_ANY_HELPER,
@@ -171,6 +172,11 @@ def _call_edit(
             raise TranslateError(f"{token.spelling} must have three arguments")
         replacement, _helper = FUNNEL_HELPERS[token.spelling]
         return (token.start, token.end, replacement)
+    if dialect.lower_dp4a and token.spelling == "__dp4a":
+        parsed = _arguments(tokens, index + 1)
+        if parsed is None or len(parsed[0]) != 3:
+            raise TranslateError("__dp4a must have three arguments")
+        return (token.start, token.end, "cts_dp4a")
     return None
 
 
@@ -251,6 +257,8 @@ def _helpers(dialect: Dialect, rewritten: str) -> str:
         for name, helper in FUNNEL_HELPERS.values():
             if f"{name}(" in rewritten:
                 blocks.append(helper.strip("\n"))
+    if dialect.lower_dp4a and "cts_dp4a(" in rewritten:
+        blocks.append(DP4A_HELPER.strip("\n"))
     return "\n\n".join(blocks)
 
 
