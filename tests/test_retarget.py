@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from cuda_retarget.dialect import (
     BITCAST_HELPERS,
+    DOUBLE_WORD_HELPERS,
     FUNNEL_HELPERS,
     MATCH_ALL_HELPER,
     MATCH_ANY_HELPER,
@@ -185,6 +186,30 @@ __global__ void shift(unsigned* out) {
                 self.assertEqual(translated.count(name + "("), 2)
         self.assertEqual(translate_source(BITCAST_SOURCE, "maca"), BITCAST_SOURCE)
 
+    def test_hip_and_musa_lower_double_words(self) -> None:
+        source = """\
+#include <cuda_runtime.h>
+__global__ void split(int* hi, int* lo, double* value) {
+    const char* label = "__double2hiint";
+    *hi = __double2hiint(*value);
+    *lo = __double2loint(*value);
+    *value = __hiloint2double(*hi, *lo);
+    *hi += label[0];
+}
+"""
+        for target in ("hip", "musa"):
+            translated = translate_source(source, target)
+            self.assertIn('"__double2hiint"', translated)
+            self.assertIn("cts_double_hiint(*value)", translated)
+            self.assertIn("cts_double_loint(*value)", translated)
+            self.assertIn("cts_hiloint_double(*hi, *lo)", translated)
+            self.assertNotIn("__double2hiint(", translated)
+            self.assertNotIn("__double2loint(", translated)
+            self.assertNotIn("__hiloint2double(", translated)
+            for _intrinsic, (name, _helper) in DOUBLE_WORD_HELPERS.items():
+                self.assertEqual(translated.count(name + "("), 2)
+        self.assertEqual(translate_source(source, "maca"), source)
+
     def test_unparsed_source_is_refused(self) -> None:
         with self.assertRaises(TranslateError):
             translate_source("int main( {\n", "hip", filename="broken.cu")
@@ -270,6 +295,22 @@ class CorpusTests(unittest.TestCase):
             self.assertLess(translated.index("cts_double_bits"), translated.index("bits_of_one"))
         self.assertIn("__double_as_longlong", maca)
         self.assertNotIn("cts_double_bits", maca)
+
+    def test_hip_and_musa_lower_the_census_double_words(self) -> None:
+        path = CENSUS / "double_hi_lo" / "main.cu"
+        if not path.is_file():
+            self.skipTest("double_hi_lo is not in the census corpus")
+        hip = translate_path(path, "hip")
+        musa = translate_path(path, "musa")
+        maca = translate_path(path, "maca")
+        for translated in (hip, musa):
+            self.assertIn("cts_double_hiint(1.0)", translated)
+            self.assertIn("cts_double_loint(1.0)", translated)
+            self.assertIn("cts_hiloint_double(hi, lo)", translated)
+            self.assertNotIn("__double2hiint(", translated)
+            self.assertNotIn("__hiloint2double(", translated)
+        self.assertIn("__double2hiint", maca)
+        self.assertNotIn("cts_double_hiint", maca)
 
     def test_graph_instantiate_keeps_five_arguments(self) -> None:
         path = CENSUS / "graph_async_alloc" / "main.cu"
@@ -587,6 +628,75 @@ int main() {{
         self.assertEqual(ran.returncode, 0, ran.stderr)
         self.assertEqual(ran.stdout.strip(), "mismatch=0")
 
+    def test_double_word_helpers_agree_with_the_intrinsics(self) -> None:
+        nvcc = shutil.which("nvcc")
+        if nvcc is None:
+            self.skipTest("nvcc is not installed")
+        device = _idle_gpu()
+        if device is None:
+            self.skipTest("every GPU has a compute process")
+        helpers = "\n".join(helper.strip("\n") for _name, helper in DOUBLE_WORD_HELPERS.values())
+        source = f"""\
+#include <cstdio>
+#include <cuda_runtime.h>
+{helpers}
+__device__ int words_mismatch(double value) {{
+    int hi_i = __double2hiint(value);
+    int lo_i = __double2loint(value);
+    int hi_h = cts_double_hiint(value);
+    int lo_h = cts_double_loint(value);
+    if (hi_i != hi_h || lo_i != lo_h)
+        return 1;
+    double again_i = __hiloint2double(hi_i, lo_i);
+    double again_h = cts_hiloint_double(hi_h, lo_h);
+    return __double2hiint(again_i) != cts_double_hiint(again_h)
+        || __double2loint(again_i) != cts_double_loint(again_h);
+}}
+__global__ void compare(int* bad) {{
+    double values[5] = {{0.0, -0.0, 1.0, -1.0, 3.141592653589793}};
+    for (int i = 0; i < 5; ++i) {{
+        if (words_mismatch(values[i]))
+            atomicExch(bad, 1);
+    }}
+}}
+int main() {{
+    int* bad = nullptr;
+    if (cudaMalloc(&bad, sizeof(*bad)) != cudaSuccess) return 2;
+    if (cudaMemset(bad, 0, sizeof(*bad)) != cudaSuccess) return 2;
+    compare<<<1, 1>>>(bad);
+    if (cudaDeviceSynchronize() != cudaSuccess) return 3;
+    int mismatch = 0;
+    if (cudaMemcpy(&mismatch, bad, sizeof(mismatch), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
+    std::printf("mismatch=%d\\n", mismatch);
+    cudaFree(bad);
+    return 0;
+}}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "words.cu"
+            binary = Path(directory) / "words"
+            path.write_text(source, encoding="utf-8")
+            env = {**os.environ, "CUDA_VISIBLE_DEVICES": device}
+            compiled = subprocess.run(
+                [nvcc, "-arch=native", str(path), "-o", str(binary)],
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+            )
+            if compiled.returncode != 0:
+                self.fail(compiled.stderr)
+            ran = subprocess.run(
+                [str(binary)],
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+            )
+        self.assertEqual(ran.returncode, 0, ran.stderr)
+        self.assertEqual(ran.stdout.strip(), "mismatch=0")
+
 
 if __name__ == "__main__":
     unittest.main()
+

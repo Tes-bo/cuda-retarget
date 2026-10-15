@@ -15,6 +15,7 @@ from pathlib import Path
 from cuda_retarget.dialect import (
     BITCAST_HELPERS,
     DIALECTS,
+    DOUBLE_WORD_HELPERS,
     FUNNEL_HELPERS,
     MATCH_ALL_HELPER,
     MATCH_ANY_HELPER,
@@ -157,6 +158,13 @@ def _call_edit(
             raise TranslateError(f"{token.spelling} must have one argument")
         replacement, _helper = BITCAST_HELPERS[token.spelling]
         return (token.start, token.end, replacement)
+    if dialect.lower_bitcasts and token.spelling in DOUBLE_WORD_HELPERS:
+        parsed = _arguments(tokens, index + 1)
+        expected = 2 if token.spelling == "__hiloint2double" else 1
+        if parsed is None or len(parsed[0]) != expected:
+            raise TranslateError(f"{token.spelling} must have {expected} argument(s)")
+        replacement, _helper = DOUBLE_WORD_HELPERS[token.spelling]
+        return (token.start, token.end, replacement)
     if dialect.lower_funnelshifts and token.spelling in FUNNEL_HELPERS:
         parsed = _arguments(tokens, index + 1)
         if parsed is None or len(parsed[0]) != 3:
@@ -221,6 +229,9 @@ def _helpers(dialect: Dialect, rewritten: str) -> str:
     blocks = []
     if dialect.lower_bitcasts:
         for name, helper in BITCAST_HELPERS.values():
+            if f"{name}(" in rewritten:
+                blocks.append(helper.strip("\n"))
+        for name, helper in DOUBLE_WORD_HELPERS.values():
             if f"{name}(" in rewritten:
                 blocks.append(helper.strip("\n"))
     if dialect.match_width_32 and (

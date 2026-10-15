@@ -93,6 +93,66 @@ static __device__ float cts_uint_bits(unsigned int bits) {
 }
 
 
+# High and low 32-bit words of an IEEE double. Same bits as the 64-bit bitcast.
+DOUBLE_WORD_HELPERS = {
+    "__double2hiint": (
+        "cts_double_hiint",
+        """
+static __device__ int cts_double_hiint(double value) {
+    union {
+        double as_double;
+        unsigned long long as_bits;
+    } converted;
+    union {
+        unsigned as_unsigned;
+        int as_int;
+    } high;
+    converted.as_double = value;
+    high.as_unsigned = static_cast<unsigned>(converted.as_bits >> 32);
+    return high.as_int;
+}
+""",
+    ),
+    "__double2loint": (
+        "cts_double_loint",
+        """
+static __device__ int cts_double_loint(double value) {
+    union {
+        double as_double;
+        unsigned long long as_bits;
+    } converted;
+    union {
+        unsigned as_unsigned;
+        int as_int;
+    } low;
+    converted.as_double = value;
+    low.as_unsigned = static_cast<unsigned>(converted.as_bits);
+    return low.as_int;
+}
+""",
+    ),
+    "__hiloint2double": (
+        "cts_hiloint_double",
+        """
+static __device__ double cts_hiloint_double(int hi, int lo) {
+    union {
+        unsigned as_unsigned;
+        int as_int;
+    } high, low;
+    union {
+        unsigned long long as_bits;
+        double as_double;
+    } converted;
+    high.as_int = hi;
+    low.as_int = lo;
+    converted.as_bits = (static_cast<unsigned long long>(high.as_unsigned) << 32) | low.as_unsigned;
+    return converted.as_double;
+}
+""",
+    ),
+}
+
+
 # Concatenate hi:lo, then shift. Wrap uses shift & 31. Clamp uses min(shift, 32).
 FUNNEL_HELPERS = {
     "__funnelshift_l": (
@@ -151,7 +211,9 @@ class Dialect:
     default wavefront is 64, so leaving either one alone is a different
     program. A `#define` name is left in place.
     `lower_bitcasts` replaces the CUDA float and double bitcast intrinsics
-    with union helpers. The IEEE bit pattern of the value does not change.
+    with union helpers, and splits or joins a double's high and low 32-bit
+    words (`__double2hiint`, `__double2loint`, `__hiloint2double`). The
+    IEEE bit pattern of the value does not change.
     `match_width_32` lowers a full-mask `__match_any_sync` or
     `__match_all_sync` to a 32-lane helper. CUDA's result is a mask of one
     warp. A 64-lane wavefront would include the paired lane from the next
