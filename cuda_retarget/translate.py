@@ -50,6 +50,7 @@ from cuda_retarget.dialect import (
     HALF_FROM_INT,
     HALF_HELPERS,
     HALF_TO_FLOAT,
+    HALF_TO_INT,
     Dialect,
     farith_needs_add,
     farith_needs_fma,
@@ -58,6 +59,7 @@ from cuda_retarget.dialect import (
     half_needs_from_float,
     half_needs_int,
     half_needs_to_float,
+    half_needs_to_int,
     round_needs_bits,
     round_needs_d2f,
     round_needs_i32,
@@ -483,6 +485,8 @@ def _helpers(dialect: Dialect, rewritten: str) -> str:
                 blocks.append(HALF_FROM_DOUBLE.strip("\n"))
             if half_needs_to_float(names):
                 blocks.append(HALF_TO_FLOAT.strip("\n"))
+            if half_needs_to_int(names):
+                blocks.append(HALF_TO_INT.strip("\n"))
             seen: set[str] = set()
             for name, helper in used:
                 if name in seen:

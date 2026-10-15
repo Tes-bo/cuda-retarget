@@ -324,7 +324,10 @@ class Dialect:
     2050. `65520` rounds to infinity, and toward zero it stays at the
     finite maximum. A double just above `2^-25` becomes the smallest half
     subnormal; casting that double to float first loses it. A double NaN
-    becomes `0x7fff`, and `-0` stays `-0`.
+    becomes `0x7fff`, and `-0` stays `-0`. `__half2int_rn` of 1.5 is 2
+    and toward zero is 1. A half of 32768 stays 32768 in 32 bits and
+    saturates to 32767 in a short. A half NaN becomes 0 for 32-bit and
+    16-bit results, and the high bit for 64-bit results.
     """
 
     name: str
@@ -1970,6 +1973,51 @@ static __device__ unsigned short cts_d2h(double value) {
 }
 """
 
+# Every finite half is exact in float. Short saturates past 32767.
+# A NaN is 0 for 16-bit and 32-bit results, and the high bit for 64-bit.
+HALF_TO_INT = """
+static __device__ unsigned long long cts_h2i(unsigned short bits, int mode, int kind) {
+    float x = cts_h2f(bits);
+    float y = rintf(x);
+    if (mode == 1) y = truncf(x);
+    else if (mode == 2) y = ceilf(x);
+    else if (mode == 3) y = floorf(x);
+    int nan = !(y == y);
+    if (kind == 0) {
+        if (nan) return 0ull;
+        if (y >= 2147483648.0f) return 2147483647ull;
+        if (y < -2147483648.0f) return 0x80000000ull;
+        return (unsigned)(int)y;
+    }
+    if (kind == 1) {
+        if (nan || y <= 0.0f) return 0ull;
+        if (y >= 4294967296.0f) return 0xffffffffull;
+        return (unsigned)y;
+    }
+    if (kind == 2) {
+        if (nan) return 0ull;
+        if (y >= 32768.0f) return 32767ull;
+        if (y < -32768.0f) return 0x8000ull;
+        return (unsigned short)(short)(int)y;
+    }
+    if (kind == 3) {
+        if (nan || y <= 0.0f) return 0ull;
+        if (y >= 65536.0f) return 65535ull;
+        return (unsigned short)y;
+    }
+    if (kind == 4) {
+        if (nan) return 0x8000000000000000ull;
+        if (y >= 0x1p63f) return 0x7fffffffffffffffull;
+        if (y <= -0x1p63f) return 0x8000000000000000ull;
+        return (unsigned long long)(long long)y;
+    }
+    if (nan) return 0x8000000000000000ull;
+    if (y <= 0.0f) return 0ull;
+    if (y >= 0x1p64f) return 0xffffffffffffffffull;
+    return (unsigned long long)y;
+}
+"""
+
 _HALF_CODE = {"rn": 0, "rz": 1, "ru": 2, "rd": 3}
 
 
@@ -2030,6 +2078,77 @@ static __device__ __half cts_double2half(double x) {
 }
 """,
 )
+def _half_out(ret: str, stem: str, mode: str, kind: int, pun: str) -> str:
+    code = _HALF_CODE[mode]
+    if pun == "u64":
+        return f"""
+static __device__ unsigned long long {stem}_{mode}(__half value) {{
+    union {{ unsigned short as_bits; __half as_half; }} in;
+    in.as_half = value;
+    return cts_h2i(in.as_bits, {code}, {kind});
+}}
+"""
+    if pun == "u32":
+        return f"""
+static __device__ unsigned {stem}_{mode}(__half value) {{
+    union {{ unsigned short as_bits; __half as_half; }} in;
+    in.as_half = value;
+    return (unsigned)cts_h2i(in.as_bits, {code}, {kind});
+}}
+"""
+    if pun == "u16":
+        return f"""
+static __device__ unsigned short {stem}_{mode}(__half value) {{
+    union {{ unsigned short as_bits; __half as_half; }} in;
+    in.as_half = value;
+    return (unsigned short)cts_h2i(in.as_bits, {code}, {kind});
+}}
+"""
+    if pun == "i16":
+        return f"""
+static __device__ short {stem}_{mode}(__half value) {{
+    union {{ unsigned short as_bits; __half as_half; }} in;
+    union {{ unsigned short as_bits; short as_value; }} out;
+    in.as_half = value;
+    out.as_bits = (unsigned short)cts_h2i(in.as_bits, {code}, {kind});
+    return out.as_value;
+}}
+"""
+    if pun == "i64":
+        return f"""
+static __device__ long long {stem}_{mode}(__half value) {{
+    union {{ unsigned short as_bits; __half as_half; }} in;
+    union {{ unsigned long long as_bits; long long as_value; }} out;
+    in.as_half = value;
+    out.as_bits = cts_h2i(in.as_bits, {code}, {kind});
+    return out.as_value;
+}}
+"""
+    return f"""
+static __device__ int {stem}_{mode}(__half value) {{
+    union {{ unsigned short as_bits; __half as_half; }} in;
+    union {{ unsigned as_bits; int as_value; }} out;
+    in.as_half = value;
+    out.as_bits = (unsigned)cts_h2i(in.as_bits, {code}, {kind});
+    return out.as_value;
+}}
+"""
+
+
+for _ret, _stem, _kind, _pun in (
+    ("int", "cts_half2int", 0, "i32"),
+    ("unsigned", "cts_half2uint", 1, "u32"),
+    ("short", "cts_half2short", 2, "i16"),
+    ("unsigned short", "cts_half2ushort", 3, "u16"),
+    ("long long", "cts_half2ll", 4, "i64"),
+    ("unsigned long long", "cts_half2ull", 5, "u64"),
+):
+    for _mode in ("rn", "rz", "ru", "rd"):
+        HALF_HELPERS[f"__{_stem[4:]}_{_mode}"] = (
+            f"{_stem}_{_mode}",
+            _half_out(_ret, _stem, _mode, _kind, _pun),
+        )
+
 HALF_HELPERS["__half2float"] = (
     "cts_half2float",
     """
@@ -2072,8 +2191,20 @@ def half_needs_double(names: set[str]) -> bool:
     return any(name.startswith("cts_double2half") for name in names)
 
 
+def half_needs_to_int(names: set[str]) -> bool:
+    prefixes = (
+        "cts_half2int_",
+        "cts_half2uint_",
+        "cts_half2short_",
+        "cts_half2ushort_",
+        "cts_half2ll_",
+        "cts_half2ull_",
+    )
+    return any(name.startswith(prefixes) for name in names)
+
+
 def half_needs_to_float(names: set[str]) -> bool:
-    return any(name.startswith("cts_half2float") for name in names)
+    return any(name.startswith("cts_half2float") for name in names) or half_needs_to_int(names)
 
 
 

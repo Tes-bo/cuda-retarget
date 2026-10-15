@@ -46,6 +46,7 @@ from cuda_retarget.dialect import (
     HALF_FROM_INT,
     HALF_HELPERS,
     HALF_TO_FLOAT,
+    HALF_TO_INT,
     PACKED_AVG_HELPERS,
     PACKED_CMP_HELPERS,
     PACKED_SAD_HELPERS,
@@ -791,6 +792,35 @@ __global__ void widen(double x, unsigned* u) { u[0] = __half_as_ushort(__double2
         self.assertNotIn("cts_s2h(", hip)
         self.assertEqual(translate_source(source, "maca"), source)
 
+    def test_hip_and_musa_lower_half_to_int(self) -> None:
+        source = """\
+#include <cuda_fp16.h>
+__global__ void convert(__half h, int* i, short* s, long long* w) {
+    const char* label = "__half2int_rn __half2short_rn __half2ll_rn";
+    *i = __half2int_rn(h);
+    *i += __half2int_ru(h);
+    *s = __half2short_rn(h);
+    *w = __half2ll_rn(h);
+    *i += label[0];
+}
+"""
+        for target in ("hip", "musa"):
+            translated = translate_source(source, target)
+            self.assertIn('"__half2int_rn __half2short_rn __half2ll_rn"', translated)
+            self.assertIn("cts_half2int_rn(h)", translated)
+            self.assertIn("cts_half2int_ru(h)", translated)
+            self.assertIn("cts_half2short_rn(h)", translated)
+            self.assertIn("cts_half2ll_rn(h)", translated)
+            self.assertIn("cts_h2i(", translated)
+            self.assertIn("cts_h2f(", translated)
+            self.assertNotIn("cts_f2h(", translated)
+            self.assertNotIn("__half2int_rn(", translated)
+            self.assertNotIn("__half2int_ru(", translated)
+            self.assertNotIn("__half2short_rn(", translated)
+            self.assertNotIn("__half2ll_rn(", translated)
+            self.assertEqual(translated.count("cts_half2int_rn("), 2)
+        self.assertEqual(translate_source(source, "maca"), source)
+
     def test_unparsed_source_is_refused(self) -> None:
         with self.assertRaises(TranslateError):
             translate_source("int main( {\n", "hip", filename="broken.cu")
@@ -1273,6 +1303,36 @@ class CorpusTests(unittest.TestCase):
         self.assertIn("__int2half_rn", maca)
         self.assertIn("__double2half", maca)
         self.assertNotIn("cts_double2half", maca)
+
+    def test_hip_and_musa_lower_the_census_half_int(self) -> None:
+        path = CENSUS / "half_int" / "main.cu"
+        if not path.is_file():
+            self.skipTest("half_int is not in the census corpus")
+        hip = translate_path(path, "hip")
+        musa = translate_path(path, "musa")
+        maca = translate_path(path, "maca")
+        for translated in (hip, musa):
+            self.assertIn("cts_half2int_rn(h15)", translated)
+            self.assertIn("cts_half2int_rz(h15)", translated)
+            self.assertIn("cts_half2int_ru(h05)", translated)
+            self.assertIn("cts_half2short_rn(h32)", translated)
+            self.assertIn("cts_half2ushort_rn(hbig)", translated)
+            self.assertIn("cts_half2uint_rn(hneg)", translated)
+            self.assertIn("cts_half2ll_rn(nan)", translated)
+            self.assertIn("cts_half2ull_rn(nan)", translated)
+            self.assertIn("cts_half2int_rn(nnan)", translated)
+            self.assertIn("cts_h2i(", translated)
+            self.assertIn("cts_h2f(", translated)
+            self.assertNotIn("cts_f2h(", translated)
+            self.assertNotIn("__half2int_rn(", translated)
+            self.assertNotIn("__half2short_rn(", translated)
+            self.assertNotIn("__half2ll_rn(", translated)
+            self.assertEqual(translated.count("cts_half2int_rn("), 8)
+            self.assertEqual(translated.count("cts_half2short_rn("), 7)
+            self.assertEqual(translated.count("cts_half2ll_rn("), 3)
+            self.assertEqual(translated.count("cts_half2ull_rn("), 2)
+        self.assertIn("__half2int_rn", maca)
+        self.assertNotIn("cts_half2int_rn", maca)
 
     def test_only_hip_pins_warp_size(self) -> None:
         path = CENSUS / "warp_size" / "main.cu"
@@ -2939,6 +2999,74 @@ __global__ void compare(int* bad) {{
             x.u = ((unsigned long long)sgn << 63) | ((unsigned long long)exp << 52) | 0x11ull;
             if (__half_as_ushort(__double2half(x.d)) != __half_as_ushort(cts_double2half(x.d))) atomicExch(bad, 1);
         }}
+    }}
+}}
+int main() {{
+    int* bad = nullptr;
+    if (cudaMalloc(&bad, sizeof(*bad)) != cudaSuccess) return 2;
+    if (cudaMemset(bad, 0, sizeof(*bad)) != cudaSuccess) return 2;
+    compare<<<1, 1>>>(bad);
+    if (cudaDeviceSynchronize() != cudaSuccess) return 3;
+    int mismatch = 0;
+    if (cudaMemcpy(&mismatch, bad, sizeof(mismatch), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
+    std::printf("mismatch=%d\\n", mismatch);
+    cudaFree(bad);
+    return 0;
+}}
+""",
+        )
+
+    def test_half_to_int_helpers_agree_with_the_intrinsics(self) -> None:
+        wanted = (
+            "__half2int_",
+            "__half2uint_",
+            "__half2short_",
+            "__half2ushort_",
+            "__half2ll_",
+            "__half2ull_",
+        )
+        wrappers = "\n".join(
+            body.strip("\n")
+            for key, (_name, body) in HALF_HELPERS.items()
+            if key.startswith(wanted)
+        )
+        helpers = "\n".join(
+            [HALF_TO_FLOAT.strip("\n"), HALF_TO_INT.strip("\n"), wrappers]
+        )
+        self._nvcc_mismatch(
+            "halfint",
+            f"""\
+#include <cstdio>
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+{helpers}
+__global__ void compare(int* bad) {{
+    for (unsigned bits = 0; bits < 65536u; ++bits) {{
+        __half h = __ushort_as_half((unsigned short)bits);
+        if (__half2int_rn(h) != cts_half2int_rn(h)) atomicExch(bad, 1);
+        if (__half2int_rz(h) != cts_half2int_rz(h)) atomicExch(bad, 1);
+        if (__half2int_ru(h) != cts_half2int_ru(h)) atomicExch(bad, 1);
+        if (__half2int_rd(h) != cts_half2int_rd(h)) atomicExch(bad, 1);
+        if (__half2uint_rn(h) != cts_half2uint_rn(h)) atomicExch(bad, 1);
+        if (__half2uint_rz(h) != cts_half2uint_rz(h)) atomicExch(bad, 1);
+        if (__half2uint_ru(h) != cts_half2uint_ru(h)) atomicExch(bad, 1);
+        if (__half2uint_rd(h) != cts_half2uint_rd(h)) atomicExch(bad, 1);
+        if (__half2short_rn(h) != cts_half2short_rn(h)) atomicExch(bad, 1);
+        if (__half2short_rz(h) != cts_half2short_rz(h)) atomicExch(bad, 1);
+        if (__half2short_ru(h) != cts_half2short_ru(h)) atomicExch(bad, 1);
+        if (__half2short_rd(h) != cts_half2short_rd(h)) atomicExch(bad, 1);
+        if (__half2ushort_rn(h) != cts_half2ushort_rn(h)) atomicExch(bad, 1);
+        if (__half2ushort_rz(h) != cts_half2ushort_rz(h)) atomicExch(bad, 1);
+        if (__half2ushort_ru(h) != cts_half2ushort_ru(h)) atomicExch(bad, 1);
+        if (__half2ushort_rd(h) != cts_half2ushort_rd(h)) atomicExch(bad, 1);
+        if (__half2ll_rn(h) != cts_half2ll_rn(h)) atomicExch(bad, 1);
+        if (__half2ll_rz(h) != cts_half2ll_rz(h)) atomicExch(bad, 1);
+        if (__half2ll_ru(h) != cts_half2ll_ru(h)) atomicExch(bad, 1);
+        if (__half2ll_rd(h) != cts_half2ll_rd(h)) atomicExch(bad, 1);
+        if (__half2ull_rn(h) != cts_half2ull_rn(h)) atomicExch(bad, 1);
+        if (__half2ull_rz(h) != cts_half2ull_rz(h)) atomicExch(bad, 1);
+        if (__half2ull_ru(h) != cts_half2ull_ru(h)) atomicExch(bad, 1);
+        if (__half2ull_rd(h) != cts_half2ull_rd(h)) atomicExch(bad, 1);
     }}
 }}
 int main() {{
