@@ -20,6 +20,7 @@ from cuda_retarget.dialect import (
     FUNNEL_HELPERS,
     MATCH_ALL_HELPER,
     PACKED_HELPERS,
+    PACKED_MINMAX_HELPERS,
     MATCH_ANY_HELPER,
     VOTE_HELPERS,
     Dialect,
@@ -184,6 +185,12 @@ def _call_edit(
             raise TranslateError(f"{token.spelling} must have two arguments")
         replacement, _helper = PACKED_HELPERS[token.spelling]
         return (token.start, token.end, replacement)
+    if dialect.lower_packed_minmax and token.spelling in PACKED_MINMAX_HELPERS:
+        parsed = _arguments(tokens, index + 1)
+        if parsed is None or len(parsed[0]) != 2:
+            raise TranslateError(f"{token.spelling} must have two arguments")
+        replacement, _helper = PACKED_MINMAX_HELPERS[token.spelling]
+        return (token.start, token.end, replacement)
     return None
 
 
@@ -268,6 +275,10 @@ def _helpers(dialect: Dialect, rewritten: str) -> str:
         blocks.append(DP4A_HELPER.strip("\n"))
     if dialect.lower_packed_arith:
         for name, helper in PACKED_HELPERS.values():
+            if f"{name}(" in rewritten:
+                blocks.append(helper.strip("\n"))
+    if dialect.lower_packed_minmax:
+        for name, helper in PACKED_MINMAX_HELPERS.values():
             if f"{name}(" in rewritten:
                 blocks.append(helper.strip("\n"))
     return "\n\n".join(blocks)

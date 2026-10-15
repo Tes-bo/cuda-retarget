@@ -22,6 +22,7 @@ from cuda_retarget.dialect import (
     MATCH_ALL_HELPER,
     MATCH_ANY_HELPER,
     PACKED_HELPERS,
+    PACKED_MINMAX_HELPERS,
     VOTE_HELPERS,
 )
 from cuda_retarget.translate import TranslateError, translate_path, translate_source
@@ -266,6 +267,33 @@ __global__ void lanes(unsigned* out) {
             self.assertIn("0xffu", translated)
         self.assertEqual(translate_source(source, "maca"), source)
 
+    def test_hip_and_musa_lower_packed_minmax(self) -> None:
+        source = """\
+#include <cuda_runtime.h>
+__global__ void pick(unsigned* out) {
+    const char* label = "__vmins2";
+    unsigned a = 0x80000001u;
+    unsigned b = 0x7FFF0000u;
+    out[0] = __vmins2(a, b);
+    out[1] = __vminu2(a, b);
+    out[2] = __vmaxs2(a, b);
+    out[3] = __vmaxu4(__vmins4(a, b), b);
+    out[4] = label[0];
+}
+"""
+        for target in ("hip", "musa"):
+            translated = translate_source(source, target)
+            self.assertIn('"__vmins2"', translated)
+            self.assertIn("cts_vmins2(a, b)", translated)
+            self.assertIn("cts_vminu2(a, b)", translated)
+            self.assertIn("cts_vmaxs2(a, b)", translated)
+            self.assertIn("cts_vmaxu4(cts_vmins4(a, b), b)", translated)
+            self.assertNotIn("__vmins2(", translated)
+            self.assertNotIn("__vminu2(", translated)
+            self.assertIn("static_cast<short>", translated)
+            self.assertIn("0xffu", translated)
+        self.assertEqual(translate_source(source, "maca"), source)
+
     def test_unparsed_source_is_refused(self) -> None:
         with self.assertRaises(TranslateError):
             translate_source("int main( {\n", "hip", filename="broken.cu")
@@ -360,6 +388,22 @@ class CorpusTests(unittest.TestCase):
             self.assertEqual(translated.count("cts_vadd2("), 2)
         self.assertIn("__vadd2", maca)
         self.assertNotIn("cts_vadd2", maca)
+
+    def test_hip_and_musa_lower_the_census_packed_minmax(self) -> None:
+        path = CENSUS / "packed_minmax" / "main.cu"
+        if not path.is_file():
+            self.skipTest("packed_minmax is not in the census corpus")
+        hip = translate_path(path, "hip")
+        musa = translate_path(path, "musa")
+        maca = translate_path(path, "maca")
+        for translated in (hip, musa):
+            self.assertIn("cts_vmins2(a2, b2)", translated)
+            self.assertIn("cts_vminu2(a2, b2)", translated)
+            self.assertIn("cts_vmaxu4(a4, b4)", translated)
+            self.assertNotIn("__vmins2(", translated)
+            self.assertEqual(translated.count("cts_vmins2("), 2)
+        self.assertIn("__vmins2", maca)
+        self.assertNotIn("cts_vmins2", maca)
 
     def test_only_hip_pins_warp_size(self) -> None:
         path = CENSUS / "warp_size" / "main.cu"
@@ -922,9 +966,76 @@ int main() {{
         self.assertEqual(ran.returncode, 0, ran.stderr)
         self.assertEqual(ran.stdout.strip(), "mismatch=0")
 
+    def test_packed_minmax_helpers_agree_with_the_intrinsics(self) -> None:
+        nvcc = shutil.which("nvcc")
+        if nvcc is None:
+            self.skipTest("nvcc is not installed")
+        device = _idle_gpu()
+        if device is None:
+            self.skipTest("every GPU has a compute process")
+        helpers = "\n".join(helper.strip("\n") for _name, helper in PACKED_MINMAX_HELPERS.values())
+        source = f"""\
+#include <cstdio>
+#include <cuda_runtime.h>
+{helpers}
+__global__ void compare(int* bad) {{
+    unsigned a2 = 0x80000001u;
+    unsigned b2 = 0x7FFF0000u;
+    unsigned a4 = 0x8001807Fu;
+    unsigned b4 = 0x7F017F00u;
+    unsigned eq = 0x00010001u;
+    if (__vmins2(a2, b2) != cts_vmins2(a2, b2)) atomicExch(bad, 1);
+    if (__vminu2(a2, b2) != cts_vminu2(a2, b2)) atomicExch(bad, 1);
+    if (__vmaxs2(a2, b2) != cts_vmaxs2(a2, b2)) atomicExch(bad, 1);
+    if (__vmaxu2(a2, b2) != cts_vmaxu2(a2, b2)) atomicExch(bad, 1);
+    if (__vmins4(a4, b4) != cts_vmins4(a4, b4)) atomicExch(bad, 1);
+    if (__vminu4(a4, b4) != cts_vminu4(a4, b4)) atomicExch(bad, 1);
+    if (__vmaxs4(a4, b4) != cts_vmaxs4(a4, b4)) atomicExch(bad, 1);
+    if (__vmaxu4(a4, b4) != cts_vmaxu4(a4, b4)) atomicExch(bad, 1);
+    if (__vmins2(eq, eq) != cts_vmins2(eq, eq)) atomicExch(bad, 1);
+    if (__vmaxu4(eq, eq) != cts_vmaxu4(eq, eq)) atomicExch(bad, 1);
+}}
+int main() {{
+    int* bad = nullptr;
+    if (cudaMalloc(&bad, sizeof(*bad)) != cudaSuccess) return 2;
+    if (cudaMemset(bad, 0, sizeof(*bad)) != cudaSuccess) return 2;
+    compare<<<1, 1>>>(bad);
+    if (cudaDeviceSynchronize() != cudaSuccess) return 3;
+    int mismatch = 0;
+    if (cudaMemcpy(&mismatch, bad, sizeof(mismatch), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
+    std::printf("mismatch=%d\\n", mismatch);
+    cudaFree(bad);
+    return 0;
+}}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "minmax.cu"
+            binary = Path(directory) / "minmax"
+            path.write_text(source, encoding="utf-8")
+            env = {**os.environ, "CUDA_VISIBLE_DEVICES": device}
+            compiled = subprocess.run(
+                [nvcc, "-arch=native", str(path), "-o", str(binary)],
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+            )
+            if compiled.returncode != 0:
+                self.fail(compiled.stderr)
+            ran = subprocess.run(
+                [str(binary)],
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+            )
+        self.assertEqual(ran.returncode, 0, ran.stderr)
+        self.assertEqual(ran.stdout.strip(), "mismatch=0")
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 
 

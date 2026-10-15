@@ -234,6 +234,10 @@ class Dialect:
     `__vsub2`, `__vsubss2`, `__vsubus2`, and the 4-byte forms. Plain
     calls wrap each lane. `ss` saturates as signed. `us` saturates as
     unsigned. A 32-bit add is a different program.
+    `lower_packed_minmax` replaces `__vmins2`, `__vminu2`, `__vmaxs2`,
+    `__vmaxu2`, and the 4-byte forms. `s` compares each lane as signed.
+    `u` compares it as unsigned. `0x8000` is -32768 on one and 32768
+    on the other.
     """
 
     name: str
@@ -247,6 +251,7 @@ class Dialect:
     lower_funnelshifts: bool
     lower_dp4a: bool
     lower_packed_arith: bool
+    lower_packed_minmax: bool
 
 
 DIALECTS = {
@@ -262,6 +267,7 @@ DIALECTS = {
         lower_funnelshifts=True,
         lower_dp4a=True,
         lower_packed_arith=True,
+        lower_packed_minmax=True,
     ),
     "musa": Dialect(
         name="musa",
@@ -275,6 +281,7 @@ DIALECTS = {
         lower_funnelshifts=True,
         lower_dp4a=True,
         lower_packed_arith=True,
+        lower_packed_minmax=True,
     ),
     "maca": Dialect(
         name="maca",
@@ -288,6 +295,7 @@ DIALECTS = {
         lower_funnelshifts=False,
         lower_dp4a=False,
         lower_packed_arith=False,
+        lower_packed_minmax=False,
     ),
 }
 
@@ -465,6 +473,64 @@ PACKED_HELPERS = {
         ("__vsub4", 4, "wrap", "-"),
         ("__vsubss4", 4, "signed", "-"),
         ("__vsubus4", 4, "unsigned", "-"),
+    )
+}
+
+
+def _packed_minmax_helper(name: str, lanes: int, signed: bool, which: str) -> str:
+    shift = 32 // lanes
+    mask = (1 << shift) - 1
+    op = "<" if which == "min" else ">"
+    if signed:
+        cast = "short" if lanes == 2 else "signed char"
+        extract = (
+            f"static_cast<{cast}>(a >> ({shift} * i))"
+            if lanes == 2
+            else f"static_cast<{cast}>((a >> ({shift} * i)) & {mask:#x}u)"
+        )
+        extract_b = extract.replace("(a >>", "(b >>")
+        return f"""
+static __device__ unsigned {name}(unsigned a, unsigned b) {{
+    unsigned out = 0;
+#pragma unroll
+    for (int i = 0; i < {lanes}; ++i) {{
+        int aa = {extract};
+        int bb = {extract_b};
+        int lane = aa {op} bb ? aa : bb;
+        out |= (static_cast<unsigned>(lane) & {mask:#x}u) << ({shift} * i);
+    }}
+    return out;
+}}
+"""
+    return f"""
+static __device__ unsigned {name}(unsigned a, unsigned b) {{
+    unsigned out = 0;
+#pragma unroll
+    for (int i = 0; i < {lanes}; ++i) {{
+        unsigned aa = (a >> ({shift} * i)) & {mask:#x}u;
+        unsigned bb = (b >> ({shift} * i)) & {mask:#x}u;
+        unsigned lane = aa {op} bb ? aa : bb;
+        out |= lane << ({shift} * i);
+    }}
+    return out;
+}}
+"""
+
+
+PACKED_MINMAX_HELPERS = {
+    intrinsic: (
+        f"cts_{intrinsic[2:]}",
+        _packed_minmax_helper(f"cts_{intrinsic[2:]}", lanes, signed, which),
+    )
+    for intrinsic, lanes, signed, which in (
+        ("__vmins2", 2, True, "min"),
+        ("__vminu2", 2, False, "min"),
+        ("__vmaxs2", 2, True, "max"),
+        ("__vmaxu2", 2, False, "max"),
+        ("__vmins4", 4, True, "min"),
+        ("__vminu4", 4, False, "min"),
+        ("__vmaxs4", 4, True, "max"),
+        ("__vmaxu4", 4, False, "max"),
     )
 }
 
