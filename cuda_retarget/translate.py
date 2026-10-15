@@ -34,6 +34,7 @@ from cuda_retarget.dialect import (
     MUL24_HELPERS,
     MATCH_ANY_HELPER,
     VOTE_HELPERS,
+    D2F_CORE,
     ROUND_BITS,
     ROUND_HELPERS,
     ROUND_I32,
@@ -49,6 +50,7 @@ from cuda_retarget.dialect import (
     farith_needs_fma,
     farith_needs_mul,
     round_needs_bits,
+    round_needs_d2f,
     round_needs_i32,
     round_needs_i64,
     runtime_name,
@@ -446,6 +448,8 @@ def _helpers(dialect: Dialect, rewritten: str) -> str:
             blocks.append(ROUND_I32.strip("\n"))
         if round_needs_i64(names):
             blocks.append(ROUND_I64.strip("\n"))
+        if round_needs_d2f(names):
+            blocks.append(D2F_CORE.strip("\n"))
         for _name, helper in used:
             blocks.append(helper.strip("\n"))
     if dialect.lower_saturate:

@@ -64,7 +64,7 @@ Comments and string literals stay. A name inside a `#define` is rewritten at the
 | `musa` | the same rule with the `musa` prefix | `musa_runtime.h` | unchanged | lowered |
 | `maca` | unchanged | `cuda_runtime.h` | unchanged | unchanged |
 
-The helpers are bitcasts and double hi/lo words, funnel shifts, `__dp4a`, packed add/sub/min/max/abs, `__byte_perm`, averages, high-half products, absolute differences, packed absolute-difference sums, comparison masks, lane predicates, packed averages, bit scans, 24-bit products, rounding conversions, `__saturatef`, and directed float add, sub, mul, and fused multiply-add.
+The helpers are bitcasts and double hi/lo words, funnel shifts, `__dp4a`, packed add/sub/min/max/abs, `__byte_perm`, averages, high-half products, absolute differences, packed absolute-difference sums, comparison masks, lane predicates, packed averages, bit scans, 24-bit products, rounding conversions, double-to-float rounding, `__saturatef`, and directed float add, sub, mul, and fused multiply-add.
 
 Inserted helpers are `static __device__` and sit after the last `#include`.
 
@@ -91,7 +91,9 @@ These are the results a prefix swap gets wrong. HIP and MUSA both get the helper
 | `__float2int_rn(2.5f)` / `__float2int_ru(2.5f)` / `__float2int_rd(-2.5f)` | `2` / `3` / `-3`. Out-of-range values saturate |
 | NaN to `__float2int_*` | `0` |
 | NaN to `__float2ll_*` or `__float2ull_*` | the high bit |
-| NaN to `__double2int_rz` | `0x80000000` |
+| NaN to `__double2int_*` | `0x80000000`, in every rounding mode |
+| `__double2float_rn(1+2^-24)` / `__double2float_ru` of that tie | stays on 1 / the next float. Toward zero, a value past the finite maximum stays finite |
+| a double NaN passed to `__double2float_*` | a quiet float NaN with the same sign. `-0` stays `-0` |
 | `__saturatef` of a NaN or of `-0` | `+0`. Values outside `[0, 1]` clamp |
 | `__fadd_ru` of 1 and a value below one ulp | the next float above 1. The nearest-even tie stays on the even float |
 | `__fadd_rd(+0, -0)` / `__fadd_rd(+0, +0)` | `-0` / `+0`. Same-sign zeros keep their sign |

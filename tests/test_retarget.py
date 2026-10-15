@@ -30,6 +30,7 @@ from cuda_retarget.dialect import (
     PACKED_MINMAX_HELPERS,
     BIT_HELPERS,
     MUL24_HELPERS,
+    D2F_CORE,
     ROUND_BITS,
     ROUND_HELPERS,
     ROUND_I32,
@@ -683,6 +684,39 @@ __global__ void round_float(float* f) { *f = __fadd_rn(*f, 1.0f); }
         self.assertNotIn("cts_ffma(", hip)
         self.assertEqual(translate_source(source, "maca"), source)
 
+    def test_hip_and_musa_lower_double_rounding(self) -> None:
+        source = """\
+#include <cuda_runtime.h>
+__global__ void convert(float* f, int* s) {
+    const char* label = "__double2float_ru __double2int_rn";
+    *f = __double2float_ru(1.0 + 0x1p-24);
+    *s = __double2int_rn(2.5);
+    *s += __double2int_ru(-1.5);
+    *s += __double2ll_rd(-0x1p63);
+    *s += label[0];
+}
+"""
+        for target in ("hip", "musa"):
+            translated = translate_source(source, target)
+            self.assertIn('"__double2float_ru __double2int_rn"', translated)
+            self.assertIn("cts_double2float_ru(1.0 + 0x1p-24)", translated)
+            self.assertIn("cts_double2int_rn(2.5)", translated)
+            self.assertIn("cts_double2int_ru(-1.5)", translated)
+            self.assertIn("cts_double2ll_rd(-0x1p63)", translated)
+            self.assertIn("cts_d2f(", translated)
+            self.assertIn("0x7fc00000u", translated)
+            self.assertNotIn("__double2float_ru(", translated)
+            self.assertNotIn("__double2int_rn(", translated)
+            self.assertNotIn("__double2ll_rd(", translated)
+        only = """\
+#include <cuda_runtime.h>
+__global__ void convert(int* s) { *s = __double2int_rd(-2.5); }
+"""
+        hip = translate_source(only, "hip")
+        self.assertIn("floor(", hip)
+        self.assertNotIn("cts_d2f(", hip)
+        self.assertEqual(translate_source(source, "maca"), source)
+
     def test_unparsed_source_is_refused(self) -> None:
         with self.assertRaises(TranslateError):
             translate_source("int main( {\n", "hip", filename="broken.cu")
@@ -1088,6 +1122,29 @@ class CorpusTests(unittest.TestCase):
             self.assertEqual(translated.count("cts_fmaf_rn("), 3)
         self.assertIn("__fadd_rn", maca)
         self.assertNotIn("cts_fadd_rn", maca)
+
+    def test_hip_and_musa_lower_the_census_dround(self) -> None:
+        path = CENSUS / "dround" / "main.cu"
+        if not path.is_file():
+            self.skipTest("dround is not in the census corpus")
+        hip = translate_path(path, "hip")
+        musa = translate_path(path, "musa")
+        maca = translate_path(path, "maca")
+        for translated in (hip, musa):
+            self.assertIn("cts_double2float_rn(tie)", translated)
+            self.assertIn("cts_double2float_ru(halfsub)", translated)
+            self.assertIn("cts_double2float_rd(-tie)", translated)
+            self.assertIn("cts_double2float_rn(nan.as_double)", translated)
+            self.assertIn("cts_double2int_rd(-2.5)", translated)
+            self.assertIn("cts_double2ll_ru(0x1p63)", translated)
+            self.assertIn("cts_double2ull_rn(nan.as_double)", translated)
+            self.assertIn("cts_d2f(", translated)
+            self.assertNotIn("__double2float_rn(", translated)
+            self.assertNotIn("__double2int_rn(", translated)
+            self.assertEqual(translated.count("cts_double2float_rn("), 4)
+            self.assertEqual(translated.count("cts_double2float_ru("), 5)
+        self.assertIn("__double2float_rn", maca)
+        self.assertNotIn("cts_double2float_rn", maca)
 
     def test_only_hip_pins_warp_size(self) -> None:
         path = CENSUS / "warp_size" / "main.cu"
@@ -2360,6 +2417,7 @@ int main() {{
                 ROUND_BITS.strip("\n"),
                 ROUND_I32.strip("\n"),
                 ROUND_I64.strip("\n"),
+                D2F_CORE.strip("\n"),
                 *(helper.strip("\n") for _name, helper in ROUND_HELPERS.values()),
             ]
         )
@@ -2510,6 +2568,84 @@ __global__ void compare(int* bad) {{
         if (__float_as_uint(__fmaf_ru(x, y, z)) != __float_as_uint(cts_fmaf_ru(x, y, z))) atomicExch(bad, 1);
         if (__float_as_uint(__fmaf_rd(x, y, z)) != __float_as_uint(cts_fmaf_rd(x, y, z))) atomicExch(bad, 1);
     }}
+}}
+int main() {{
+    int* bad = nullptr;
+    if (cudaMalloc(&bad, sizeof(*bad)) != cudaSuccess) return 2;
+    if (cudaMemset(bad, 0, sizeof(*bad)) != cudaSuccess) return 2;
+    compare<<<1, 1>>>(bad);
+    if (cudaDeviceSynchronize() != cudaSuccess) return 3;
+    int mismatch = 0;
+    if (cudaMemcpy(&mismatch, bad, sizeof(mismatch), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
+    std::printf("mismatch=%d\\n", mismatch);
+    cudaFree(bad);
+    return 0;
+}}
+""",
+        )
+
+    def test_double_rounding_helpers_agree_with_the_intrinsics(self) -> None:
+        names = [
+            "__double2float_rn",
+            "__double2float_rz",
+            "__double2float_ru",
+            "__double2float_rd",
+            "__double2int_rn",
+            "__double2int_ru",
+            "__double2int_rd",
+            "__double2uint_rn",
+            "__double2uint_ru",
+            "__double2uint_rd",
+            "__double2ll_rn",
+            "__double2ll_ru",
+            "__double2ll_rd",
+            "__double2ull_rn",
+            "__double2ull_ru",
+            "__double2ull_rd",
+        ]
+        helpers = "\n".join(
+            [D2F_CORE.strip("\n"), *(ROUND_HELPERS[name][1].strip("\n") for name in names)]
+        )
+        self._nvcc_mismatch(
+            "dround",
+            f"""\
+#include <cstdio>
+#include <cuda_runtime.h>
+{helpers}
+__global__ void compare(int* bad) {{
+    double vals[8] = {{
+        0.0, -0.0, 1.0 + 0x1p-24, -(1.0 + 0x1p-24), 0x1p-150, 16777217.0,
+        -16777219.0, 0x1p63
+    }};
+    for (int i = 0; i < 8; ++i) {{
+        double x = vals[i];
+        if (__float_as_uint(__double2float_rn(x)) != __float_as_uint(cts_double2float_rn(x))) atomicExch(bad, 1);
+        if (__float_as_uint(__double2float_rz(x)) != __float_as_uint(cts_double2float_rz(x))) atomicExch(bad, 1);
+        if (__float_as_uint(__double2float_ru(x)) != __float_as_uint(cts_double2float_ru(x))) atomicExch(bad, 1);
+        if (__float_as_uint(__double2float_rd(x)) != __float_as_uint(cts_double2float_rd(x))) atomicExch(bad, 1);
+        if (__double2int_rn(x) != cts_double2int_rn(x)) atomicExch(bad, 1);
+        if (__double2int_ru(x) != cts_double2int_ru(x)) atomicExch(bad, 1);
+        if (__double2int_rd(x) != cts_double2int_rd(x)) atomicExch(bad, 1);
+        if (__double2uint_rn(x) != cts_double2uint_rn(x)) atomicExch(bad, 1);
+        if (__double2ll_ru(x) != cts_double2ll_ru(x)) atomicExch(bad, 1);
+        if (__double2ll_rd(x) != cts_double2ll_rd(x)) atomicExch(bad, 1);
+        if (__double2ull_rn(x) != cts_double2ull_rn(x)) atomicExch(bad, 1);
+    }}
+    union {{ double d; unsigned long long u; }} nann, limit;
+    nann.u = 0xfff8000000000001ull;
+    limit.d = nextafter(3.40282346638528859811704183484516925e+38, 1.0e308);
+    if (__float_as_uint(__double2float_rn(nann.d)) != __float_as_uint(cts_double2float_rn(nann.d)))
+        atomicExch(bad, 1);
+    if (__float_as_uint(__double2float_rz(limit.d)) != __float_as_uint(cts_double2float_rz(limit.d)))
+        atomicExch(bad, 1);
+    if (__float_as_uint(__double2float_ru(limit.d)) != __float_as_uint(cts_double2float_ru(limit.d)))
+        atomicExch(bad, 1);
+    if (__double2int_rn(nann.d) != cts_double2int_rn(nann.d)) atomicExch(bad, 1);
+    if (__double2int_ru(2.5) != cts_double2int_ru(2.5)) atomicExch(bad, 1);
+    if (__double2int_rd(-2.5) != cts_double2int_rd(-2.5)) atomicExch(bad, 1);
+    if (__double2uint_ru(1.1) != cts_double2uint_ru(1.1)) atomicExch(bad, 1);
+    if (__double2ll_rd(-0x1p63) != cts_double2ll_rd(-0x1p63)) atomicExch(bad, 1);
+    if (__double2ull_rn(nann.d) != cts_double2ull_rn(nann.d)) atomicExch(bad, 1);
 }}
 int main() {{
     int* bad = nullptr;
