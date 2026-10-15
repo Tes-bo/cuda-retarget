@@ -111,6 +111,9 @@ class Dialect:
     `__match_all_sync` to a 32-lane helper. CUDA's result is a mask of one
     warp. A 64-lane wavefront would include the paired lane from the next
     warp.
+    `vote_width_32` lowers a full-mask `__ballot_sync`, `__any_sync`,
+    `__all_sync`, or `__uni_sync` the same way. A predicate that is uniform
+    inside one warp of 32 can be mixed across a 64-lane wavefront.
     """
 
     name: str
@@ -119,6 +122,7 @@ class Dialect:
     shuffle_width_32: bool
     lower_bitcasts: bool
     match_width_32: bool
+    vote_width_32: bool
 
 
 DIALECTS = {
@@ -129,6 +133,7 @@ DIALECTS = {
         shuffle_width_32=True,
         lower_bitcasts=True,
         match_width_32=True,
+        vote_width_32=True,
     ),
     "musa": Dialect(
         name="musa",
@@ -137,6 +142,7 @@ DIALECTS = {
         shuffle_width_32=False,
         lower_bitcasts=True,
         match_width_32=False,
+        vote_width_32=False,
     ),
     "maca": Dialect(
         name="maca",
@@ -145,6 +151,7 @@ DIALECTS = {
         shuffle_width_32=False,
         lower_bitcasts=False,
         match_width_32=False,
+        vote_width_32=False,
     ),
 }
 
@@ -196,6 +203,38 @@ static __device__ unsigned cts_match_all_sync(unsigned mask, T value, int* pred)
     return same ? mask : 0u;
 }
 """
+
+
+VOTE_HELPERS = {
+    "cts_ballot_sync": """
+static __device__ unsigned cts_ballot_sync(unsigned mask, int predicate) {
+    unsigned bits = 0;
+#pragma unroll
+    for (int src = 0; src < 32; ++src) {
+        int other = __shfl_sync(mask, predicate, src, 32);
+        if (other)
+            bits |= 1u << src;
+    }
+    return bits;
+}
+""",
+    "cts_any_sync": """
+static __device__ int cts_any_sync(unsigned mask, int predicate) {
+    return cts_ballot_sync(mask, predicate) != 0;
+}
+""",
+    "cts_all_sync": """
+static __device__ int cts_all_sync(unsigned mask, int predicate) {
+    return cts_ballot_sync(mask, predicate) == mask;
+}
+""",
+    "cts_uni_sync": """
+static __device__ int cts_uni_sync(unsigned mask, int predicate) {
+    unsigned bits = cts_ballot_sync(mask, predicate);
+    return bits == 0u || bits == mask;
+}
+""",
+}
 
 
 def runtime_name(spelling: str, dialect: Dialect) -> str | None:

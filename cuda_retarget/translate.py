@@ -17,6 +17,7 @@ from cuda_retarget.dialect import (
     DIALECTS,
     MATCH_ALL_HELPER,
     MATCH_ANY_HELPER,
+    VOTE_HELPERS,
     Dialect,
     runtime_name,
 )
@@ -26,6 +27,12 @@ _FULL_MASKS = {"0xffffffff", "0xffffffffu", "0xffffffffl", "0xffffffffll", "0xff
 # Same default width as __shfl_sync: the last argument defaults to warpSize.
 _SHUFFLES = {"__shfl_sync", "__shfl_xor_sync", "__shfl_up_sync", "__shfl_down_sync"}
 _MATCHES = {"__match_any_sync": 2, "__match_all_sync": 3}
+_VOTES = {
+    "__ballot_sync": "cts_ballot_sync",
+    "__any_sync": "cts_any_sync",
+    "__all_sync": "cts_all_sync",
+    "__uni_sync": "cts_uni_sync",
+}
 
 
 class TranslateError(Exception):
@@ -128,6 +135,13 @@ def _call_edit(
         if len(args) == _MATCHES[token.spelling] and _is_full_mask(text, args[0]):
             replacement = "cts_match_any_sync" if token.spelling == "__match_any_sync" else "cts_match_all_sync"
             return (token.start, token.end, replacement)
+    if dialect.vote_width_32 and token.spelling in _VOTES:
+        parsed = _arguments(tokens, index + 1)
+        if parsed is None:
+            raise TranslateError(f"{token.spelling} arguments are not a simple call")
+        args, _close = parsed
+        if len(args) == 2 and _is_full_mask(text, args[0]):
+            return (token.start, token.end, _VOTES[token.spelling])
     if dialect.lower_bitcasts and token.spelling in BITCAST_HELPERS:
         parsed = _arguments(tokens, index + 1)
         if parsed is None or len(parsed[0]) != 1:
@@ -200,6 +214,13 @@ def _helpers(dialect: Dialect, rewritten: str) -> str:
         blocks.append(MATCH_ANY_HELPER.strip("\n"))
         if "cts_match_all_sync(" in rewritten:
             blocks.append(MATCH_ALL_HELPER.strip("\n"))
+    if dialect.vote_width_32:
+        used = [name for name in VOTE_HELPERS if f"{name}(" in rewritten]
+        if used:
+            blocks.append(VOTE_HELPERS["cts_ballot_sync"].strip("\n"))
+            for name in used:
+                if name != "cts_ballot_sync":
+                    blocks.append(VOTE_HELPERS[name].strip("\n"))
     return "\n\n".join(blocks)
 
 

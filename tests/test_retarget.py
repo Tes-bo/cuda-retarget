@@ -14,7 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from cuda_retarget.dialect import BITCAST_HELPERS, MATCH_ALL_HELPER, MATCH_ANY_HELPER
+from cuda_retarget.dialect import BITCAST_HELPERS, MATCH_ALL_HELPER, MATCH_ANY_HELPER, VOTE_HELPERS
 from cuda_retarget.translate import TranslateError, translate_path, translate_source
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -96,6 +96,33 @@ __global__ void match_keys(unsigned* out) {
         musa = translate_source(source, "musa")
         self.assertIn("__match_any_sync(0xffffffff, key)", musa)
         self.assertNotIn("cts_match_any_sync", musa)
+        self.assertEqual(translate_source(source, "maca"), source)
+
+    def test_only_hip_lowers_full_mask_vote(self) -> None:
+        source = """\
+#include <cuda_runtime.h>
+__global__ void vote(unsigned* out) {
+    const char* label = "__ballot_sync";
+    int pred = threadIdx.x < 32;
+    unsigned partial = __ballot_sync(0x0000ffff, pred);
+    unsigned full = __ballot_sync(0xffffffff, pred);
+    int any = __any_sync(0xffffffff, pred);
+    int all = __all_sync(0xffffffff, pred);
+    int uni = __uni_sync(0xffffffff, pred);
+    *out = partial + full + any + all + uni + label[0];
+}
+"""
+        hip = translate_source(source, "hip")
+        self.assertIn("__ballot_sync(0x0000ffff, pred)", hip)
+        self.assertIn("cts_ballot_sync(0xffffffff, pred)", hip)
+        self.assertIn("cts_any_sync(0xffffffff, pred)", hip)
+        self.assertIn("cts_all_sync(0xffffffff, pred)", hip)
+        self.assertIn("cts_uni_sync(0xffffffff, pred)", hip)
+        self.assertIn('"__ballot_sync"', hip)
+        self.assertIn("__shfl_sync(mask, predicate, src, 32)", hip)
+        musa = translate_source(source, "musa")
+        self.assertIn("__ballot_sync(0xffffffff, pred)", musa)
+        self.assertNotIn("cts_ballot_sync", musa)
         self.assertEqual(translate_source(source, "maca"), source)
 
     def test_hip_and_musa_lower_bitcasts(self) -> None:
@@ -344,6 +371,75 @@ int main() {{
             )
         self.assertEqual(ran.returncode, 0, ran.stderr)
         self.assertEqual(ran.stdout.strip(), "mismatch=0\nlane0=1")
+
+    def test_vote_helper_agrees_with_the_intrinsic(self) -> None:
+        nvcc = shutil.which("nvcc")
+        if nvcc is None:
+            self.skipTest("nvcc is not installed")
+        device = _idle_gpu()
+        if device is None:
+            self.skipTest("every GPU has a compute process")
+        helpers = "\n".join(text.strip("\n") for text in VOTE_HELPERS.values())
+        source = f"""\
+#include <cstdio>
+#include <cuda_runtime.h>
+{helpers}
+__device__ int vote_mismatch(int predicate) {{
+    unsigned ballot_i = __ballot_sync(0xffffffff, predicate);
+    unsigned ballot_h = cts_ballot_sync(0xffffffff, predicate);
+    int any_i = __any_sync(0xffffffff, predicate);
+    int any_h = cts_any_sync(0xffffffff, predicate);
+    int all_i = __all_sync(0xffffffff, predicate);
+    int all_h = cts_all_sync(0xffffffff, predicate);
+    int uni_i = __uni_sync(0xffffffff, predicate);
+    int uni_h = cts_uni_sync(0xffffffff, predicate);
+    return ballot_i != ballot_h || any_i != any_h || all_i != all_h || uni_i != uni_h;
+}}
+__global__ void compare_split(int* bad) {{
+    if (vote_mismatch(threadIdx.x < 32))
+        atomicExch(bad, 1);
+}}
+__global__ void compare_alt(int* bad) {{
+    if (vote_mismatch(threadIdx.x & 1))
+        atomicExch(bad, 1);
+}}
+int main() {{
+    int* bad = nullptr;
+    if (cudaMalloc(&bad, sizeof(*bad)) != cudaSuccess) return 2;
+    if (cudaMemset(bad, 0, sizeof(*bad)) != cudaSuccess) return 2;
+    compare_split<<<1, 64>>>(bad);
+    compare_alt<<<1, 32>>>(bad);
+    if (cudaDeviceSynchronize() != cudaSuccess) return 3;
+    int mismatch = 0;
+    if (cudaMemcpy(&mismatch, bad, sizeof(mismatch), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
+    std::printf("mismatch=%d\\n", mismatch);
+    cudaFree(bad);
+    return 0;
+}}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "vote.cu"
+            binary = Path(directory) / "vote"
+            path.write_text(source, encoding="utf-8")
+            env = {**os.environ, "CUDA_VISIBLE_DEVICES": device}
+            compiled = subprocess.run(
+                [nvcc, "-arch=native", str(path), "-o", str(binary)],
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+            )
+            if compiled.returncode != 0:
+                self.fail(compiled.stderr)
+            ran = subprocess.run(
+                [str(binary)],
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+            )
+        self.assertEqual(ran.returncode, 0, ran.stderr)
+        self.assertEqual(ran.stdout.strip(), "mismatch=0")
 
 
 if __name__ == "__main__":
