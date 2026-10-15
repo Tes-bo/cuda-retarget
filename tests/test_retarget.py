@@ -35,6 +35,11 @@ from cuda_retarget.dialect import (
     ROUND_I32,
     ROUND_I64,
     SATURATE_HELPERS,
+    FARITH_ADD,
+    FARITH_FMA,
+    FARITH_HELPERS,
+    FARITH_MUL,
+    FARITH_PACK,
     PACKED_AVG_HELPERS,
     PACKED_CMP_HELPERS,
     PACKED_SAD_HELPERS,
@@ -641,6 +646,43 @@ __global__ void clamp(float* f) {
             self.assertEqual(translated.count("cts_saturatef("), 3)
         self.assertEqual(translate_source(source, "maca"), source)
 
+    def test_hip_and_musa_lower_directed_float(self) -> None:
+        source = """\
+#include <cuda_runtime.h>
+__global__ void round_float(float* f) {
+    const char* label = "__fadd_rn __fsub_rd __fmul_ru __fmaf_rz";
+    *f = __fadd_rn(*f, 1.0f);
+    *f = __fsub_rd(*f, 1.0f);
+    *f = __fmul_ru(*f, 2.0f);
+    *f = __fmaf_rz(*f, *f, 1.0f);
+    *f += label[0];
+}
+"""
+        for target in ("hip", "musa"):
+            translated = translate_source(source, target)
+            self.assertIn('"__fadd_rn __fsub_rd __fmul_ru __fmaf_rz"', translated)
+            self.assertIn("cts_fadd_rn(*f, 1.0f)", translated)
+            self.assertIn("cts_fsub_rd(*f, 1.0f)", translated)
+            self.assertIn("cts_fmul_ru(*f, 2.0f)", translated)
+            self.assertIn("cts_fmaf_rz(*f, *f, 1.0f)", translated)
+            self.assertIn("cts_fpack", translated)
+            self.assertIn("cts_fadd(", translated)
+            self.assertIn("cts_ffma(", translated)
+            self.assertNotIn("__fadd_rn(", translated)
+            self.assertNotIn("__fsub_rd(", translated)
+            self.assertNotIn("__fmul_ru(", translated)
+            self.assertNotIn("__fmaf_rz(", translated)
+        only = """\
+#include <cuda_runtime.h>
+__global__ void round_float(float* f) { *f = __fadd_rn(*f, 1.0f); }
+"""
+        hip = translate_source(only, "hip")
+        self.assertIn("cts_fpack", hip)
+        self.assertIn("cts_fadd(", hip)
+        self.assertNotIn("cts_fmul(", hip)
+        self.assertNotIn("cts_ffma(", hip)
+        self.assertEqual(translate_source(source, "maca"), source)
+
     def test_unparsed_source_is_refused(self) -> None:
         with self.assertRaises(TranslateError):
             translate_source("int main( {\n", "hip", filename="broken.cu")
@@ -1021,6 +1063,31 @@ class CorpusTests(unittest.TestCase):
             self.assertEqual(translated.count("cts_saturatef("), 6)
         self.assertIn("__saturatef", maca)
         self.assertNotIn("cts_saturatef", maca)
+
+    def test_hip_and_musa_lower_the_census_farith(self) -> None:
+        path = CENSUS / "farith" / "main.cu"
+        if not path.is_file():
+            self.skipTest("farith is not in the census corpus")
+        hip = translate_path(path, "hip")
+        musa = translate_path(path, "musa")
+        maca = translate_path(path, "maca")
+        for translated in (hip, musa):
+            self.assertIn("cts_fadd_rn(1.0f, tiny.as_float)", translated)
+            self.assertIn("cts_fadd_ru(1.0f, tiny.as_float)", translated)
+            self.assertIn("cts_fadd_rd(0.0f, 0.0f)", translated)
+            self.assertIn("cts_fadd_rd(0.0f, -0.0f)", translated)
+            self.assertIn("cts_fsub_rd(1.0f, tiny.as_float)", translated)
+            self.assertIn("cts_fmul_rn(-0.0f, 0.0f)", translated)
+            self.assertIn("cts_fmaf_ru(1.0f, tiny.as_float, 1.0f)", translated)
+            self.assertIn("cts_fmaf_rn(wide.as_float, wide.as_float, cts_uint_bits(0xbf800002u))", translated)
+            self.assertIn("cts_fmaf_rn(0.0f, cts_uint_bits(0x7f800000u), 1.0f)", translated)
+            self.assertIn("cts_fpack", translated)
+            self.assertNotIn("__fadd_rn(", translated)
+            self.assertNotIn("__fmaf_rn(", translated)
+            self.assertEqual(translated.count("cts_fadd_rn("), 5)
+            self.assertEqual(translated.count("cts_fmaf_rn("), 3)
+        self.assertIn("__fadd_rn", maca)
+        self.assertNotIn("cts_fadd_rn", maca)
 
     def test_only_hip_pins_warp_size(self) -> None:
         path = CENSUS / "warp_size" / "main.cu"
@@ -2368,6 +2435,81 @@ __global__ void compare(int* bad) {{
     if (__double2ll_rz(1.0e20) != cts_double2ll_rz(1.0e20)) atomicExch(bad, 1);
     if (__double2ull_rz(nand.d) != cts_double2ull_rz(nand.d)) atomicExch(bad, 1);
     if (__double2ull_rz(1.0e20) != cts_double2ull_rz(1.0e20)) atomicExch(bad, 1);
+}}
+int main() {{
+    int* bad = nullptr;
+    if (cudaMalloc(&bad, sizeof(*bad)) != cudaSuccess) return 2;
+    if (cudaMemset(bad, 0, sizeof(*bad)) != cudaSuccess) return 2;
+    compare<<<1, 1>>>(bad);
+    if (cudaDeviceSynchronize() != cudaSuccess) return 3;
+    int mismatch = 0;
+    if (cudaMemcpy(&mismatch, bad, sizeof(mismatch), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
+    std::printf("mismatch=%d\\n", mismatch);
+    cudaFree(bad);
+    return 0;
+}}
+""",
+        )
+
+    def test_directed_float_helpers_agree_with_the_intrinsics(self) -> None:
+        helpers = "\n".join(
+            [
+                FARITH_PACK.strip("\n"),
+                FARITH_ADD.strip("\n"),
+                FARITH_MUL.strip("\n"),
+                FARITH_FMA.strip("\n"),
+                *(helper.strip("\n") for _name, helper in FARITH_HELPERS.values()),
+            ]
+        )
+        self._nvcc_mismatch(
+            "farith",
+            f"""\
+#include <cstdio>
+#include <cuda_runtime.h>
+{helpers}
+__global__ void compare(int* bad) {{
+    unsigned vals[14] = {{
+        0, 0x80000000u, 0x3f800000u, 0xbf800000u, 0x21800000u, 0x33800000u,
+        0x7f000000u, 0x00000001u, 0x007fffffu, 0x00800000u, 0x3f800001u,
+        0x7f800000u, 0xff800000u, 0x7fc00000u
+    }};
+    for (int i = 0; i < 14; ++i) for (int j = 0; j < 14; ++j) {{
+        float x = __uint_as_float(vals[i]);
+        float y = __uint_as_float(vals[j]);
+        if (__float_as_uint(__fadd_rn(x, y)) != __float_as_uint(cts_fadd_rn(x, y))) atomicExch(bad, 1);
+        if (__float_as_uint(__fadd_rz(x, y)) != __float_as_uint(cts_fadd_rz(x, y))) atomicExch(bad, 1);
+        if (__float_as_uint(__fadd_ru(x, y)) != __float_as_uint(cts_fadd_ru(x, y))) atomicExch(bad, 1);
+        if (__float_as_uint(__fadd_rd(x, y)) != __float_as_uint(cts_fadd_rd(x, y))) atomicExch(bad, 1);
+        if (__float_as_uint(__fsub_rn(x, y)) != __float_as_uint(cts_fsub_rn(x, y))) atomicExch(bad, 1);
+        if (__float_as_uint(__fsub_rz(x, y)) != __float_as_uint(cts_fsub_rz(x, y))) atomicExch(bad, 1);
+        if (__float_as_uint(__fsub_ru(x, y)) != __float_as_uint(cts_fsub_ru(x, y))) atomicExch(bad, 1);
+        if (__float_as_uint(__fsub_rd(x, y)) != __float_as_uint(cts_fsub_rd(x, y))) atomicExch(bad, 1);
+        if (__float_as_uint(__fmul_rn(x, y)) != __float_as_uint(cts_fmul_rn(x, y))) atomicExch(bad, 1);
+        if (__float_as_uint(__fmul_rz(x, y)) != __float_as_uint(cts_fmul_rz(x, y))) atomicExch(bad, 1);
+        if (__float_as_uint(__fmul_ru(x, y)) != __float_as_uint(cts_fmul_ru(x, y))) atomicExch(bad, 1);
+        if (__float_as_uint(__fmul_rd(x, y)) != __float_as_uint(cts_fmul_rd(x, y))) atomicExch(bad, 1);
+    }}
+    unsigned hard[][3] = {{
+        {{0x3f800001u, 0x3f800001u, 0xbf800002u}},
+        {{0x7f800000u, 0x3f800000u, 0xff800000u}},
+        {{0, 0x7f800000u, 0x3f800000u}},
+        {{0x7fc00000u, 0x3f800000u, 0x3f800000u}},
+        {{0xffc00000u, 0x3f800000u, 0x3f800000u}},
+        {{0x3f800000u, 0x21800000u, 0x3f800000u}},
+        {{0x3f800000u, 0x33800000u, 0x3f800000u}},
+        {{0x00800000u, 0x00800000u, 0}},
+        {{0x7f7fffffu, 0x3f800000u, 0x7f7fffffu}},
+        {{0x21800000u, 0x00800000u, 0}}
+    }};
+    for (int n = 0; n < 10; ++n) {{
+        float x = __uint_as_float(hard[n][0]);
+        float y = __uint_as_float(hard[n][1]);
+        float z = __uint_as_float(hard[n][2]);
+        if (__float_as_uint(__fmaf_rn(x, y, z)) != __float_as_uint(cts_fmaf_rn(x, y, z))) atomicExch(bad, 1);
+        if (__float_as_uint(__fmaf_rz(x, y, z)) != __float_as_uint(cts_fmaf_rz(x, y, z))) atomicExch(bad, 1);
+        if (__float_as_uint(__fmaf_ru(x, y, z)) != __float_as_uint(cts_fmaf_ru(x, y, z))) atomicExch(bad, 1);
+        if (__float_as_uint(__fmaf_rd(x, y, z)) != __float_as_uint(cts_fmaf_rd(x, y, z))) atomicExch(bad, 1);
+    }}
 }}
 int main() {{
     int* bad = nullptr;

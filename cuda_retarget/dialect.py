@@ -300,6 +300,15 @@ class Dialect:
     exact in double, so those helpers round from the integer bits.
     `lower_saturate` replaces `__saturatef`. Values outside [0, 1] clamp,
     and a NaN or a negative zero becomes +0.
+    `lower_farith` replaces `__fadd_*`, `__fsub_*`, `__fmul_*`, and
+    `__fmaf_*`. Plain addition and multiplication round ties to even, so
+    a value below one ulp disappears. Round-up of 1 plus that value is
+    the next float, and a halfway tie stays on the even float. Overflow
+    toward zero stays at the finite maximum. Two +0 stay +0 in every
+    mode. +0 plus -0 is -0 only when rounding toward -inf. A NaN operand
+    becomes the canonical quiet NaN `0x7fffffff`. Fused multiply-add of
+    `(1+2^-23)` squared minus the rounded square is `2^-46`, which a
+    rounded product plus the addend loses.
     """
 
     name: str
@@ -327,6 +336,7 @@ class Dialect:
     lower_mul24: bool
     lower_round: bool
     lower_saturate: bool
+    lower_farith: bool
 
 
 DIALECTS = {
@@ -356,6 +366,7 @@ DIALECTS = {
         lower_mul24=True,
         lower_round=True,
         lower_saturate=True,
+        lower_farith=True,
     ),
     "musa": Dialect(
         name="musa",
@@ -383,6 +394,7 @@ DIALECTS = {
         lower_mul24=True,
         lower_round=True,
         lower_saturate=True,
+        lower_farith=True,
     ),
     "maca": Dialect(
         name="maca",
@@ -410,6 +422,7 @@ DIALECTS = {
         lower_mul24=False,
         lower_round=False,
         lower_saturate=False,
+        lower_farith=False,
     ),
 }
 
@@ -1457,6 +1470,215 @@ static __device__ float cts_saturatef(float x) {
 """,
     ),
 }
+
+
+
+# The 24-bit significand LSB sits at bit 32. Bits below that are the remainder.
+FARITH_PACK = """
+static __device__ unsigned cts_fpack(int sign, int exp, unsigned long long mag, int mode) {
+    if (mag == 0) return sign ? 0x80000000u : 0u;
+    unsigned long long top = mag;
+    while (top >= (1ull << 56)) { top >>= 1; exp++; }
+    while (top < (1ull << 55) && exp > 1) { top <<= 1; exp--; }
+    if (exp < 1 || (exp == 1 && top < (1ull << 55))) {
+        int need = 1 - exp;
+        exp = 0;
+        if (need >= 64) top = top ? 1 : 0;
+        else if (need) {
+            unsigned long long lost = top & ((1ull << need) - 1);
+            top >>= need;
+            if (lost) top |= 1;
+        }
+    }
+    unsigned long long rem = top & 0xffffffffull;
+    unsigned sig = (unsigned)(top >> 32) & 0xffffffu;
+    int toward_inf = sign ? (mode == 3) : (mode == 2);
+    int up = 0;
+    if (mode == 0) up = rem > 0x80000000ull || (rem == 0x80000000ull && (sig & 1u));
+    else if (toward_inf) up = rem != 0;
+    if (up) {
+        sig += 1u;
+        if (exp == 0) {
+            if (sig == 0x800000u) exp = 1;
+        } else if (sig == 0x1000000u) {
+            sig = 0x800000u;
+            exp++;
+        }
+    }
+    if (exp >= 255) {
+        int to_inf = (mode == 0) || (sign ? mode == 3 : mode == 2);
+        if (to_inf) return ((unsigned)sign << 31) | 0x7f800000u;
+        return ((unsigned)sign << 31) | 0x7f7fffffu;
+    }
+    if (exp <= 0) return ((unsigned)sign << 31) | (sig & 0x7fffffu);
+    return ((unsigned)sign << 31) | ((unsigned)exp << 23) | (sig & 0x7fffffu);
+}
+"""
+
+FARITH_ADD = """
+static __device__ unsigned cts_fadd(unsigned a, unsigned b, int mode) {
+    unsigned sa = a >> 31, sb = b >> 31;
+    int ea = (a >> 23) & 0xff, eb = (b >> 23) & 0xff;
+    unsigned fa = a & 0x7fffffu, fb = b & 0x7fffffu;
+    if (ea == 255 || eb == 255) {
+        if ((ea == 255 && fa) || (eb == 255 && fb)) return 0x7fffffffu;
+        if (ea == 255 && eb == 255) return sa == sb ? ((sa << 31) | 0x7f800000u) : 0x7fffffffu;
+        return ea == 255 ? ((sa << 31) | 0x7f800000u) : ((sb << 31) | 0x7f800000u);
+    }
+    unsigned long long ma, mb;
+    int aexp, bexp;
+    if (ea == 0) { ma = (unsigned long long)fa << 32; aexp = 1; }
+    else { ma = (unsigned long long)(fa | 0x800000u) << 32; aexp = ea; }
+    if (eb == 0) { mb = (unsigned long long)fb << 32; bexp = 1; }
+    else { mb = (unsigned long long)(fb | 0x800000u) << 32; bexp = eb; }
+    if (aexp < bexp || (aexp == bexp && ma < mb)) {
+        unsigned ts = sa; sa = sb; sb = ts;
+        int te = aexp; aexp = bexp; bexp = te;
+        unsigned long long tm = ma; ma = mb; mb = tm;
+    }
+    int sh = aexp - bexp;
+    if (sh >= 63) mb = mb ? 1ull : 0ull;
+    else if (sh) {
+        unsigned long long lost = mb & ((1ull << sh) - 1ull);
+        mb >>= sh;
+        if (lost) mb |= 1ull;
+    }
+    if (sa == sb) return cts_fpack((int)sa, aexp, ma + mb, mode);
+    if (ma == mb) return (mode == 3) ? 0x80000000u : 0u;
+    return cts_fpack((int)sa, aexp, ma - mb, mode);
+}
+"""
+
+FARITH_MUL = """
+static __device__ unsigned cts_fmul(unsigned a, unsigned b, int mode) {
+    unsigned sa = a >> 31, sb = b >> 31;
+    int sign = (int)(sa ^ sb);
+    int ea = (a >> 23) & 0xff, eb = (b >> 23) & 0xff;
+    unsigned fa = a & 0x7fffffu, fb = b & 0x7fffffu;
+    if (ea == 255 || eb == 255) {
+        if ((ea == 255 && fa) || (eb == 255 && fb)) return 0x7fffffffu;
+        int a0 = (ea | fa) == 0, b0 = (eb | fb) == 0;
+        if ((ea == 255 && b0) || (eb == 255 && a0)) return 0x7fffffffu;
+        return ((unsigned)sign << 31) | 0x7f800000u;
+    }
+    if ((ea | fa) == 0 || (eb | fb) == 0) return sign ? 0x80000000u : 0u;
+    unsigned long long ma = ea ? (fa | 0x800000u) : fa;
+    unsigned long long mb = eb ? (fb | 0x800000u) : fb;
+    int exp = (ea ? ea : 1) + (eb ? eb : 1) - 127;
+    unsigned long long mag = (ma * mb) << 9;
+    return cts_fpack(sign, exp, mag, mode);
+}
+"""
+
+FARITH_FMA = """
+static __device__ unsigned cts_ffma(unsigned a, unsigned b, unsigned c, int mode) {
+    unsigned sa = a >> 31, sb = b >> 31, sc = c >> 31;
+    int signp = (int)(sa ^ sb);
+    int ea = (a >> 23) & 0xff, eb = (b >> 23) & 0xff, ec = (c >> 23) & 0xff;
+    unsigned fa = a & 0x7fffffu, fb = b & 0x7fffffu, fc = c & 0x7fffffu;
+    if ((ea == 255 && fa) || (eb == 255 && fb) || (ec == 255 && fc)) return 0x7fffffffu;
+    int a0 = (ea | fa) == 0, b0 = (eb | fb) == 0;
+    int ainf = ea == 255, binf = eb == 255, cinf = ec == 255;
+    if ((ainf && b0) || (binf && a0)) return 0x7fffffffu;
+    if (ainf || binf) {
+        if (cinf && sc != (unsigned)signp) return 0x7fffffffu;
+        return ((unsigned)signp << 31) | 0x7f800000u;
+    }
+    if (a0 || b0) return cts_fadd(signp ? 0x80000000u : 0u, c, mode);
+    unsigned long long pa = ea ? (fa | 0x800000u) : fa;
+    unsigned long long pb = eb ? (fb | 0x800000u) : fb;
+    int exp = (ea ? ea : 1) + (eb ? eb : 1) - 127;
+    unsigned long long mag = (pa * pb) << 9;
+    if (mag) {
+        while (mag >= (1ull << 56)) { mag >>= 1; exp++; }
+        while (mag < (1ull << 55) && exp > 1) { mag <<= 1; exp--; }
+    }
+    if ((ec | fc) == 0) return cts_fpack(signp, exp, mag, mode);
+    unsigned long long mc = ec ? ((unsigned long long)(fc | 0x800000u) << 32) : ((unsigned long long)fc << 32);
+    int cexp = ec ? ec : 1;
+    int sh = exp - cexp;
+    unsigned long long acc = mag;
+    if (sh >= 0) {
+        if (sh >= 63) mc = mc ? 1ull : 0ull;
+        else if (sh) {
+            unsigned long long lost = mc & ((1ull << sh) - 1ull);
+            mc >>= sh;
+            if (lost) mc |= 1ull;
+        }
+    } else {
+        int shc = -sh;
+        if (shc >= 63) acc = acc ? 1ull : 0ull;
+        else {
+            unsigned long long lost = acc & ((1ull << shc) - 1ull);
+            acc >>= shc;
+            if (lost) acc |= 1ull;
+        }
+        exp = cexp;
+    }
+    if ((unsigned)signp == sc) return cts_fpack(signp, exp, acc + mc, mode);
+    if (acc == mc) return mode == 3 ? 0x80000000u : 0u;
+    if (acc < mc) return cts_fpack((int)sc, exp, mc - acc, mode);
+    return cts_fpack(signp, exp, acc - mc, mode);
+}
+"""
+
+_FARITH_CODE = {"rn": 0, "rz": 1, "ru": 2, "rd": 3}
+
+
+def _farith_binary(kind: str, mode: str) -> str:
+    code = _FARITH_CODE[mode]
+    if kind == "sub":
+        call = f"cts_fadd(x.as_bits, y.as_bits ^ 0x80000000u, {code})"
+    elif kind == "mul":
+        call = f"cts_fmul(x.as_bits, y.as_bits, {code})"
+    else:
+        call = f"cts_fadd(x.as_bits, y.as_bits, {code})"
+    return f"""
+static __device__ float cts_f{kind}_{mode}(float a, float b) {{
+    union {{ float as_float; unsigned as_bits; }} x, y, out;
+    x.as_float = a;
+    y.as_float = b;
+    out.as_bits = {call};
+    return out.as_float;
+}}
+"""
+
+
+def _farith_fma(mode: str) -> str:
+    code = _FARITH_CODE[mode]
+    return f"""
+static __device__ float cts_fmaf_{mode}(float a, float b, float c) {{
+    union {{ float as_float; unsigned as_bits; }} x, y, z, out;
+    x.as_float = a;
+    y.as_float = b;
+    z.as_float = c;
+    out.as_bits = cts_ffma(x.as_bits, y.as_bits, z.as_bits, {code});
+    return out.as_float;
+}}
+"""
+
+
+FARITH_HELPERS: dict[str, tuple[str, str]] = {}
+for _kind in ("add", "sub", "mul"):
+    for _mode in ("rn", "rz", "ru", "rd"):
+        FARITH_HELPERS[f"__f{_kind}_{_mode}"] = (f"cts_f{_kind}_{_mode}", _farith_binary(_kind, _mode))
+for _mode in ("rn", "rz", "ru", "rd"):
+    FARITH_HELPERS[f"__fmaf_{_mode}"] = (f"cts_fmaf_{_mode}", _farith_fma(_mode))
+
+
+def farith_needs_add(names: set[str]) -> bool:
+    return any(
+        name.startswith("cts_fadd_") or name.startswith("cts_fsub_") or name.startswith("cts_fmaf_")
+        for name in names
+    )
+
+
+def farith_needs_mul(names: set[str]) -> bool:
+    return any(name.startswith("cts_fmul_") for name in names)
+
+
+def farith_needs_fma(names: set[str]) -> bool:
+    return any(name.startswith("cts_fmaf_") for name in names)
 
 
 def runtime_name(spelling: str, dialect: Dialect) -> str | None:

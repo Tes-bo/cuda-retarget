@@ -39,7 +39,15 @@ from cuda_retarget.dialect import (
     ROUND_I32,
     ROUND_I64,
     SATURATE_HELPERS,
+    FARITH_ADD,
+    FARITH_FMA,
+    FARITH_HELPERS,
+    FARITH_MUL,
+    FARITH_PACK,
     Dialect,
+    farith_needs_add,
+    farith_needs_fma,
+    farith_needs_mul,
     round_needs_bits,
     round_needs_i32,
     round_needs_i64,
@@ -287,6 +295,13 @@ def _call_edit(
             raise TranslateError(f"{token.spelling} must have one argument")
         replacement, _helper = SATURATE_HELPERS[token.spelling]
         return (token.start, token.end, replacement)
+    if dialect.lower_farith and token.spelling in FARITH_HELPERS:
+        parsed = _arguments(tokens, index + 1)
+        arity = 3 if token.spelling.startswith("__fmaf_") else 2
+        if parsed is None or len(parsed[0]) != arity:
+            raise TranslateError(f"{token.spelling} must have {arity} arguments")
+        replacement, _helper = FARITH_HELPERS[token.spelling]
+        return (token.start, token.end, replacement)
     return None
 
 
@@ -436,6 +451,19 @@ def _helpers(dialect: Dialect, rewritten: str) -> str:
     if dialect.lower_saturate:
         for name, helper in SATURATE_HELPERS.values():
             if f"{name}(" in rewritten:
+                blocks.append(helper.strip("\n"))
+    if dialect.lower_farith:
+        used = [(name, helper) for name, helper in FARITH_HELPERS.values() if f"{name}(" in rewritten]
+        names = {name for name, _helper in used}
+        if names:
+            blocks.append(FARITH_PACK.strip("\n"))
+            if farith_needs_add(names):
+                blocks.append(FARITH_ADD.strip("\n"))
+            if farith_needs_mul(names):
+                blocks.append(FARITH_MUL.strip("\n"))
+            if farith_needs_fma(names):
+                blocks.append(FARITH_FMA.strip("\n"))
+            for _name, helper in used:
                 blocks.append(helper.strip("\n"))
     return "\n\n".join(blocks)
 

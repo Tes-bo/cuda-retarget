@@ -64,7 +64,7 @@ Comments and string literals stay. A name inside a `#define` is rewritten at the
 | `musa` | the same rule with the `musa` prefix | `musa_runtime.h` | unchanged | lowered |
 | `maca` | unchanged | `cuda_runtime.h` | unchanged | unchanged |
 
-The helpers are bitcasts and double hi/lo words, funnel shifts, `__dp4a`, packed add/sub/min/max/abs, `__byte_perm`, averages, high-half products, absolute differences, packed absolute-difference sums, comparison masks, lane predicates, packed averages, bit scans, 24-bit products, rounding conversions, and `__saturatef`.
+The helpers are bitcasts and double hi/lo words, funnel shifts, `__dp4a`, packed add/sub/min/max/abs, `__byte_perm`, averages, high-half products, absolute differences, packed absolute-difference sums, comparison masks, lane predicates, packed averages, bit scans, 24-bit products, rounding conversions, `__saturatef`, and directed float add, sub, mul, and fused multiply-add.
 
 Inserted helpers are `static __device__` and sit after the last `#include`.
 
@@ -93,6 +93,11 @@ These are the results a prefix swap gets wrong. HIP and MUSA both get the helper
 | NaN to `__float2ll_*` or `__float2ull_*` | the high bit |
 | NaN to `__double2int_rz` | `0x80000000` |
 | `__saturatef` of a NaN or of `-0` | `+0`. Values outside `[0, 1]` clamp |
+| `__fadd_ru` of 1 and a value below one ulp | the next float above 1. The nearest-even tie stays on the even float |
+| `__fadd_rd(+0, -0)` / `__fadd_rd(+0, +0)` | `-0` / `+0`. Same-sign zeros keep their sign |
+| `__fadd_rz` of two overflowing magnitudes | the finite maximum, not infinity |
+| `__fmaf_rn` of `(1+2^-23)` squared minus the rounded square | `2^-46` (`679477248`), not 0 |
+| a NaN operand of `__fadd_*` or `__fmaf_*` | the canonical quiet NaN `2147483647` |
 | `__mul24` | the high 8 bits are ignored. The square of the minimum 24-bit value keeps a low half of `0` |
 | `__clz(0)` / `__clzll(0)` / `__ffs(0)` | `32` / `64` / `0` |
 | `__dp4a` of a `0x80` byte | `-128` signed, `128` unsigned |
