@@ -1,37 +1,24 @@
 # cuda-retarget
 
-Translate CUDA source to HIP, to MUSA, and to the CUDA spelling MetaX compiles. This is a rewriter for people searching for a way to turn CUDA into HIP, run CUDA on AMD, or retarget a kernel toward Moore Threads (musify's source language) without switching tools per vendor.
+Turn one CUDA file into HIP, MUSA, or the CUDA spelling MetaX compiles. The rewriter in this repository decides the edits. It does not call HIPIFY, musify, or cu-bridge, and it does not ship their source.
 
-Clang tokenises the file. The rewrite rules in this repository decide what changes. `cuda-retarget` does not invoke HIPIFY, musify, or cu-bridge, and it does not ship their source. It also does not compile. AMD's runtime, Moore Threads' runtime, MetaX's runtime, and each vendor's instruction set stay theirs. A renamed `cudaMalloc` is not a binary.
+[![License](https://img.shields.io/github/license/Tes-bo/cuda-retarget?style=flat-square&color=blue)](LICENSE)
+[![Dialects](https://img.shields.io/badge/dialects-HIP%20%C2%B7%20MUSA%20%C2%B7%20MACA-1a7f37?style=flat-square)](#targets)
+[![Python](https://img.shields.io/badge/python-3.10%2B-0969da?style=flat-square)](#quick-start)
 
-The semantic edits are the part a prefix swap drops. On HIP, a 3-argument `__shfl_sync`, `__shfl_xor_sync`, `__shfl_up_sync`, or `__shfl_down_sync` whose mask is the full 32-bit literal keeps CUDA's subgroup width of 32, because an omitted width follows the device wavefront and AMD's is 64. A use of `warpSize` becomes the literal `32` for the same reason. The name in a `#define` stays. On MUSA those calls stay 3 arguments and `warpSize` stays, because the documented warp is 32 lanes. A full-mask `__match_any_sync` or `__match_all_sync` on HIP becomes a helper that builds the mask from a subgroup of 32 lanes, comparing float and double by their IEEE bits. A full-mask `__ballot_sync`, `__any_sync`, `__all_sync`, or `__uni_sync` on HIP becomes a helper over that same subgroup, so a predicate that is uniform in one warp stays uniform there. A no-argument `__syncwarp()` on HIP becomes `__syncwarp(0xffffffff)`, which is CUDA's default mask. An explicit mask stays. On MUSA those match and vote calls stay, because the documented warp is 32 lanes. On HIP and MUSA, `__double_as_longlong`, `__longlong_as_double`, `__float_as_int`, `__int_as_float`, `__float_as_uint`, and `__uint_as_float` become device union helpers, so the IEEE bits do not depend on a CUDA intrinsic. `__double2hiint`, `__double2loint`, and `__hiloint2double` become the high and low 32-bit words of that same double. `__funnelshift_l`, `__funnelshift_lc`, `__funnelshift_r`, and `__funnelshift_rc` become 64-bit shift helpers on those same targets, so wrap versus clamp does not depend on a CUDA builtin. `__dp4a` becomes signed and unsigned four-byte dot-product helpers, so a 0x80 byte is -128 or 128 depending on the overload. `__vadd2`, `__vsub2`, `__vadd4`, `__vsub4`, and their `ss` and `us` forms become per-lane helpers: plain calls wrap, `ss` saturates as signed, and `us` saturates as unsigned. `__vmins2`, `__vminu2`, `__vmaxs2`, `__vmaxu2`, and the 4-byte forms become per-lane helpers too: `s` compares a lane as signed and `u` compares it as unsigned. `__vabs2`, `__vabs4`, `__vneg2`, `__vneg4`, and the absolute-difference forms become per-lane helpers. Plain absolute value wraps, so a minimum lane keeps its bits. The saturating absolute value turns that lane into the maximum. `__vnegss2` keeps a `0x8000` lane, the same bits `__vneg2` produces. `__vnegss4` turns `0x80` into `0x7F`. `__byte_perm` becomes a helper that concatenates the two words as `y:x` and picks four bytes. Each selector uses three bits from the low 16 bits of the third argument. `__hadd` and `__uhadd` become `(x + y) >> 1`, and `__rhadd` and `__urhadd` add one before that shift. The sum does not overflow a 32-bit temporary. `__mulhi` and `__umulhi` become the high 32 bits of a widened product, and `__mul64hi` and `__umul64hi` become the high 64 bits of a 128-bit product. A negative product sign-extends. `INT_MIN * INT_MIN` keeps the high half `2^30`. `__sad` and `__usad` become the absolute difference plus the third argument. The signed form widens first, so the absolute value of `INT_MIN` is `2^31`. The unsigned form treats those bits as a magnitude. The sum wraps modulo `2^32`. `__vsads2`, `__vsadu2`, `__vsads4`, and `__vsadu4` become the sum of the per-lane absolute differences. A signed `0xFFFF` lane is 1 and an unsigned one is 65535. A `0x8000` lane contributes 32768. The result is a scalar sum. `__vcmp*` comparisons become lane masks. A true halfword is `0xFFFF` and a true byte is `0xFF`. Signed `0x8000` is less than `0x7FFF`; the same bits unsigned are greater. `__vset*` writes a 1 into each true lane, `0x0001` for a halfword and `0x01` for a byte, and leaves a failing lane at zero. `__vavgs2` and `__vavgs4` round a half away from zero, so 1 and 2 become 2 while -2 and -3 become -3. `__vavgu2` and `__vavgu4` round unsigned lanes the same way. `__vhaddu2` and `__vhaddu4` truncate, so `0xFFFF` and 1 become `0x8000`. `__clz(0)` is 32, `__clzll(0)` is 64, `__ffs(0)` is 0, and `__brev` reverses bits. `__mul24` and `__umul24` ignore the high 8 bits. Bit 23 is the signed form's sign, and the square of the minimum 24-bit value keeps a low half of 0. `__float2int_rn(2.5)` is 2 and `__float2int_ru(2.5)` is 3. Values past the integer range saturate. A NaN becomes 0 for `__float2int_*` and the high bit for `__float2ll_*` and `__double2int_rz`. `__int2float_ru` of 16777217 is the next float above the tie. A long long past 2^53 is rounded from its bits. `__saturatef` clamps to [0, 1], and a NaN or a negative zero becomes +0. MetaX keeps every CUDA spelling: that compiler accepts CUDA, and an identity translation is the honest output.
+[cuda-census](https://github.com/Tes-bo/cuda-census) runs the official toolchains and records their numbers. This repository does not score itself there.
 
-This project is not affiliated with NVIDIA, AMD, Hygon, Moore Threads, or MetaX. It does not score itself inside [cuda-census](https://github.com/Tes-bo/cuda-census). cuda-census runs official toolchains only.
+<p align="center">
+  <img src="docs/overview.svg" alt="CUDA source is parsed once by Clang and emitted as HIP, MUSA, or unchanged MetaX CUDA." width="820">
+</p>
 
-## Targets
+**Quick start · [What changes](#what-changes) · [Targets](#targets) · [Edges](#edges-the-helpers-match) · [Run](#run)**
 
-| `--target` | Names | Header | 32-lane shuffles | 32-lane match and vote | Bitcast and funnel |
-| --- | --- | --- | --- | --- | --- |
-| `hip` | `cudaMalloc` becomes `hipMalloc`, and the same prefix rule for every `cuda` identifier whose next character is uppercase. A `warpSize` use becomes `32` | `hip/hip_runtime.h` | a full-mask 3-argument `__shfl_sync`, `__shfl_xor_sync`, `__shfl_up_sync`, or `__shfl_down_sync` gains `, 32` | full-mask match, ballot, any, all, and uni calls become helpers | union helpers, including double hi/lo words; `__funnelshift_*`, `__dp4a`, packed add/sub/min/max/abs helpers, `__byte_perm`, average helpers, high-half multiply helpers, absolute-difference helpers, packed absolute-difference sums, packed comparison masks, lane predicates, packed averages, bit scans, 24-bit products, rounding conversions, and saturate |
-| `musa` | the same rule with the `musa` prefix | `musa_runtime.h` | unchanged | unchanged | union helpers, including double hi/lo words; `__funnelshift_*`, `__dp4a`, packed add/sub/min/max/abs helpers, `__byte_perm`, average helpers, high-half multiply helpers, absolute-difference helpers, packed absolute-difference sums, packed comparison masks, lane predicates, packed averages, bit scans, 24-bit products, rounding conversions, and saturate |
-| `maca` | unchanged | `cuda_runtime.h` | unchanged | unchanged | unchanged |
+A renamed `cudaMalloc` is source, not a binary. AMD's runtime, Moore Threads' runtime, MetaX's runtime, and each vendor's instruction set stay theirs. This project is not affiliated with NVIDIA, AMD, Hygon, Moore Threads, or MetaX.
 
-`cudaFoo`, a user function with that prefix, is renamed on HIP and MUSA. `__shfl_sync`, `threadIdx`, and `atomicAdd` are not runtime identifiers and stay. A CUDA name inside a comment or a string literal stays. A name inside a `#define` in this file is rewritten at the definition.
+## Quick start
 
-## What stays source
-
-These are not rewritten, and a later vendor compile may reject them or change their meaning:
-
-- Inline PTX.
-- A shuffle whose width argument is already a literal. That literal is kept.
-- A `__syncwarp` call that already passes a mask. That mask stays.
-- A 3-argument shuffle, a match call, or a `__ballot_sync` / `__any_sync` / `__all_sync` / `__uni_sync`, whose mask is not the literal `0xffffffff` (any of `u`, `l`, `ll`, `ull`). A variable mask is still CUDA's width 32 on NVIDIA and the wavefront width on AMD. This rewriter does not guess which mask the programmer meant to widen.
-- `lane & 31` and any other width arithmetic.
-- CUDA Graph instantiate signatures that drift between runtimes. The 5-argument call is renamed and its arguments stay.
-
-Inserted helpers are `static __device__` and are placed after the last `#include`.
-
-## Run
+Python 3.10 or newer. Clang must load `libclang` and see `cuda_runtime.h`. `LIBCLANG_PATH` and `CUDA_INCLUDE` override the defaults.
 
 ```bash
 python3 -m cuda_retarget self-check
@@ -40,15 +27,98 @@ python3 -m cuda_retarget translate --target musa --input kernel.cu --output kern
 python3 -m cuda_retarget translate --target maca --input kernel.cu
 ```
 
-Without `--output`, the translation is written to stdout. A parse failure or an unknown target exits 2. Clang must be able to load `libclang` and to see `cuda_runtime.h`. `LIBCLANG_PATH` and `CUDA_INCLUDE` override the defaults.
+Without `--output`, the translation goes to stdout. A parse failure or an unknown target exits 2.
 
-Host-side tests, with no vendor SDK:
+## What changes
+
+The sample the self-check translates:
+
+```cuda
+*out = __shfl_sync(0xffffffff, threadIdx.x, 0) + warpSize;
+cudaMalloc(&p, sizeof(int));
+```
+
+HIP keeps CUDA's subgroup of 32 lanes. An omitted width would follow the device wavefront, and AMD's is 64.
+
+```cpp
+*out = __shfl_sync(0xffffffff, threadIdx.x, 0, 32) + 32;
+hipMalloc(&p, sizeof(int));
+```
+
+MUSA keeps the 3-argument shuffle and `warpSize`. The documented warp there is 32 lanes. The runtime prefix still changes.
+
+```cpp
+*out = __shfl_sync(0xffffffff, threadIdx.x, 0) + warpSize;
+musaMalloc(&p, sizeof(int));
+```
+
+MACA is the same text as the input. That compiler accepts CUDA, so an identity translation is the honest output.
+
+Comments and string literals stay. A name inside a `#define` is rewritten at the definition. The `#define` name `warpSize` itself stays; a later use of it does not. `cudaFoo`, a user function with that prefix, is renamed on HIP and MUSA. `__shfl_sync`, `threadIdx`, and `atomicAdd` are not runtime identifiers.
+
+## Targets
+
+| `--target` | Names | Header | 32-lane warp | Integer and float helpers |
+| --- | --- | --- | --- | --- |
+| `hip` | `cudaMalloc` becomes `hipMalloc`, and the same prefix rule for every `cuda` identifier whose next character is uppercase. A `warpSize` use becomes `32` | `hip/hip_runtime.h` | a full-mask 3-argument shuffle gains `, 32`. Full-mask match, ballot, any, all, and uni become 32-lane helpers. `__syncwarp()` becomes `__syncwarp(0xffffffff)` | lowered |
+| `musa` | the same rule with the `musa` prefix | `musa_runtime.h` | unchanged | lowered |
+| `maca` | unchanged | `cuda_runtime.h` | unchanged | unchanged |
+
+The helpers are bitcasts and double hi/lo words, funnel shifts, `__dp4a`, packed add/sub/min/max/abs, `__byte_perm`, averages, high-half products, absolute differences, packed absolute-difference sums, comparison masks, lane predicates, packed averages, bit scans, 24-bit products, rounding conversions, and `__saturatef`.
+
+Inserted helpers are `static __device__` and sit after the last `#include`.
+
+## Edges the helpers match
+
+These are the results a prefix swap gets wrong. HIP and MUSA both get the helpers. Warp-width edits are HIP only.
+
+| Call | Result |
+| --- | --- |
+| full-mask `__shfl_sync` / `xor` / `up` / `down` with 3 arguments, on HIP | `, 32` inserted. A width that is already present stays, including `warpSize` |
+| `warpSize` use, on HIP | literal `32`. The name in `#define warpSize` stays |
+| full-mask `__match_any_sync` / `__match_all_sync`, on HIP | a 32-lane mask. Float and double are compared by IEEE bits, so `-0` and `+0` differ |
+| full-mask `__ballot_sync` / `__any_sync` / `__all_sync` / `__uni_sync`, on HIP | the same 32-lane subgroup. A predicate that is uniform in one warp stays uniform there |
+| `__syncwarp()`, on HIP | `__syncwarp(0xffffffff)`. An explicit mask stays |
+| `__vnegss2` of a `0x8000` lane | stays `0x8000`, the same bits as `__vneg2`. `__vnegss4` turns `0x80` into `0x7F` |
+| `__vset*` | a true halfword writes `0x0001` and a true byte writes `0x01`. Failing lanes stay zero |
+| `__vavgs2(1, 2)` and `__vavgs2(-2, -3)` | `2` and `-3`. Half rounds away from zero |
+| `__vhaddu2(0xFFFF, 1)` | `0x8000`, not a wrapped `0` |
+| `__hadd(INT_MIN, INT_MIN)` | `INT_MIN`. The average of `0xFFFFFFFF` and `1` is `2^31` |
+| `INT_MIN * INT_MIN` through `__mulhi` | high half `2^30`, not a wrapped 32-bit product |
+| `__sad` of `INT_MIN` | absolute value `2^31`. The following add wraps modulo `2^32` |
+| `__vsad*` | the scalar sum of the lane differences. A `0x8000` lane contributes `32768` |
+| `__vcmp*` | a true halfword is `0xFFFF` and a true byte is `0xFF` |
+| `__float2int_rn(2.5f)` / `__float2int_ru(2.5f)` / `__float2int_rd(-2.5f)` | `2` / `3` / `-3`. Out-of-range values saturate |
+| NaN to `__float2int_*` | `0` |
+| NaN to `__float2ll_*` or `__float2ull_*` | the high bit |
+| NaN to `__double2int_rz` | `0x80000000` |
+| `__saturatef` of a NaN or of `-0` | `+0`. Values outside `[0, 1]` clamp |
+| `__mul24` | the high 8 bits are ignored. The square of the minimum 24-bit value keeps a low half of `0` |
+| `__clz(0)` / `__clzll(0)` / `__ffs(0)` | `32` / `64` / `0` |
+| `__dp4a` of a `0x80` byte | `-128` signed, `128` unsigned |
+| `__byte_perm` | four bytes from `y:x`. Selector bits above bit 15 are ignored |
+| `__funnelshift_l` / `_r` | `shift & 31`. The clamp forms stop at 32 |
+
+Signed lane `0x8000` and unsigned lane `0x8000` are different numbers in the packed comparisons, min/max, and absolute differences.
+
+## What stays source
+
+A later vendor compile may reject these, or give them a different meaning:
+
+- Inline PTX.
+- A shuffle that already has a width argument. That literal is kept.
+- A `__syncwarp` call that already passes a mask.
+- A 3-argument shuffle, a match call, or a vote call whose mask is not the literal `0xffffffff` (`u`, `l`, `ll`, or `ull`). A variable mask is still CUDA's width 32 on NVIDIA and the wavefront width on AMD. This rewriter does not guess which mask the programmer meant.
+- `lane & 31` and any other width arithmetic.
+- The 5-argument CUDA Graph instantiate call. It is renamed, and its arguments stay. The `0` there is a buffer size, not flags.
+
+## Run
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
 
-One test compiles the double-bits helper with `nvcc` when `nvcc` is on `PATH`. It does not compile HIP or MUSA output with `nvcc`.
+The tests do not compile HIP or MUSA output with `nvcc`. When `nvcc` is on `PATH` and a GPU is free, they compile the helper text and compare it with the CUDA intrinsic.
 
 ## License
 

@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="280" viewBox="0 0 820 280" role="img">
+  <title>cuda-retarget: one Clang parse, three emitters</title>
+  <desc>CUDA source is tokenised once, then emitted as HIP, MUSA, or MetaX CUDA.</desc>
+  <rect width="820" height="280" rx="12" fill="#ffffff" stroke="#d0d7de"/>
+  <rect x="20" y="96" width="156" height="88" rx="8" fill="#f6f8fa" stroke="#d0d7de"/>
+  <text x="98" y="132" text-anchor="middle" fill="#1f2328" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="16" font-weight="600">kernel.cu</text>
+  <text x="98" y="156" text-anchor="middle" fill="#656d76" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="13">CUDA source</text>
+  <line x1="176" y1="140" x2="214" y2="140" stroke="#656d76" stroke-width="1.5"/>
+  <polygon points="214,140 206,136 206,144" fill="#656d76"/>
+  <rect x="220" y="96" width="176" height="88" rx="8" fill="#ddf4ff" stroke="#54aeff"/>
+  <text x="308" y="132" text-anchor="middle" fill="#1f2328" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="16" font-weight="600">Clang</text>
+  <text x="308" y="156" text-anchor="middle" fill="#0969da" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="13">one token parse</text>
+  <line x1="396" y1="140" x2="430" y2="52" stroke="#656d76" stroke-width="1.5"/>
+  <line x1="396" y1="140" x2="430" y2="140" stroke="#656d76" stroke-width="1.5"/>
+  <line x1="396" y1="140" x2="430" y2="228" stroke="#656d76" stroke-width="1.5"/>
+  <polygon points="430,52 422,48 422,56" fill="#656d76"/>
+  <polygon points="430,140 422,136 422,144" fill="#656d76"/>
+  <polygon points="430,228 422,224 422,232" fill="#656d76"/>
+  <rect x="436" y="16" width="364" height="72" rx="8" fill="#fff8c5" stroke="#d4a72c"/>
+  <text x="454" y="46" fill="#1f2328" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="16" font-weight="600">HIP</text>
+  <text x="454" y="68" fill="#656d76" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="13">prefix, helpers, warp width pinned at 32</text>
+  <rect x="436" y="104" width="364" height="72" rx="8" fill="#dafbe1" stroke="#1a7f37"/>
+  <text x="454" y="134" fill="#1f2328" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="16" font-weight="600">MUSA</text>
+  <text x="454" y="156" fill="#656d76" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="13">prefix and helpers, warp width unchanged</text>
+  <rect x="436" y="192" width="364" height="72" rx="8" fill="#f6f8fa" stroke="#d0d7de"/>
+  <text x="454" y="222" fill="#1f2328" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="16" font-weight="600">MACA</text>
+  <text x="454" y="244" fill="#656d76" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="13">CUDA spelling, left unchanged</text>
+</svg>
