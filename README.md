@@ -64,7 +64,7 @@ Comments and string literals stay. A name inside a `#define` is rewritten at the
 | `musa` | the same rule with the `musa` prefix | `musa_runtime.h` | unchanged | lowered |
 | `maca` | unchanged | `cuda_runtime.h` | unchanged | unchanged |
 
-The helpers are bitcasts and double hi/lo words, funnel shifts, `__dp4a`, packed add/sub/min/max/abs, `__byte_perm`, averages, high-half products, absolute differences, packed absolute-difference sums, comparison masks, lane predicates, packed averages, bit scans, 24-bit products, rounding conversions, double-to-float rounding, `__saturatef`, and directed float add, sub, mul, and fused multiply-add.
+The helpers are bitcasts and double hi/lo words, funnel shifts, `__dp4a`, packed add/sub/min/max/abs, `__byte_perm`, averages, high-half products, absolute differences, packed absolute-difference sums, comparison masks, lane predicates, packed averages, bit scans, 24-bit products, rounding conversions, double-to-float rounding, float-to-half rounding, `__saturatef`, and directed float add, sub, mul, and fused multiply-add.
 
 Inserted helpers are `static __device__` and sit after the last `#include`.
 
@@ -94,6 +94,10 @@ These are the results a prefix swap gets wrong. HIP and MUSA both get the helper
 | NaN to `__double2int_*` | `0x80000000`, in every rounding mode |
 | `__double2float_rn(1+2^-24)` / `__double2float_ru` of that tie | stays on 1 / the next float. Toward zero, a value past the finite maximum stays finite |
 | a double NaN passed to `__double2float_*` | a quiet float NaN with the same sign. `-0` stays `-0` |
+| `__float2half_rn(1+2^-11)` / `__float2half_ru` of that tie | `15360` / `15361`. `__float2half` matches the nearest-even form |
+| `__float2half_rz` of a value past 65504 | `31743`, the finite maximum. Round-up is infinity `31744` |
+| a NaN passed to `__float2half_*` | `32767`, and the sign is dropped. `__half2float` of that NaN is `2147483647` |
+| `-0` through `__float2half_rd` | `32768` |
 | `__saturatef` of a NaN or of `-0` | `+0`. Values outside `[0, 1]` clamp |
 | `__fadd_ru` of 1 and a value below one ulp | the next float above 1. The nearest-even tie stays on the even float |
 | `__fadd_rd(+0, -0)` / `__fadd_rd(+0, +0)` | `-0` / `+0`. Same-sign zeros keep their sign |

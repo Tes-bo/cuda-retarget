@@ -45,10 +45,15 @@ from cuda_retarget.dialect import (
     FARITH_HELPERS,
     FARITH_MUL,
     FARITH_PACK,
+    HALF_FROM_FLOAT,
+    HALF_HELPERS,
+    HALF_TO_FLOAT,
     Dialect,
     farith_needs_add,
     farith_needs_fma,
     farith_needs_mul,
+    half_needs_from_float,
+    half_needs_to_float,
     round_needs_bits,
     round_needs_d2f,
     round_needs_i32,
@@ -297,6 +302,12 @@ def _call_edit(
             raise TranslateError(f"{token.spelling} must have one argument")
         replacement, _helper = SATURATE_HELPERS[token.spelling]
         return (token.start, token.end, replacement)
+    if dialect.lower_half and token.spelling in HALF_HELPERS:
+        parsed = _arguments(tokens, index + 1)
+        if parsed is None or len(parsed[0]) != 1:
+            raise TranslateError(f"{token.spelling} must have one argument")
+        replacement, _helper = HALF_HELPERS[token.spelling]
+        return (token.start, token.end, replacement)
     if dialect.lower_farith and token.spelling in FARITH_HELPERS:
         parsed = _arguments(tokens, index + 1)
         arity = 3 if token.spelling.startswith("__fmaf_") else 2
@@ -455,6 +466,20 @@ def _helpers(dialect: Dialect, rewritten: str) -> str:
     if dialect.lower_saturate:
         for name, helper in SATURATE_HELPERS.values():
             if f"{name}(" in rewritten:
+                blocks.append(helper.strip("\n"))
+    if dialect.lower_half:
+        used = [(name, helper) for name, helper in HALF_HELPERS.values() if f"{name}(" in rewritten]
+        names = {name for name, _helper in used}
+        if names:
+            if half_needs_from_float(names):
+                blocks.append(HALF_FROM_FLOAT.strip("\n"))
+            if half_needs_to_float(names):
+                blocks.append(HALF_TO_FLOAT.strip("\n"))
+            seen: set[str] = set()
+            for name, helper in used:
+                if name in seen:
+                    continue
+                seen.add(name)
                 blocks.append(helper.strip("\n"))
     if dialect.lower_farith:
         used = [(name, helper) for name, helper in FARITH_HELPERS.values() if f"{name}(" in rewritten]

@@ -41,6 +41,9 @@ from cuda_retarget.dialect import (
     FARITH_HELPERS,
     FARITH_MUL,
     FARITH_PACK,
+    HALF_FROM_FLOAT,
+    HALF_HELPERS,
+    HALF_TO_FLOAT,
     PACKED_AVG_HELPERS,
     PACKED_CMP_HELPERS,
     PACKED_SAD_HELPERS,
@@ -717,6 +720,39 @@ __global__ void convert(int* s) { *s = __double2int_rd(-2.5); }
         self.assertNotIn("cts_d2f(", hip)
         self.assertEqual(translate_source(source, "maca"), source)
 
+    def test_hip_and_musa_lower_half(self) -> None:
+        source = """\
+#include <cuda_fp16.h>
+__global__ void convert(float* f) {
+    const char* label = "__float2half __half2float";
+    __half h = __float2half(*f + 0x1p-11f);
+    h = __float2half_ru(*f);
+    *f = __half2float(h);
+    *f += label[0];
+}
+"""
+        for target in ("hip", "musa"):
+            translated = translate_source(source, target)
+            self.assertIn('"__float2half __half2float"', translated)
+            self.assertIn("cts_float2half_rn(*f + 0x1p-11f)", translated)
+            self.assertIn("cts_float2half_ru(*f)", translated)
+            self.assertIn("cts_half2float(h)", translated)
+            self.assertIn("cts_f2h(", translated)
+            self.assertIn("cts_h2f(", translated)
+            self.assertIn("0x7fff", translated)
+            self.assertNotIn("__float2half(", translated)
+            self.assertNotIn("__float2half_ru(", translated)
+            self.assertNotIn("__half2float(", translated)
+            self.assertEqual(translated.count("cts_float2half_rn("), 2)
+        only = """\
+#include <cuda_fp16.h>
+__global__ void widen(__half h, float* f) { *f = __half2float(h); }
+"""
+        hip = translate_source(only, "hip")
+        self.assertIn("cts_h2f(", hip)
+        self.assertNotIn("cts_f2h(", hip)
+        self.assertEqual(translate_source(source, "maca"), source)
+
     def test_unparsed_source_is_refused(self) -> None:
         with self.assertRaises(TranslateError):
             translate_source("int main( {\n", "hip", filename="broken.cu")
@@ -1145,6 +1181,30 @@ class CorpusTests(unittest.TestCase):
             self.assertEqual(translated.count("cts_double2float_ru("), 5)
         self.assertIn("__double2float_rn", maca)
         self.assertNotIn("cts_double2float_rn", maca)
+
+    def test_hip_and_musa_lower_the_census_half(self) -> None:
+        path = CENSUS / "half_cvt" / "main.cu"
+        if not path.is_file():
+            self.skipTest("half_cvt is not in the census corpus")
+        hip = translate_path(path, "hip")
+        musa = translate_path(path, "musa")
+        maca = translate_path(path, "maca")
+        for translated in (hip, musa):
+            self.assertIn("cts_float2half_rn(tie)", translated)
+            self.assertIn("cts_float2half_ru(tie)", translated)
+            self.assertIn("cts_float2half_rd(-tie)", translated)
+            self.assertIn("cts_float2half_rn(nan.as_float)", translated)
+            self.assertIn("cts_float2half_ru(2049.0f)", translated)
+            self.assertIn("cts_half2float(__ushort_as_half(0x7fff))", translated)
+            self.assertIn("cts_half2float(__ushort_as_half(0xfc00))", translated)
+            self.assertIn("__half_as_ushort", translated)
+            self.assertNotIn("__float2half(", translated)
+            self.assertNotIn("__float2half_rn(", translated)
+            self.assertNotIn("__half2float(", translated)
+            self.assertEqual(translated.count("cts_float2half_rn("), 6)
+            self.assertEqual(translated.count("cts_half2float("), 7)
+        self.assertIn("__float2half", maca)
+        self.assertNotIn("cts_float2half_rn", maca)
 
     def test_only_hip_pins_warp_size(self) -> None:
         path = CENSUS / "warp_size" / "main.cu"
@@ -2646,6 +2706,57 @@ __global__ void compare(int* bad) {{
     if (__double2uint_ru(1.1) != cts_double2uint_ru(1.1)) atomicExch(bad, 1);
     if (__double2ll_rd(-0x1p63) != cts_double2ll_rd(-0x1p63)) atomicExch(bad, 1);
     if (__double2ull_rn(nann.d) != cts_double2ull_rn(nann.d)) atomicExch(bad, 1);
+}}
+int main() {{
+    int* bad = nullptr;
+    if (cudaMalloc(&bad, sizeof(*bad)) != cudaSuccess) return 2;
+    if (cudaMemset(bad, 0, sizeof(*bad)) != cudaSuccess) return 2;
+    compare<<<1, 1>>>(bad);
+    if (cudaDeviceSynchronize() != cudaSuccess) return 3;
+    int mismatch = 0;
+    if (cudaMemcpy(&mismatch, bad, sizeof(mismatch), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
+    std::printf("mismatch=%d\\n", mismatch);
+    cudaFree(bad);
+    return 0;
+}}
+""",
+        )
+
+    def test_half_helpers_agree_with_the_intrinsics(self) -> None:
+        wrappers = "\n".join(
+            body.strip("\n") for key, (_name, body) in HALF_HELPERS.items() if key != "__float2half"
+        )
+        helpers = "\n".join([HALF_FROM_FLOAT.strip("\n"), HALF_TO_FLOAT.strip("\n"), wrappers])
+        self._nvcc_mismatch(
+            "half",
+            f"""\
+#include <cstdio>
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+{helpers}
+__global__ void compare(int* bad) {{
+    float vals[8] = {{
+        0.0f, -0.0f, 1.0f + 0x1p-11f, -(1.0f + 0x1p-11f), 0x1p-25f, 65520.0f, 2049.0f, -2049.0f
+    }};
+    for (int i = 0; i < 8; ++i) {{
+        float x = vals[i];
+        if (__half_as_ushort(__float2half(x)) != __half_as_ushort(cts_float2half_rn(x))) atomicExch(bad, 1);
+        if (__half_as_ushort(__float2half_rn(x)) != __half_as_ushort(cts_float2half_rn(x))) atomicExch(bad, 1);
+        if (__half_as_ushort(__float2half_rz(x)) != __half_as_ushort(cts_float2half_rz(x))) atomicExch(bad, 1);
+        if (__half_as_ushort(__float2half_ru(x)) != __half_as_ushort(cts_float2half_ru(x))) atomicExch(bad, 1);
+        if (__half_as_ushort(__float2half_rd(x)) != __half_as_ushort(cts_float2half_rd(x))) atomicExch(bad, 1);
+    }}
+    union {{ float f; unsigned u; }} nanp, nann;
+    nanp.u = 0x7fc00000u;
+    nann.u = 0xffc00000u;
+    if (__half_as_ushort(__float2half_rn(nanp.f)) != __half_as_ushort(cts_float2half_rn(nanp.f))) atomicExch(bad, 1);
+    if (__half_as_ushort(__float2half_rn(nann.f)) != __half_as_ushort(cts_float2half_rn(nann.f))) atomicExch(bad, 1);
+    if (__half_as_ushort(__float2half(__int_as_float(0x7f800000))) != __half_as_ushort(cts_float2half_rn(__int_as_float(0x7f800000))))
+        atomicExch(bad, 1);
+    for (unsigned bits = 0; bits < 65536u; ++bits) {{
+        __half h = __ushort_as_half((unsigned short)bits);
+        if (__float_as_uint(__half2float(h)) != __float_as_uint(cts_half2float(h))) atomicExch(bad, 1);
+    }}
 }}
 int main() {{
     int* bad = nullptr;

@@ -313,6 +313,13 @@ class Dialect:
     becomes the canonical quiet NaN `0x7fffffff`. Fused multiply-add of
     `(1+2^-23)` squared minus the rounded square is `2^-46`, which a
     rounded product plus the addend loses.
+    `lower_half` replaces `__float2half`, `__float2half_*`, and
+    `__half2float`. `__float2half` is the nearest-even conversion.
+    `__float2half_rn(1+2^-11)` stays on 1 and round-up takes the next
+    half. A value past 65504 stays at the finite maximum when rounding
+    toward zero. A NaN becomes `0x7fff`, with the sign dropped.
+    `__half2float` of that NaN is the float `0x7fffffff`. Infinity keeps
+    its sign, and `-0` stays `-0`.
     """
 
     name: str
@@ -341,6 +348,7 @@ class Dialect:
     lower_round: bool
     lower_saturate: bool
     lower_farith: bool
+    lower_half: bool
 
 
 DIALECTS = {
@@ -371,6 +379,7 @@ DIALECTS = {
         lower_round=True,
         lower_saturate=True,
         lower_farith=True,
+        lower_half=True,
     ),
     "musa": Dialect(
         name="musa",
@@ -399,6 +408,7 @@ DIALECTS = {
         lower_round=True,
         lower_saturate=True,
         lower_farith=True,
+        lower_half=True,
     ),
     "maca": Dialect(
         name="maca",
@@ -427,6 +437,7 @@ DIALECTS = {
         lower_round=False,
         lower_saturate=False,
         lower_farith=False,
+        lower_half=False,
     ),
 }
 
@@ -1827,6 +1838,123 @@ def farith_needs_mul(names: set[str]) -> bool:
 
 def farith_needs_fma(names: set[str]) -> bool:
     return any(name.startswith("cts_fmaf_") for name in names)
+
+
+# Half keeps 10 explicit bits. A NaN becomes 0x7fff, and widening that NaN
+# becomes the float 0x7fffffff. Infinity keeps its sign.
+HALF_FROM_FLOAT = """
+static __device__ unsigned short cts_hpack(int sign, int exp, unsigned long long mag, int mode) {
+    if (mag == 0) return (unsigned short)(sign ? 0x8000 : 0);
+    while (mag >= (1ull << 34)) { mag >>= 1; exp++; }
+    while (mag < (1ull << 33) && exp > 1) { mag <<= 1; exp--; }
+    if (exp < 1 || (exp == 1 && mag < (1ull << 33))) {
+        int need = 1 - exp;
+        exp = 0;
+        if (need >= 64) mag = mag ? 1 : 0;
+        else if (need) {
+            unsigned long long lost = mag & ((1ull << need) - 1ull);
+            mag >>= need;
+            if (lost) mag |= 1ull;
+        }
+    }
+    unsigned long long rem = mag & ((1ull << 23) - 1ull);
+    unsigned sig = (unsigned)(mag >> 23) & 0x7ffu;
+    int toward_inf = sign ? (mode == 3) : (mode == 2);
+    int up = 0;
+    if (mode == 0) up = rem > (1ull << 22) || (rem == (1ull << 22) && (sig & 1u));
+    else if (toward_inf) up = rem != 0;
+    if (up) {
+        sig += 1u;
+        if (exp == 0) {
+            if (sig == 0x400u) exp = 1;
+        } else if (sig == 0x800u) {
+            sig = 0x400u;
+            exp++;
+        }
+    }
+    if (exp >= 31) {
+        int to_inf = (mode == 0) || (sign ? mode == 3 : mode == 2);
+        if (to_inf) return (unsigned short)((sign << 15) | 0x7c00);
+        return (unsigned short)((sign << 15) | 0x7bff);
+    }
+    if (exp <= 0) return (unsigned short)((sign << 15) | (sig & 0x3ffu));
+    return (unsigned short)((sign << 15) | (exp << 10) | (sig & 0x3ffu));
+}
+
+static __device__ unsigned short cts_f2h(float value, int mode) {
+    union { float as_float; unsigned as_bits; } in;
+    in.as_float = value;
+    unsigned sign = in.as_bits >> 31;
+    int exp = (int)((in.as_bits >> 23) & 0xff);
+    unsigned frac = in.as_bits & 0x7fffffu;
+    if (exp == 255) {
+        if (frac) return (unsigned short)0x7fff;
+        return (unsigned short)((sign << 15) | 0x7c00);
+    }
+    unsigned sig = exp ? (frac | 0x800000u) : frac;
+    int hexp = exp ? (exp - 112) : -111;
+    return cts_hpack((int)sign, hexp, (unsigned long long)sig << 10, mode);
+}
+"""
+
+HALF_TO_FLOAT = """
+static __device__ float cts_h2f(unsigned short bits) {
+    unsigned sign = bits >> 15;
+    int exp = (bits >> 10) & 0x1f;
+    unsigned frac = bits & 0x3ffu;
+    union { float as_float; unsigned as_bits; } out;
+    if (exp == 31) {
+        out.as_bits = frac ? 0x7fffffffu : ((sign << 31) | 0x7f800000u);
+        return out.as_float;
+    }
+    if (exp == 0) {
+        out.as_float = (float)frac * 0x1p-24f;
+        if (sign) out.as_bits |= 0x80000000u;
+        return out.as_float;
+    }
+    out.as_bits = (sign << 31) | ((unsigned)(exp + 112) << 23) | (frac << 13);
+    return out.as_float;
+}
+"""
+
+_HALF_CODE = {"rn": 0, "rz": 1, "ru": 2, "rd": 3}
+
+
+def _float_to_half(mode: str) -> str:
+    name = f"cts_float2half_{mode}"
+    code = _HALF_CODE[mode]
+    return f"""
+static __device__ __half {name}(float x) {{
+    union {{ unsigned short as_bits; __half as_half; }} out;
+    out.as_bits = cts_f2h(x, {code});
+    return out.as_half;
+}}
+"""
+
+
+HALF_HELPERS: dict[str, tuple[str, str]] = {}
+for _mode in ("rn", "rz", "ru", "rd"):
+    HALF_HELPERS[f"__float2half_{_mode}"] = (f"cts_float2half_{_mode}", _float_to_half(_mode))
+HALF_HELPERS["__float2half"] = HALF_HELPERS["__float2half_rn"]
+HALF_HELPERS["__half2float"] = (
+    "cts_half2float",
+    """
+static __device__ float cts_half2float(__half value) {
+    union { unsigned short as_bits; __half as_half; } in;
+    in.as_half = value;
+    return cts_h2f(in.as_bits);
+}
+""",
+)
+
+
+def half_needs_from_float(names: set[str]) -> bool:
+    return any(name.startswith("cts_float2half") for name in names)
+
+
+def half_needs_to_float(names: set[str]) -> bool:
+    return any(name.startswith("cts_half2float") for name in names)
+
 
 
 def runtime_name(spelling: str, dialect: Dialect) -> str | None:
