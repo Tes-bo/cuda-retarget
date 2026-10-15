@@ -1,0 +1,30 @@
+{
+  "hip": {
+    "official": "HIPIFY",
+    "note": "hipify-perl rewrites CUDA source. hipcc compiles it. On Hygon, hipcc is the DTK compiler.",
+    "steps": [
+      {"id": "translate", "argv": ["hipify-perl", "{source}"], "stdout": "{translated}"},
+      {"id": "gaps", "input": "{translated}"},
+      {"id": "compile", "argv": ["hipcc", "-O2", "-std=c++17", "{translated}", "-o", "{binary}"]}
+    ]
+  },
+  "musa": {
+    "official": "musify",
+    "note": "musify-text rewrites a copy of the source in place. mcc compiles that copy.",
+    "steps": [
+      {"id": "copy", "from": "{source}", "to": "{copied}"},
+      {"id": "translate", "argv": ["musify-text", "--inplace", "--", "{copied}"]},
+      {"id": "gaps", "input": "{copied}"},
+      {"id": "compile", "argv": ["mcc", "-O2", "-std=c++17", "{copied}", "-o", "{binary}", "-lmusart"]}
+    ]
+  },
+  "maca": {
+    "official": "cu-bridge",
+    "note": "cu-bridge does not emit a translated dialect. cucc compiles CUDA source. Gaps, when admitted, are applied to a copy of that source first.",
+    "steps": [
+      {"id": "copy", "from": "{source}", "to": "{copied}"},
+      {"id": "gaps", "input": "{copied}"},
+      {"id": "compile", "argv": ["cucc", "-O2", "-std=c++17", "{copied}", "-o", "{binary}"]}
+    ]
+  }
+}
