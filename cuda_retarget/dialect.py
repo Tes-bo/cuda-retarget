@@ -248,6 +248,11 @@ class Dialect:
     concatenates `y:x` and picks four bytes. Each selector is three bits
     from the low 16 bits of the third argument. The high bit of each
     nibble, and every bit above bit 15, is ignored.
+    `lower_hadd` replaces `__hadd`, `__rhadd`, `__uhadd`, and `__urhadd`.
+    The plain forms are `(x + y) >> 1`. The rounded forms add one before
+    the shift. The sum is computed without a 32-bit overflow, so the
+    average of two minimum signed values stays negative and the average
+    of `0xFFFFFFFF` and `1` is `2^31`.
     """
 
     name: str
@@ -264,6 +269,7 @@ class Dialect:
     lower_packed_minmax: bool
     lower_packed_abs: bool
     lower_byte_perm: bool
+    lower_hadd: bool
 
 
 DIALECTS = {
@@ -282,6 +288,7 @@ DIALECTS = {
         lower_packed_minmax=True,
         lower_packed_abs=True,
         lower_byte_perm=True,
+        lower_hadd=True,
     ),
     "musa": Dialect(
         name="musa",
@@ -298,6 +305,7 @@ DIALECTS = {
         lower_packed_minmax=True,
         lower_packed_abs=True,
         lower_byte_perm=True,
+        lower_hadd=True,
     ),
     "maca": Dialect(
         name="maca",
@@ -314,6 +322,7 @@ DIALECTS = {
         lower_packed_minmax=False,
         lower_packed_abs=False,
         lower_byte_perm=False,
+        lower_hadd=False,
     ),
 }
 
@@ -639,6 +648,42 @@ PACKED_ABS_HELPERS = {
         ("__vabsdiffs4", 4, "diffs", 2),
         ("__vabsdiffu4", 4, "diffu", 2),
     )
+}
+
+
+HADD_HELPERS = {
+    "__hadd": (
+        "cts_hadd",
+        """
+static __device__ int cts_hadd(int x, int y) {
+    return (x & y) + ((x ^ y) >> 1);
+}
+""",
+    ),
+    "__rhadd": (
+        "cts_rhadd",
+        """
+static __device__ int cts_rhadd(int x, int y) {
+    return (x | y) - ((x ^ y) >> 1);
+}
+""",
+    ),
+    "__uhadd": (
+        "cts_uhadd",
+        """
+static __device__ unsigned cts_uhadd(unsigned x, unsigned y) {
+    return (x & y) + ((x ^ y) >> 1);
+}
+""",
+    ),
+    "__urhadd": (
+        "cts_urhadd",
+        """
+static __device__ unsigned cts_urhadd(unsigned x, unsigned y) {
+    return (x | y) - ((x ^ y) >> 1);
+}
+""",
+    ),
 }
 
 

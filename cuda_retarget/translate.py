@@ -19,6 +19,7 @@ from cuda_retarget.dialect import (
     DOUBLE_WORD_HELPERS,
     DP4A_HELPER,
     FUNNEL_HELPERS,
+    HADD_HELPERS,
     MATCH_ALL_HELPER,
     PACKED_ABS_HELPERS,
     PACKED_HELPERS,
@@ -204,6 +205,12 @@ def _call_edit(
         if parsed is None or len(parsed[0]) != 3:
             raise TranslateError("__byte_perm must have three arguments")
         return (token.start, token.end, "cts_byte_perm")
+    if dialect.lower_hadd and token.spelling in HADD_HELPERS:
+        parsed = _arguments(tokens, index + 1)
+        if parsed is None or len(parsed[0]) != 2:
+            raise TranslateError(f"{token.spelling} must have two arguments")
+        replacement, _helper = HADD_HELPERS[token.spelling]
+        return (token.start, token.end, replacement)
     return None
 
 
@@ -300,6 +307,10 @@ def _helpers(dialect: Dialect, rewritten: str) -> str:
                 blocks.append(helper.strip("\n"))
     if dialect.lower_byte_perm and "cts_byte_perm(" in rewritten:
         blocks.append(BYTE_PERM_HELPER.strip("\n"))
+    if dialect.lower_hadd:
+        for name, helper in HADD_HELPERS.values():
+            if f"{name}(" in rewritten:
+                blocks.append(helper.strip("\n"))
     return "\n\n".join(blocks)
 
 
