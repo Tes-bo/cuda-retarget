@@ -290,6 +290,16 @@ class Dialect:
     each input are ignored. Bit 23 is the sign of the signed form. The
     low 32 bits of the product are kept, so the square of the minimum
     24-bit value is 0.
+    `lower_round` replaces the rounding conversions between float and
+    32-bit or 64-bit integers, and the toward-zero double conversions.
+    `__float2int_rn(2.5)` is 2 and `__float2int_ru(2.5)` is 3. A value
+    past the integer range saturates. A NaN becomes 0 for `__float2int_*`
+    and the high bit for `__float2ll_*`, `__float2ull_*`, and
+    `__double2int_rz`. Every 32-bit integer is exact in double, so the
+    int-to-float helpers round that double. A long long past 2^53 is not
+    exact in double, so those helpers round from the integer bits.
+    `lower_saturate` replaces `__saturatef`. Values outside [0, 1] clamp,
+    and a NaN or a negative zero becomes +0.
     """
 
     name: str
@@ -315,6 +325,8 @@ class Dialect:
     lower_packed_avg: bool
     lower_bitops: bool
     lower_mul24: bool
+    lower_round: bool
+    lower_saturate: bool
 
 
 DIALECTS = {
@@ -342,6 +354,8 @@ DIALECTS = {
         lower_packed_avg=True,
         lower_bitops=True,
         lower_mul24=True,
+        lower_round=True,
+        lower_saturate=True,
     ),
     "musa": Dialect(
         name="musa",
@@ -367,6 +381,8 @@ DIALECTS = {
         lower_packed_avg=True,
         lower_bitops=True,
         lower_mul24=True,
+        lower_round=True,
+        lower_saturate=True,
     ),
     "maca": Dialect(
         name="maca",
@@ -392,6 +408,8 @@ DIALECTS = {
         lower_packed_avg=False,
         lower_bitops=False,
         lower_mul24=False,
+        lower_round=False,
+        lower_saturate=False,
     ),
 }
 
@@ -1173,6 +1191,272 @@ static __device__ unsigned cts_byte_perm(unsigned x, unsigned y, unsigned select
     return out;
 }
 """
+
+
+# Measured on sm_70. __float2int_* turns NaN into 0 and saturates past the
+# signed range. __float2ll_* and __float2ull_* turn NaN into the high bit.
+# __double2int_rz turns NaN into 0x80000000. Every 32-bit integer is exact
+# in double, so int-to-float rounds that double down to float. A long long
+# past 2^53 is not exact in double, so the 64-bit path rounds the bits.
+_ROUND_CALL = {"rn": "rintf", "rz": "truncf", "ru": "ceilf", "rd": "floorf"}
+
+
+def _float_to_int(mode: str, unsigned: bool) -> str:
+    call = _ROUND_CALL[mode]
+    if not unsigned:
+        name = f"cts_float2int_{mode}"
+        return f"""
+static __device__ int {name}(float x) {{
+    float y = {call}(x);
+    if (!(y == y)) return 0;
+    if (y >= 2147483648.0f) return 2147483647;
+    if (y < -2147483648.0f) return (int)0x80000000;
+    return (int)y;
+}}
+"""
+    name = f"cts_float2uint_{mode}"
+    return f"""
+static __device__ unsigned {name}(float x) {{
+    float y = {call}(x);
+    if (!(y == y) || y <= 0.0f) return 0u;
+    if (y >= 4294967296.0f) return 0xffffffffu;
+    return (unsigned)y;
+}}
+"""
+
+
+def _float_to_ll(mode: str, unsigned: bool) -> str:
+    call = _ROUND_CALL[mode]
+    if not unsigned:
+        name = f"cts_float2ll_{mode}"
+        return f"""
+static __device__ long long {name}(float x) {{
+    float y = {call}(x);
+    if (!(y == y)) return (long long)0x8000000000000000ULL;
+    if (y >= 0x1p63f) return 9223372036854775807LL;
+    if (y <= -0x1p63f) return (long long)0x8000000000000000ULL;
+    return (long long)y;
+}}
+"""
+    name = f"cts_float2ull_{mode}"
+    return f"""
+static __device__ unsigned long long {name}(float x) {{
+    float y = {call}(x);
+    if (!(y == y)) return 0x8000000000000000ull;
+    if (y <= 0.0f) return 0ull;
+    if (y >= 0x1p64f) return 0xffffffffffffffffull;
+    return (unsigned long long)y;
+}}
+"""
+
+
+def _to_float(prefix: str, ctype: str, callee: str, mode: str, code: int) -> str:
+    name = f"cts_{prefix}_{mode}"
+    return f"""
+static __device__ float {name}({ctype} x) {{
+    return {callee}(x, {code});
+}}
+"""
+
+
+ROUND_BITS = """
+static __device__ unsigned cts_round_fbits(float value) {
+    union {
+        float as_float;
+        unsigned as_bits;
+    } converted;
+    converted.as_float = value;
+    return converted.as_bits;
+}
+
+static __device__ float cts_round_ffrom(unsigned bits) {
+    union {
+        unsigned as_bits;
+        float as_float;
+    } converted;
+    converted.as_bits = bits;
+    return converted.as_float;
+}
+
+static __device__ float cts_round_adj(float value, int plus) {
+    unsigned bits = cts_round_fbits(value);
+    return cts_round_ffrom(plus ? bits + 1u : bits - 1u);
+}
+"""
+
+
+ROUND_I32 = """
+static __device__ float cts_round_i32(int x, int mode) {
+    double exact = (double)x;
+    float f = (float)exact;
+    if ((double)f == exact || mode == 0) return f;
+    int above = (double)f > exact;
+    if (x >= 0) {
+        if (mode == 2) return above ? f : cts_round_adj(f, 1);
+        return above ? cts_round_adj(f, 0) : f;
+    }
+    if (mode == 3) return above ? cts_round_adj(f, 1) : f;
+    return above ? f : cts_round_adj(f, 0);
+}
+
+static __device__ float cts_round_u32(unsigned x, int mode) {
+    double exact = (double)x;
+    float f = (float)exact;
+    if ((double)f == exact || mode == 0) return f;
+    int above = (double)f > exact;
+    if (mode == 2) return above ? f : cts_round_adj(f, 1);
+    return above ? cts_round_adj(f, 0) : f;
+}
+"""
+
+
+ROUND_I64 = """
+static __device__ float cts_round_u64(unsigned long long x, int mode) {
+    if (x == 0ull) return 0.0f;
+    int clz = 0;
+    unsigned long long t = x;
+    while ((t >> 63) == 0ull) {
+        t <<= 1;
+        ++clz;
+    }
+    int exp = 63 - clz;
+    if (exp <= 23) return (float)x;
+    int shift = exp - 23;
+    unsigned long long dropped = x & ((1ull << shift) - 1ull);
+    unsigned long long mant = x >> shift;
+    unsigned long long half = 1ull << (shift - 1);
+    int up = 0;
+    if (mode == 0) {
+        if (dropped > half || (dropped == half && (mant & 1ull))) up = 1;
+    } else if (mode == 2) {
+        if (dropped) up = 1;
+    }
+    if (up) {
+        mant += 1ull;
+        if (mant == (1ull << 24)) {
+            mant >>= 1;
+            ++exp;
+        }
+    }
+    unsigned bits = ((unsigned)(exp + 127) << 23) | (unsigned)(mant & 0x7fffffull);
+    return cts_round_ffrom(bits);
+}
+
+static __device__ float cts_round_s64(long long x, int mode) {
+    if (x >= 0) return cts_round_u64((unsigned long long)x, mode);
+    unsigned long long mag = (unsigned long long)(-(x + 1)) + 1ull;
+    int mag_mode = mode;
+    if (mode == 2) mag_mode = 1;
+    else if (mode == 3) mag_mode = 2;
+    return -cts_round_u64(mag, mag_mode);
+}
+"""
+
+
+_DOUBLE_RZ = {
+    "__double2int_rz": (
+        "cts_double2int_rz",
+        """
+static __device__ int cts_double2int_rz(double x) {
+    if (!(x == x)) return (int)0x80000000;
+    if (x >= 2147483648.0) return 2147483647;
+    if (x < -2147483648.0) return (int)0x80000000;
+    return (int)x;
+}
+""",
+    ),
+    "__double2uint_rz": (
+        "cts_double2uint_rz",
+        """
+static __device__ unsigned cts_double2uint_rz(double x) {
+    if (!(x == x)) return 0x80000000u;
+    if (x <= 0.0) return 0u;
+    if (x >= 4294967296.0) return 0xffffffffu;
+    return (unsigned)x;
+}
+""",
+    ),
+    "__double2ll_rz": (
+        "cts_double2ll_rz",
+        """
+static __device__ long long cts_double2ll_rz(double x) {
+    if (!(x == x)) return (long long)0x8000000000000000ULL;
+    if (x >= 0x1p63) return 9223372036854775807LL;
+    if (x <= -0x1p63) return (long long)0x8000000000000000ULL;
+    return (long long)x;
+}
+""",
+    ),
+    "__double2ull_rz": (
+        "cts_double2ull_rz",
+        """
+static __device__ unsigned long long cts_double2ull_rz(double x) {
+    if (!(x == x)) return 0x8000000000000000ull;
+    if (x <= 0.0) return 0ull;
+    if (x >= 0x1p64) return 0xffffffffffffffffull;
+    return (unsigned long long)x;
+}
+""",
+    ),
+}
+
+_MODE_CODE = {"rn": 0, "rz": 1, "ru": 2, "rd": 3}
+
+ROUND_HELPERS: dict[str, tuple[str, str]] = {}
+for _mode in ("rn", "rz", "ru", "rd"):
+    ROUND_HELPERS[f"__float2int_{_mode}"] = (f"cts_float2int_{_mode}", _float_to_int(_mode, False))
+    ROUND_HELPERS[f"__float2uint_{_mode}"] = (f"cts_float2uint_{_mode}", _float_to_int(_mode, True))
+    ROUND_HELPERS[f"__int2float_{_mode}"] = (
+        f"cts_int2float_{_mode}",
+        _to_float("int2float", "int", "cts_round_i32", _mode, _MODE_CODE[_mode]),
+    )
+    ROUND_HELPERS[f"__uint2float_{_mode}"] = (
+        f"cts_uint2float_{_mode}",
+        _to_float("uint2float", "unsigned", "cts_round_u32", _mode, _MODE_CODE[_mode]),
+    )
+    ROUND_HELPERS[f"__float2ll_{_mode}"] = (f"cts_float2ll_{_mode}", _float_to_ll(_mode, False))
+    ROUND_HELPERS[f"__float2ull_{_mode}"] = (f"cts_float2ull_{_mode}", _float_to_ll(_mode, True))
+    ROUND_HELPERS[f"__ll2float_{_mode}"] = (
+        f"cts_ll2float_{_mode}",
+        _to_float("ll2float", "long long", "cts_round_s64", _mode, _MODE_CODE[_mode]),
+    )
+    ROUND_HELPERS[f"__ull2float_{_mode}"] = (
+        f"cts_ull2float_{_mode}",
+        _to_float("ull2float", "unsigned long long", "cts_round_u64", _mode, _MODE_CODE[_mode]),
+    )
+ROUND_HELPERS.update(_DOUBLE_RZ)
+
+
+def round_needs_bits(names: set[str]) -> bool:
+    return any(
+        name.startswith("cts_int2float_")
+        or name.startswith("cts_uint2float_")
+        or name.startswith("cts_ll2float_")
+        or name.startswith("cts_ull2float_")
+        for name in names
+    )
+
+
+def round_needs_i32(names: set[str]) -> bool:
+    return any(name.startswith("cts_int2float_") or name.startswith("cts_uint2float_") for name in names)
+
+
+def round_needs_i64(names: set[str]) -> bool:
+    return any(name.startswith("cts_ll2float_") or name.startswith("cts_ull2float_") for name in names)
+
+
+SATURATE_HELPERS = {
+    "__saturatef": (
+        "cts_saturatef",
+        """
+static __device__ float cts_saturatef(float x) {
+    if (!(x == x) || x <= 0.0f) return 0.0f;
+    if (x >= 1.0f) return 1.0f;
+    return x;
+}
+""",
+    ),
+}
 
 
 def runtime_name(spelling: str, dialect: Dialect) -> str | None:

@@ -34,7 +34,15 @@ from cuda_retarget.dialect import (
     MUL24_HELPERS,
     MATCH_ANY_HELPER,
     VOTE_HELPERS,
+    ROUND_BITS,
+    ROUND_HELPERS,
+    ROUND_I32,
+    ROUND_I64,
+    SATURATE_HELPERS,
     Dialect,
+    round_needs_bits,
+    round_needs_i32,
+    round_needs_i64,
     runtime_name,
 )
 from cuda_retarget.parse import ParseError, Tok, parse_file
@@ -267,6 +275,18 @@ def _call_edit(
             raise TranslateError(f"{token.spelling} must have two arguments")
         replacement, _helper = MUL24_HELPERS[token.spelling]
         return (token.start, token.end, replacement)
+    if dialect.lower_round and token.spelling in ROUND_HELPERS:
+        parsed = _arguments(tokens, index + 1)
+        if parsed is None or len(parsed[0]) != 1:
+            raise TranslateError(f"{token.spelling} must have one argument")
+        replacement, _helper = ROUND_HELPERS[token.spelling]
+        return (token.start, token.end, replacement)
+    if dialect.lower_saturate and token.spelling in SATURATE_HELPERS:
+        parsed = _arguments(tokens, index + 1)
+        if parsed is None or len(parsed[0]) != 1:
+            raise TranslateError(f"{token.spelling} must have one argument")
+        replacement, _helper = SATURATE_HELPERS[token.spelling]
+        return (token.start, token.end, replacement)
     return None
 
 
@@ -400,6 +420,21 @@ def _helpers(dialect: Dialect, rewritten: str) -> str:
                 blocks.append(helper.strip("\n"))
     if dialect.lower_mul24:
         for name, helper in MUL24_HELPERS.values():
+            if f"{name}(" in rewritten:
+                blocks.append(helper.strip("\n"))
+    if dialect.lower_round:
+        used = [(name, helper) for name, helper in ROUND_HELPERS.values() if f"{name}(" in rewritten]
+        names = {name for name, _helper in used}
+        if round_needs_bits(names):
+            blocks.append(ROUND_BITS.strip("\n"))
+        if round_needs_i32(names):
+            blocks.append(ROUND_I32.strip("\n"))
+        if round_needs_i64(names):
+            blocks.append(ROUND_I64.strip("\n"))
+        for _name, helper in used:
+            blocks.append(helper.strip("\n"))
+    if dialect.lower_saturate:
+        for name, helper in SATURATE_HELPERS.values():
             if f"{name}(" in rewritten:
                 blocks.append(helper.strip("\n"))
     return "\n\n".join(blocks)

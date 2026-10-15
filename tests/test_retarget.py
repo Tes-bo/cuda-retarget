@@ -30,6 +30,11 @@ from cuda_retarget.dialect import (
     PACKED_MINMAX_HELPERS,
     BIT_HELPERS,
     MUL24_HELPERS,
+    ROUND_BITS,
+    ROUND_HELPERS,
+    ROUND_I32,
+    ROUND_I64,
+    SATURATE_HELPERS,
     PACKED_AVG_HELPERS,
     PACKED_CMP_HELPERS,
     PACKED_SAD_HELPERS,
@@ -587,6 +592,55 @@ __global__ void product(int* s, unsigned* u) {
             self.assertIn("0xffffffu", translated)
         self.assertEqual(translate_source(source, "maca"), source)
 
+    def test_hip_and_musa_lower_rounding(self) -> None:
+        source = """\
+#include <cuda_runtime.h>
+__global__ void convert(int* s, float* f, long long* z) {
+    const char* label = "__float2int_rn";
+    *s = __float2int_rn(2.5f);
+    *f = __int2float_ru(16777217);
+    *z = __float2ll_rn(*f);
+    *f = __ll2float_rd(*z);
+    *s = __double2int_rz(1.9);
+    *s += label[0];
+}
+"""
+        for target in ("hip", "musa"):
+            translated = translate_source(source, target)
+            self.assertIn('"__float2int_rn"', translated)
+            self.assertIn("cts_float2int_rn(2.5f)", translated)
+            self.assertIn("cts_int2float_ru(16777217)", translated)
+            self.assertIn("cts_float2ll_rn(*f)", translated)
+            self.assertIn("cts_ll2float_rd(*z)", translated)
+            self.assertIn("cts_double2int_rz(1.9)", translated)
+            self.assertIn("cts_round_i32", translated)
+            self.assertIn("cts_round_u64", translated)
+            self.assertIn("0x80000000", translated)
+            self.assertNotIn("__float2int_rn(", translated)
+            self.assertNotIn("__int2float_ru(", translated)
+            self.assertNotIn("__float2ll_rn(", translated)
+            self.assertNotIn("__ll2float_rd(", translated)
+            self.assertNotIn("__double2int_rz(", translated)
+        self.assertEqual(translate_source(source, "maca"), source)
+
+    def test_hip_and_musa_lower_saturatef(self) -> None:
+        source = """\
+#include <cuda_runtime.h>
+__global__ void clamp(float* f) {
+    const char* label = "__saturatef";
+    *f = __saturatef(__saturatef(-1.0f));
+    *f += label[0];
+}
+"""
+        for target in ("hip", "musa"):
+            translated = translate_source(source, target)
+            self.assertIn('"__saturatef"', translated)
+            self.assertIn("cts_saturatef(cts_saturatef(-1.0f))", translated)
+            self.assertIn("x <= 0.0f", translated)
+            self.assertNotIn("__saturatef(", translated)
+            self.assertEqual(translated.count("cts_saturatef("), 3)
+        self.assertEqual(translate_source(source, "maca"), source)
+
     def test_unparsed_source_is_refused(self) -> None:
         with self.assertRaises(TranslateError):
             translate_source("int main( {\n", "hip", filename="broken.cu")
@@ -906,6 +960,67 @@ class CorpusTests(unittest.TestCase):
             self.assertEqual(translated.count("cts_mul24("), 5)
         self.assertIn("__mul24", maca)
         self.assertNotIn("cts_mul24", maca)
+
+    def test_hip_and_musa_lower_the_census_round_cvt(self) -> None:
+        path = CENSUS / "round_cvt" / "main.cu"
+        if not path.is_file():
+            self.skipTest("round_cvt is not in the census corpus")
+        hip = translate_path(path, "hip")
+        musa = translate_path(path, "musa")
+        maca = translate_path(path, "maca")
+        for translated in (hip, musa):
+            self.assertIn("cts_float2int_rn(2.5f)", translated)
+            self.assertIn("cts_float2int_ru(2.5f)", translated)
+            self.assertIn("cts_float2int_rd(-2.5f)", translated)
+            self.assertIn("cts_int2float_ru(16777217)", translated)
+            self.assertIn("cts_int2float_rd(-16777219)", translated)
+            self.assertIn("cts_uint2float_rd(0xffffffffu)", translated)
+            self.assertNotIn("__float2int_rn(", translated)
+            self.assertNotIn("__int2float_ru(", translated)
+            self.assertEqual(translated.count("cts_float2int_rn("), 5)
+            self.assertEqual(translated.count("cts_int2float_rd("), 3)
+        self.assertIn("__float2int_rn", maca)
+        self.assertNotIn("cts_float2int_rn", maca)
+
+    def test_hip_and_musa_lower_the_census_round_wide(self) -> None:
+        path = CENSUS / "round_wide" / "main.cu"
+        if not path.is_file():
+            self.skipTest("round_wide is not in the census corpus")
+        hip = translate_path(path, "hip")
+        musa = translate_path(path, "musa")
+        maca = translate_path(path, "maca")
+        for translated in (hip, musa):
+            self.assertIn("cts_float2ll_rn(nan.as_float)", translated)
+            self.assertIn("cts_float2ll_rn(1.0e20f)", translated)
+            self.assertIn("cts_ll2float_rn((1LL << 53) + 1)", translated)
+            self.assertIn("cts_ll2float_ru((1LL << 53) + 1)", translated)
+            self.assertIn("cts_ull2float_rd(0xffffffffffffffffull)", translated)
+            self.assertIn("cts_double2int_rz(dnan.as_double)", translated)
+            self.assertIn("cts_double2ull_rz(1.0e20)", translated)
+            self.assertIn("cts_round_u64", translated)
+            self.assertNotIn("__float2ll_rn(", translated)
+            self.assertNotIn("__double2int_rz(", translated)
+            self.assertEqual(translated.count("cts_float2ll_rn("), 3)
+        self.assertIn("__float2ll_rn", maca)
+        self.assertNotIn("cts_float2ll_rn", maca)
+
+    def test_hip_and_musa_lower_the_census_saturatef(self) -> None:
+        path = CENSUS / "saturatef" / "main.cu"
+        if not path.is_file():
+            self.skipTest("saturatef is not in the census corpus")
+        hip = translate_path(path, "hip")
+        musa = translate_path(path, "musa")
+        maca = translate_path(path, "maca")
+        for translated in (hip, musa):
+            self.assertIn("cts_saturatef(-1.0f)", translated)
+            self.assertIn("cts_saturatef(2.0f)", translated)
+            self.assertIn("cts_saturatef(0.5f)", translated)
+            self.assertIn("cts_saturatef(-0.0f)", translated)
+            self.assertIn("cts_saturatef(nan.as_float)", translated)
+            self.assertNotIn("__saturatef(", translated)
+            self.assertEqual(translated.count("cts_saturatef("), 6)
+        self.assertIn("__saturatef", maca)
+        self.assertNotIn("cts_saturatef", maca)
 
     def test_only_hip_pins_warp_size(self) -> None:
         path = CENSUS / "warp_size" / "main.cu"
@@ -2156,6 +2271,136 @@ __global__ void compare(int* bad) {{
     if (__umul24(0x00FFFFFFu, 0x00FFFFFFu) != cts_umul24(0x00FFFFFFu, 0x00FFFFFFu)) atomicExch(bad, 1);
     if (__umul24(0xFF800000u, 2u) != cts_umul24(0xFF800000u, 2u)) atomicExch(bad, 1);
     if (__umul24(0x01000000u, 3u) != cts_umul24(0x01000000u, 3u)) atomicExch(bad, 1);
+}}
+int main() {{
+    int* bad = nullptr;
+    if (cudaMalloc(&bad, sizeof(*bad)) != cudaSuccess) return 2;
+    if (cudaMemset(bad, 0, sizeof(*bad)) != cudaSuccess) return 2;
+    compare<<<1, 1>>>(bad);
+    if (cudaDeviceSynchronize() != cudaSuccess) return 3;
+    int mismatch = 0;
+    if (cudaMemcpy(&mismatch, bad, sizeof(mismatch), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
+    std::printf("mismatch=%d\\n", mismatch);
+    cudaFree(bad);
+    return 0;
+}}
+""",
+        )
+
+    def test_rounding_helpers_agree_with_the_intrinsics(self) -> None:
+        helpers = "\n".join(
+            [
+                ROUND_BITS.strip("\n"),
+                ROUND_I32.strip("\n"),
+                ROUND_I64.strip("\n"),
+                *(helper.strip("\n") for _name, helper in ROUND_HELPERS.values()),
+            ]
+        )
+        self._nvcc_mismatch(
+            "round",
+            f"""\
+#include <cstdio>
+#include <cuda_runtime.h>
+{helpers}
+__global__ void compare(int* bad) {{
+    union {{ float f; unsigned u; }} nanf;
+    nanf.u = 0x7fc00000u;
+    union {{ double d; unsigned long long u; }} nand;
+    nand.u = 0x7ff8000000000000ull;
+    float two63 = __uint_as_float(0x5f000000u);
+    if (__float2int_rn(2.5f) != cts_float2int_rn(2.5f)) atomicExch(bad, 1);
+    if (__float2int_ru(2.5f) != cts_float2int_ru(2.5f)) atomicExch(bad, 1);
+    if (__float2int_rd(-2.5f) != cts_float2int_rd(-2.5f)) atomicExch(bad, 1);
+    if (__float2int_rn(1.0e20f) != cts_float2int_rn(1.0e20f)) atomicExch(bad, 1);
+    if (__float2int_rn(-1.0e20f) != cts_float2int_rn(-1.0e20f)) atomicExch(bad, 1);
+    if (__float2int_rn(nanf.f) != cts_float2int_rn(nanf.f)) atomicExch(bad, 1);
+    if (__float2int_rn(0.5f) != cts_float2int_rn(0.5f)) atomicExch(bad, 1);
+    if (__float2int_rn(-0.5f) != cts_float2int_rn(-0.5f)) atomicExch(bad, 1);
+    if (__float2uint_rn(-1.2f) != cts_float2uint_rn(-1.2f)) atomicExch(bad, 1);
+    if (__float2uint_rz(1.0e20f) != cts_float2uint_rz(1.0e20f)) atomicExch(bad, 1);
+    if (__float2uint_ru(0.2f) != cts_float2uint_ru(0.2f)) atomicExch(bad, 1);
+    if (__float2uint_rn(nanf.f) != cts_float2uint_rn(nanf.f)) atomicExch(bad, 1);
+    if (__float_as_int(__int2float_rn(16777217)) != __float_as_int(cts_int2float_rn(16777217)))
+        atomicExch(bad, 1);
+    if (__float_as_int(__int2float_ru(16777217)) != __float_as_int(cts_int2float_ru(16777217)))
+        atomicExch(bad, 1);
+    if (__float_as_int(__int2float_rz(16777219)) != __float_as_int(cts_int2float_rz(16777219)))
+        atomicExch(bad, 1);
+    if (__float_as_int(__int2float_rd(-16777219)) != __float_as_int(cts_int2float_rd(-16777219)))
+        atomicExch(bad, 1);
+    if (__float_as_int(__int2float_ru(-16777219)) != __float_as_int(cts_int2float_ru(-16777219)))
+        atomicExch(bad, 1);
+    if (__float_as_int(__int2float_rn(2147483647)) != __float_as_int(cts_int2float_rn(2147483647)))
+        atomicExch(bad, 1);
+    if (__float_as_int(__int2float_rd(2147483647)) != __float_as_int(cts_int2float_rd(2147483647)))
+        atomicExch(bad, 1);
+    if (__float_as_uint(__uint2float_rn(0xffffffffu)) != __float_as_uint(cts_uint2float_rn(0xffffffffu)))
+        atomicExch(bad, 1);
+    if (__float_as_uint(__uint2float_rd(0xffffffffu)) != __float_as_uint(cts_uint2float_rd(0xffffffffu)))
+        atomicExch(bad, 1);
+    if (__float2ll_rn(2.5f) != cts_float2ll_rn(2.5f)) atomicExch(bad, 1);
+    if (__float2ll_rn(1.0e20f) != cts_float2ll_rn(1.0e20f)) atomicExch(bad, 1);
+    if (__float2ll_rn(nanf.f) != cts_float2ll_rn(nanf.f)) atomicExch(bad, 1);
+    if (__float2ll_rn(two63) != cts_float2ll_rn(two63)) atomicExch(bad, 1);
+    if (__float2ll_rd(-two63) != cts_float2ll_rd(-two63)) atomicExch(bad, 1);
+    if (__float2ull_rn(nanf.f) != cts_float2ull_rn(nanf.f)) atomicExch(bad, 1);
+    if (__float2ull_rn(-1.0f) != cts_float2ull_rn(-1.0f)) atomicExch(bad, 1);
+    if (__float2ull_rn(1.0e20f) != cts_float2ull_rn(1.0e20f)) atomicExch(bad, 1);
+    long long wide = (1LL << 53) + 1;
+    long long tie = (1LL << 53) + (1LL << 29);
+    long long lo = (long long)0x8000000000000000ULL;
+    if (__float_as_int(__ll2float_rn(wide)) != __float_as_int(cts_ll2float_rn(wide))) atomicExch(bad, 1);
+    if (__float_as_int(__ll2float_ru(wide)) != __float_as_int(cts_ll2float_ru(wide))) atomicExch(bad, 1);
+    if (__float_as_int(__ll2float_rd(-tie)) != __float_as_int(cts_ll2float_rd(-tie))) atomicExch(bad, 1);
+    if (__float_as_int(__ll2float_rn(lo)) != __float_as_int(cts_ll2float_rn(lo))) atomicExch(bad, 1);
+    if (__float_as_int(__ll2float_rn(9223372036854775807LL)) != __float_as_int(cts_ll2float_rn(9223372036854775807LL)))
+        atomicExch(bad, 1);
+    if (__float_as_uint(__ull2float_rn(0xffffffffffffffffull)) != __float_as_uint(cts_ull2float_rn(0xffffffffffffffffull)))
+        atomicExch(bad, 1);
+    if (__float_as_uint(__ull2float_rd(0xffffffffffffffffull)) != __float_as_uint(cts_ull2float_rd(0xffffffffffffffffull)))
+        atomicExch(bad, 1);
+    if (__double2int_rz(nand.d) != cts_double2int_rz(nand.d)) atomicExch(bad, 1);
+    if (__double2int_rz(1.9) != cts_double2int_rz(1.9)) atomicExch(bad, 1);
+    if (__double2int_rz(1.0e20) != cts_double2int_rz(1.0e20)) atomicExch(bad, 1);
+    if (__double2uint_rz(nand.d) != cts_double2uint_rz(nand.d)) atomicExch(bad, 1);
+    if (__double2uint_rz(-1.2) != cts_double2uint_rz(-1.2)) atomicExch(bad, 1);
+    if (__double2ll_rz(nand.d) != cts_double2ll_rz(nand.d)) atomicExch(bad, 1);
+    if (__double2ll_rz(1.0e20) != cts_double2ll_rz(1.0e20)) atomicExch(bad, 1);
+    if (__double2ull_rz(nand.d) != cts_double2ull_rz(nand.d)) atomicExch(bad, 1);
+    if (__double2ull_rz(1.0e20) != cts_double2ull_rz(1.0e20)) atomicExch(bad, 1);
+}}
+int main() {{
+    int* bad = nullptr;
+    if (cudaMalloc(&bad, sizeof(*bad)) != cudaSuccess) return 2;
+    if (cudaMemset(bad, 0, sizeof(*bad)) != cudaSuccess) return 2;
+    compare<<<1, 1>>>(bad);
+    if (cudaDeviceSynchronize() != cudaSuccess) return 3;
+    int mismatch = 0;
+    if (cudaMemcpy(&mismatch, bad, sizeof(mismatch), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
+    std::printf("mismatch=%d\\n", mismatch);
+    cudaFree(bad);
+    return 0;
+}}
+""",
+        )
+
+    def test_saturate_helper_agrees_with_the_intrinsic(self) -> None:
+        helper = SATURATE_HELPERS["__saturatef"][1].strip("\n")
+        self._nvcc_mismatch(
+            "sat",
+            f"""\
+#include <cstdio>
+#include <cuda_runtime.h>
+{helper}
+__global__ void compare(int* bad) {{
+    union {{ float f; unsigned u; }} nanf;
+    nanf.u = 0x7fc00000u;
+    if (__float_as_uint(__saturatef(-1.0f)) != __float_as_uint(cts_saturatef(-1.0f))) atomicExch(bad, 1);
+    if (__float_as_uint(__saturatef(2.0f)) != __float_as_uint(cts_saturatef(2.0f))) atomicExch(bad, 1);
+    if (__float_as_uint(__saturatef(0.5f)) != __float_as_uint(cts_saturatef(0.5f))) atomicExch(bad, 1);
+    if (__float_as_uint(__saturatef(-0.0f)) != __float_as_uint(cts_saturatef(-0.0f))) atomicExch(bad, 1);
+    if (__float_as_uint(__saturatef(nanf.f)) != __float_as_uint(cts_saturatef(nanf.f))) atomicExch(bad, 1);
+    if (__float_as_uint(__saturatef(0.0f)) != __float_as_uint(cts_saturatef(0.0f))) atomicExch(bad, 1);
 }}
 int main() {{
     int* bad = nullptr;
