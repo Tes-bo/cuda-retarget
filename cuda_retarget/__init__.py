@@ -1,5 +1,5 @@
 # Copyright 2026 Tesbo
 # SPDX-License-Identifier: Apache-2.0
-"""Dispatch CUDA source to the official vendor tools."""
+"""Translate CUDA source. The rewrite rules belong to this project."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

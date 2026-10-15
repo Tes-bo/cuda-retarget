@@ -1,57 +1,53 @@
 # cuda-retarget
 
-One command to run CUDA on AMD, Hygon, Moore Threads, and MetaX. Calls HIPIFY, musify, and cu-bridge, and only fills API gaps those tools miss.
+Translate CUDA source to HIP, to MUSA, and to the CUDA spelling MetaX compiles. This is a rewriter for people searching for a way to turn CUDA into HIP, run CUDA on AMD, or retarget a kernel toward Moore Threads (musify's source language) without switching tools per vendor.
 
-`cuda-retarget` does not reimplement those tools and does not ship their source. It invokes whatever official binary is on `PATH`, then applies a source replacement only when `gaps/registry.json` admits that replacement. An admitted gap must name a [cuda-census](https://github.com/Tes-bo/cuda-census) case and a failure status from that case (`compile-fail`, `run-fail`, `numeric-mismatch`, or `unparsed-stdout`). The shipped registry admits nothing.
+Clang tokenises the file. The rewrite rules in this repository decide what changes. `cuda-retarget` does not invoke HIPIFY, musify, or cu-bridge, and it does not ship their source. It also does not compile. AMD's runtime, Moore Threads' runtime, MetaX's runtime, and each vendor's instruction set stay theirs. A renamed `cudaMalloc` is not a binary.
 
-This project is not affiliated with NVIDIA, AMD, Hygon, Moore Threads, or MetaX. It does not score itself inside cuda-census. cuda-census runs the official tools directly and refuses a binary named `cuda-retarget`.
+The semantic edits are the part a prefix swap drops. On HIP, a 3-argument `__shfl_sync` whose mask is the full 32-bit literal keeps CUDA's subgroup width of 32, because an omitted width follows the device wavefront and AMD's is 64. On MUSA that call stays 3 arguments, because the documented warp is 32 lanes. `__double_as_longlong` becomes a device union helper on HIP and MUSA so the IEEE bits of the value do not depend on a CUDA intrinsic. MetaX keeps every CUDA spelling: that compiler accepts CUDA, and an identity translation is the honest output.
+
+This project is not affiliated with NVIDIA, AMD, Hygon, Moore Threads, or MetaX. It does not score itself inside [cuda-census](https://github.com/Tes-bo/cuda-census). cuda-census runs official toolchains only.
 
 ## Targets
 
-| `--target` | Official tool | What `run` does |
-| --- | --- | --- |
-| `hip` | HIPIFY, then `hipcc` | `hipify-perl` writes a translation, admitted gaps may edit it, `hipcc` compiles it. Use the Hygon DTK `hipcc` when that is the `hipcc` on `PATH`. |
-| `musa` | musify, then `mcc` | The source is copied, `musify-text --inplace` rewrites the copy, admitted gaps may edit it, `mcc` compiles it. |
-| `maca` | cu-bridge | cu-bridge does not emit another dialect. Admitted gaps may edit a copy of the original CUDA file, then `cucc` compiles that copy. With an empty gap list the copy is the original source. |
+| `--target` | Names | Header | 32-lane `__shfl_sync` | `__double_as_longlong` |
+| --- | --- | --- | --- | --- |
+| `hip` | `cudaMalloc` becomes `hipMalloc`, and the same prefix rule for every `cuda` identifier whose next character is uppercase | `hip/hip_runtime.h` | a full-mask 3-argument call gains `, 32` | `cts_double_bits` |
+| `musa` | the same rule with the `musa` prefix | `musa_runtime.h` | unchanged | `cts_double_bits` |
+| `maca` | unchanged | `cuda_runtime.h` | unchanged | unchanged |
 
-Command lines live in `targets.json`.
+`cudaFoo`, a user function with that prefix, is renamed on HIP and MUSA. `__shfl_sync`, `threadIdx`, and `atomicAdd` are not runtime identifiers and stay. A CUDA name inside a comment or a string literal stays. A name inside a `#define` in this file is rewritten at the definition.
+
+## What stays source
+
+These are not rewritten, and a later vendor compile may reject them or change their meaning:
+
+- Inline PTX.
+- A `__shfl_sync` whose width is already written. That width is kept, including `warpSize`.
+- A 3-argument `__shfl_sync` whose mask is not the literal `0xffffffff` (any of `u`, `l`, `ll`, `ull`). A variable mask is still CUDA's width 32 on NVIDIA and the wavefront width on AMD. This rewriter does not guess which mask the programmer meant to widen.
+- `lane & 31` and any other width arithmetic.
+- CUDA Graph instantiate signatures that drift between runtimes. The 5-argument call is renamed and its arguments stay.
+
+The helper inserted for the double-bits intrinsic is `static __device__` and is placed after the last `#include`.
 
 ## Run
 
 ```bash
 python3 -m cuda_retarget self-check
-python3 -m cuda_retarget gaps
-python3 -m cuda_retarget run --target hip --input kernel.cu --output-dir out --dry-run
-python3 -m cuda_retarget run --target hip --input kernel.cu --output-dir out
-python3 -m cuda_retarget run --target musa --input kernel.cu --output-dir out
-python3 -m cuda_retarget run --target maca --input kernel.cu --output-dir out
+python3 -m cuda_retarget translate --target hip --input kernel.cu --output kernel.hip.cpp
+python3 -m cuda_retarget translate --target musa --input kernel.cu --output kernel.mu
+python3 -m cuda_retarget translate --target maca --input kernel.cu
 ```
 
-`--dry-run` prints the steps and does not execute them. A missing official tool, a refused gap, or a non-zero tool exit status exits 2. The compiled binary is `out/case`. This command does not launch that binary.
+Without `--output`, the translation is written to stdout. A parse failure or an unknown target exits 2. Clang must be able to load `libclang` and to see `cuda_runtime.h`. `LIBCLANG_PATH` and `CUDA_INCLUDE` override the defaults.
 
-Host-side tests, with no GPU and no vendor SDK:
+Host-side tests, with no vendor SDK:
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
 
-## Admitting a gap
-
-Leave the registry empty until cuda-census has a JSON result for the official tool on that case, and the status is a failure. Then add one object:
-
-```json
-{
-  "id": "hip-example",
-  "admit": true,
-  "target": "hip",
-  "census_case": "warp_shuffle",
-  "census_status": "compile-fail",
-  "find": "the literal text in the official output",
-  "replace": "the replacement"
-}
-```
-
-`find` is replaced once, so the edit stays reviewable. If the official output does not contain `find`, the run stops. A gap with `admit` set and no `census_case` is rejected. Do not admit a gap because a vendor toolchain is missing; that is `toolchain-missing`, and it is not a license to rewrite the source.
+One test compiles the double-bits helper with `nvcc` when `nvcc` is on `PATH`. It does not compile HIP or MUSA output with `nvcc`.
 
 ## License
 
