@@ -264,6 +264,11 @@ class Dialect:
     before the subtraction, so the absolute value of `INT_MIN` is
     `2^31` and `|INT_MIN - 1|` is `2^31 + 1`. The unsigned form treats
     the same bits as a magnitude. The sum wraps modulo `2^32`.
+    `lower_packed_sad` replaces `__vsads2`, `__vsadu2`, `__vsads4`, and
+    `__vsadu4` with the sum of the per-lane absolute differences. A
+    signed `0xFFFF` lane is 1 and an unsigned one is 65535. A `0x8000`
+    lane contributes 32768, so two of them sum to 65536. The result is
+    a scalar sum, not a packed word.
     """
 
     name: str
@@ -283,6 +288,7 @@ class Dialect:
     lower_hadd: bool
     lower_mulhi: bool
     lower_sad: bool
+    lower_packed_sad: bool
 
 
 DIALECTS = {
@@ -304,6 +310,7 @@ DIALECTS = {
         lower_hadd=True,
         lower_mulhi=True,
         lower_sad=True,
+        lower_packed_sad=True,
     ),
     "musa": Dialect(
         name="musa",
@@ -323,6 +330,7 @@ DIALECTS = {
         lower_hadd=True,
         lower_mulhi=True,
         lower_sad=True,
+        lower_packed_sad=True,
     ),
     "maca": Dialect(
         name="maca",
@@ -342,6 +350,7 @@ DIALECTS = {
         lower_hadd=False,
         lower_mulhi=False,
         lower_sad=False,
+        lower_packed_sad=False,
     ),
 }
 
@@ -666,6 +675,53 @@ PACKED_ABS_HELPERS = {
         ("__vabsdiffu2", 2, "diffu", 2),
         ("__vabsdiffs4", 4, "diffs", 2),
         ("__vabsdiffu4", 4, "diffu", 2),
+    )
+}
+
+
+def _packed_sad_helper(name: str, lanes: int, signed: bool) -> str:
+    shift = 32 // lanes
+    mask = (1 << shift) - 1
+    if signed:
+        left = _signed_lane(lanes, shift, mask, "a")
+        right = _signed_lane(lanes, shift, mask, "b")
+        return f"""
+static __device__ unsigned {name}(unsigned a, unsigned b) {{
+    unsigned sum = 0;
+#pragma unroll
+    for (int i = 0; i < {lanes}; ++i) {{
+        int aa = {left};
+        int bb = {right};
+        int diff = aa - bb;
+        sum += static_cast<unsigned>(diff < 0 ? -diff : diff);
+    }}
+    return sum;
+}}
+"""
+    return f"""
+static __device__ unsigned {name}(unsigned a, unsigned b) {{
+    unsigned sum = 0;
+#pragma unroll
+    for (int i = 0; i < {lanes}; ++i) {{
+        unsigned aa = (a >> ({shift} * i)) & {mask:#x}u;
+        unsigned bb = (b >> ({shift} * i)) & {mask:#x}u;
+        sum += aa >= bb ? aa - bb : bb - aa;
+    }}
+    return sum;
+}}
+"""
+
+
+PACKED_SAD_HELPERS = {
+    intrinsic: (
+        f"cts_{intrinsic[2:]}",
+        _packed_sad_helper(f"cts_{intrinsic[2:]}", lanes, signed),
+    )
+    for intrinsic, lanes, signed in (
+        ("__vsads2", 2, True),
+        ("__vsadu2", 2, False),
+        ("__vsads4", 4, True),
+        ("__vsadu4", 4, False),
     )
 }
 
