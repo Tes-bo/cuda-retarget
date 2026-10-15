@@ -12,7 +12,7 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
-from cuda_retarget.dialect import DIALECTS, DOUBLE_BITS_HELPER, Dialect, runtime_name
+from cuda_retarget.dialect import BITCAST_HELPERS, DIALECTS, Dialect, runtime_name
 from cuda_retarget.parse import ParseError, Tok, parse_file
 
 _FULL_MASKS = {"0xffffffff", "0xffffffffu", "0xffffffffl", "0xffffffffll", "0xffffffffull"}
@@ -112,11 +112,12 @@ def _call_edit(
             # The identifier loop still rewrites runtime names inside the call.
             paren = tokens[close].start
             return (paren, paren, ", 32")
-    if token.spelling == "__double_as_longlong" and dialect.lower_double_bits:
+    if dialect.lower_bitcasts and token.spelling in BITCAST_HELPERS:
         parsed = _arguments(tokens, index + 1)
         if parsed is None or len(parsed[0]) != 1:
-            raise TranslateError("__double_as_longlong must have one argument")
-        return (token.start, token.end, "cts_double_bits")
+            raise TranslateError(f"{token.spelling} must have one argument")
+        replacement, _helper = BITCAST_HELPERS[token.spelling]
+        return (token.start, token.end, replacement)
     return None
 
 
@@ -172,9 +173,12 @@ def _apply(text: str, edits: list[tuple[int, int, str]]) -> bytes:
 
 
 def _helpers(dialect: Dialect, rewritten: str) -> str:
+    if not dialect.lower_bitcasts:
+        return ""
     blocks = []
-    if dialect.lower_double_bits and "cts_double_bits(" in rewritten:
-        blocks.append(DOUBLE_BITS_HELPER.strip("\n"))
+    for name, helper in BITCAST_HELPERS.values():
+        if f"{name}(" in rewritten:
+            blocks.append(helper.strip("\n"))
     return "\n\n".join(blocks)
 
 

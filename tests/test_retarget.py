@@ -14,12 +14,27 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from cuda_retarget.dialect import BITCAST_HELPERS
 from cuda_retarget.translate import TranslateError, translate_path, translate_source
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests" / "fixtures" / "edges.cu"
 CENSUS = Path(__file__).resolve().parents[2] / "cuda-census" / "corpus"
 BITS = 4607182418800017408
+FLOAT_BITS = 1065353216
+BITCAST_SOURCE = """\
+#include <cuda_runtime.h>
+__global__ void convert(int* i, unsigned* u, float* f, double* d, long long* ll) {
+    const char* label = "__float_as_int";
+    *i = __float_as_int(*f);
+    *u = __float_as_uint(*f);
+    *f = __int_as_float(*i);
+    *f = __uint_as_float(*u);
+    *ll = __double_as_longlong(*d);
+    *d = __longlong_as_double(*ll);
+    *i += label[0];
+}
+"""
 
 
 class EdgeTests(unittest.TestCase):
@@ -58,6 +73,16 @@ class EdgeTests(unittest.TestCase):
     def test_unknown_target_is_refused(self) -> None:
         with self.assertRaises(TranslateError):
             translate_source("int main(){return 0;}\n", "spirv")
+
+    def test_hip_and_musa_lower_bitcasts(self) -> None:
+        for target in ("hip", "musa"):
+            translated = translate_source(BITCAST_SOURCE, target)
+            self.assertIn('"__float_as_int"', translated)
+            for intrinsic, (name, _helper) in BITCAST_HELPERS.items():
+                self.assertNotIn(intrinsic + "(", translated)
+                self.assertIn(name + "(", translated)
+                self.assertEqual(translated.count(name + "("), 2)
+        self.assertEqual(translate_source(BITCAST_SOURCE, "maca"), BITCAST_SOURCE)
 
     def test_unparsed_source_is_refused(self) -> None:
         with self.assertRaises(TranslateError):
@@ -166,31 +191,35 @@ class HelperBitsTests(unittest.TestCase):
         device = _idle_gpu()
         if device is None:
             self.skipTest("every GPU has a compute process")
-        source = """\
+        helpers = "\n".join(
+            BITCAST_HELPERS[name][1].strip("\n")
+            for name in ("__double_as_longlong", "__float_as_int")
+        )
+        source = f"""\
 #include <cstdio>
 #include <cuda_runtime.h>
-static __device__ unsigned long long cts_double_bits(double value) {
-    union {
-        double as_double;
-        unsigned long long as_bits;
-    } converted;
-    converted.as_double = value;
-    return converted.as_bits;
-}
-__global__ void bits_of_one(unsigned long long* out) {
-    *out = cts_double_bits(1.0);
-}
-int main() {
-    unsigned long long* out = nullptr;
-    if (cudaMalloc(&out, sizeof(*out)) != cudaSuccess) return 2;
-    bits_of_one<<<1, 1>>>(out);
+{helpers}
+__global__ void bits_of_one(unsigned long long* out_d, int* out_f) {{
+    *out_d = cts_double_bits(1.0);
+    *out_f = cts_float_bits(1.0f);
+}}
+int main() {{
+    unsigned long long* out_d = nullptr;
+    int* out_f = nullptr;
+    if (cudaMalloc(&out_d, sizeof(*out_d)) != cudaSuccess) return 2;
+    if (cudaMalloc(&out_f, sizeof(*out_f)) != cudaSuccess) return 2;
+    bits_of_one<<<1, 1>>>(out_d, out_f);
     if (cudaDeviceSynchronize() != cudaSuccess) return 3;
     unsigned long long bits = 0;
-    if (cudaMemcpy(&bits, out, sizeof(bits), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
+    int fbits = 0;
+    if (cudaMemcpy(&bits, out_d, sizeof(bits), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
+    if (cudaMemcpy(&fbits, out_f, sizeof(fbits), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
     std::printf("bits=%llu\\n", bits);
-    cudaFree(out);
+    std::printf("fbits=%d\\n", fbits);
+    cudaFree(out_d);
+    cudaFree(out_f);
     return 0;
-}
+}}
 """
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "bits.cu"
@@ -214,7 +243,7 @@ int main() {
                 env=env,
             )
         self.assertEqual(ran.returncode, 0, ran.stderr)
-        self.assertEqual(ran.stdout.strip(), f"bits={BITS}")
+        self.assertEqual(ran.stdout.strip(), f"bits={BITS}\nfbits={FLOAT_BITS}")
 
 
 if __name__ == "__main__":
