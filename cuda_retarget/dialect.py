@@ -243,7 +243,11 @@ class Dialect:
     lane stays the minimum bit pattern. The `ss` absolute value saturates
     that lane to the maximum. `__vnegss2` does not: a `0x8000` lane stays
     `0x8000`, the same bits as `__vneg2`. `__vnegss4` saturates `0x80` to
-    `0x7F`. Signed and unsigned absolute differences are different lanes.
+    `0x7F`.     Signed and unsigned absolute differences are different lanes.
+    `lower_byte_perm` replaces `__byte_perm` with a helper that
+    concatenates `y:x` and picks four bytes. Each selector is three bits
+    from the low 16 bits of the third argument. The high bit of each
+    nibble, and every bit above bit 15, is ignored.
     """
 
     name: str
@@ -259,6 +263,7 @@ class Dialect:
     lower_packed_arith: bool
     lower_packed_minmax: bool
     lower_packed_abs: bool
+    lower_byte_perm: bool
 
 
 DIALECTS = {
@@ -276,6 +281,7 @@ DIALECTS = {
         lower_packed_arith=True,
         lower_packed_minmax=True,
         lower_packed_abs=True,
+        lower_byte_perm=True,
     ),
     "musa": Dialect(
         name="musa",
@@ -291,6 +297,7 @@ DIALECTS = {
         lower_packed_arith=True,
         lower_packed_minmax=True,
         lower_packed_abs=True,
+        lower_byte_perm=True,
     ),
     "maca": Dialect(
         name="maca",
@@ -306,6 +313,7 @@ DIALECTS = {
         lower_packed_arith=False,
         lower_packed_minmax=False,
         lower_packed_abs=False,
+        lower_byte_perm=False,
     ),
 }
 
@@ -632,6 +640,21 @@ PACKED_ABS_HELPERS = {
         ("__vabsdiffu4", 4, "diffu", 2),
     )
 }
+
+
+BYTE_PERM_HELPER = """
+static __device__ unsigned cts_byte_perm(unsigned x, unsigned y, unsigned selector) {
+    unsigned long long source = (static_cast<unsigned long long>(y) << 32) | x;
+    unsigned out = 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        unsigned index = (selector >> (4 * i)) & 7u;
+        unsigned byte = static_cast<unsigned>(source >> (8 * index)) & 0xffu;
+        out |= byte << (8 * i);
+    }
+    return out;
+}
+"""
 
 
 def runtime_name(spelling: str, dialect: Dialect) -> str | None:

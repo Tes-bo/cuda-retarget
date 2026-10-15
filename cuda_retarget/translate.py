@@ -14,6 +14,7 @@ from pathlib import Path
 
 from cuda_retarget.dialect import (
     BITCAST_HELPERS,
+    BYTE_PERM_HELPER,
     DIALECTS,
     DOUBLE_WORD_HELPERS,
     DP4A_HELPER,
@@ -198,6 +199,11 @@ def _call_edit(
         if parsed is None or len(parsed[0]) != arity:
             raise TranslateError(f"{token.spelling} must have {arity} argument(s)")
         return (token.start, token.end, replacement)
+    if dialect.lower_byte_perm and token.spelling == "__byte_perm":
+        parsed = _arguments(tokens, index + 1)
+        if parsed is None or len(parsed[0]) != 3:
+            raise TranslateError("__byte_perm must have three arguments")
+        return (token.start, token.end, "cts_byte_perm")
     return None
 
 
@@ -292,6 +298,8 @@ def _helpers(dialect: Dialect, rewritten: str) -> str:
         for name, helper, _arity in PACKED_ABS_HELPERS.values():
             if f"{name}(" in rewritten:
                 blocks.append(helper.strip("\n"))
+    if dialect.lower_byte_perm and "cts_byte_perm(" in rewritten:
+        blocks.append(BYTE_PERM_HELPER.strip("\n"))
     return "\n\n".join(blocks)
 
 

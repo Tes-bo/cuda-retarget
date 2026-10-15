@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from cuda_retarget.dialect import (
     BITCAST_HELPERS,
+    BYTE_PERM_HELPER,
     DOUBLE_WORD_HELPERS,
     DP4A_HELPER,
     FUNNEL_HELPERS,
@@ -328,6 +329,30 @@ __global__ void magnitude(unsigned* out) {
             self.assertIn("lane == -128", translated)
         self.assertEqual(translate_source(source, "maca"), source)
 
+    def test_hip_and_musa_lower_byte_perm(self) -> None:
+        source = """\
+#include <cuda_runtime.h>
+__global__ void pick(unsigned* out) {
+    const char* label = "__byte_perm";
+    unsigned x = 0xA1B2C3D4u;
+    unsigned y = 0x1F2E3D4Cu;
+    out[0] = __byte_perm(x, y, 0x3210u);
+    out[1] = __byte_perm(x, y, 0x32107654u);
+    out[2] = __byte_perm(__byte_perm(x, y, 0x89ABu), y, 0x0000u);
+    out[3] = label[0];
+}
+"""
+        for target in ("hip", "musa"):
+            translated = translate_source(source, target)
+            self.assertIn('"__byte_perm"', translated)
+            self.assertIn("cts_byte_perm(x, y, 0x3210u)", translated)
+            self.assertIn("cts_byte_perm(x, y, 0x32107654u)", translated)
+            self.assertIn("cts_byte_perm(cts_byte_perm(x, y, 0x89ABu), y, 0x0000u)", translated)
+            self.assertNotIn("__byte_perm(", translated)
+            self.assertIn("& 7u", translated)
+            self.assertEqual(translated.count("cts_byte_perm("), 5)
+        self.assertEqual(translate_source(source, "maca"), source)
+
     def test_unparsed_source_is_refused(self) -> None:
         with self.assertRaises(TranslateError):
             translate_source("int main( {\n", "hip", filename="broken.cu")
@@ -455,6 +480,22 @@ class CorpusTests(unittest.TestCase):
             self.assertEqual(translated.count("cts_vabs2("), 2)
         self.assertIn("__vabs2", maca)
         self.assertNotIn("cts_vabs2", maca)
+
+    def test_hip_and_musa_lower_the_census_byte_perm(self) -> None:
+        path = CENSUS / "byte_perm" / "main.cu"
+        if not path.is_file():
+            self.skipTest("byte_perm is not in the census corpus")
+        hip = translate_path(path, "hip")
+        musa = translate_path(path, "musa")
+        maca = translate_path(path, "maca")
+        for translated in (hip, musa):
+            self.assertIn("cts_byte_perm(x, y, 0x3210u)", translated)
+            self.assertIn("cts_byte_perm(x, y, 0x7654u)", translated)
+            self.assertIn("cts_byte_perm(x, y, 0x32107654u)", translated)
+            self.assertNotIn("__byte_perm(", translated)
+            self.assertEqual(translated.count("cts_byte_perm("), 6)
+        self.assertIn("__byte_perm", maca)
+        self.assertNotIn("cts_byte_perm", maca)
 
     def test_only_hip_pins_warp_size(self) -> None:
         path = CENSUS / "warp_size" / "main.cu"
@@ -1153,9 +1194,68 @@ int main() {{
         self.assertEqual(ran.returncode, 0, ran.stderr)
         self.assertEqual(ran.stdout.strip(), "mismatch=0")
 
+    def test_byte_perm_helper_agrees_with_the_intrinsic(self) -> None:
+        nvcc = shutil.which("nvcc")
+        if nvcc is None:
+            self.skipTest("nvcc is not installed")
+        device = _idle_gpu()
+        if device is None:
+            self.skipTest("every GPU has a compute process")
+        helpers = BYTE_PERM_HELPER.strip("\n")
+        source = f"""\
+#include <cstdio>
+#include <cuda_runtime.h>
+{helpers}
+__global__ void compare(int* bad) {{
+    unsigned x = 0xA1B2C3D4u;
+    unsigned y = 0x1F2E3D4Cu;
+    unsigned selectors[5] = {{0x3210u, 0x7654u, 0x0401u, 0x89ABu, 0x32107654u}};
+    for (int i = 0; i < 5; ++i) {{
+        if (__byte_perm(x, y, selectors[i]) != cts_byte_perm(x, y, selectors[i]))
+            atomicExch(bad, 1);
+    }}
+}}
+int main() {{
+    int* bad = nullptr;
+    if (cudaMalloc(&bad, sizeof(*bad)) != cudaSuccess) return 2;
+    if (cudaMemset(bad, 0, sizeof(*bad)) != cudaSuccess) return 2;
+    compare<<<1, 1>>>(bad);
+    if (cudaDeviceSynchronize() != cudaSuccess) return 3;
+    int mismatch = 0;
+    if (cudaMemcpy(&mismatch, bad, sizeof(mismatch), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
+    std::printf("mismatch=%d\\n", mismatch);
+    cudaFree(bad);
+    return 0;
+}}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "perm.cu"
+            binary = Path(directory) / "perm"
+            path.write_text(source, encoding="utf-8")
+            env = {**os.environ, "CUDA_VISIBLE_DEVICES": device}
+            compiled = subprocess.run(
+                [nvcc, "-arch=native", str(path), "-o", str(binary)],
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+            )
+            if compiled.returncode != 0:
+                self.fail(compiled.stderr)
+            ran = subprocess.run(
+                [str(binary)],
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+            )
+        self.assertEqual(ran.returncode, 0, ran.stderr)
+        self.assertEqual(ran.stdout.strip(), "mismatch=0")
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
