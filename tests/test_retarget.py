@@ -18,6 +18,7 @@ from cuda_retarget.dialect import (
     BITCAST_HELPERS,
     BYTE_PERM_HELPER,
     HADD_HELPERS,
+    MULHI_HELPERS,
     DOUBLE_WORD_HELPERS,
     DP4A_HELPER,
     FUNNEL_HELPERS,
@@ -379,6 +380,47 @@ __global__ void average(int* s, unsigned* u) {
             self.assertIn("(x | y)", translated)
         self.assertEqual(translate_source(source, "maca"), source)
 
+    def test_hip_and_musa_lower_high_multiplies(self) -> None:
+        source = """\
+#include <cuda_runtime.h>
+__global__ void product(int* s, unsigned* u, long long* w, unsigned long long* z) {
+    const char* label = "__mulhi";
+    int a = (int)0x80000000;
+    *s = __mulhi(__mulhi(a, a), 1);
+    *u = __umulhi(0xffffffffu, 0xffffffffu);
+    *w = __mul64hi(-3, 5);
+    *z = __umul64hi(~0ull, ~0ull);
+    *s += label[0];
+}
+"""
+        for target in ("hip", "musa"):
+            translated = translate_source(source, target)
+            self.assertIn('"__mulhi"', translated)
+            self.assertIn("cts_mulhi(cts_mulhi(a, a), 1)", translated)
+            self.assertIn("cts_umulhi(0xffffffffu, 0xffffffffu)", translated)
+            self.assertIn("cts_mul64hi(-3, 5)", translated)
+            self.assertIn("cts_umul64hi(~0ull, ~0ull)", translated)
+            self.assertNotIn("__mulhi(", translated)
+            self.assertNotIn("__mul64hi(", translated)
+            self.assertIn(">> 32", translated)
+            self.assertLess(
+                translated.index("cts_umul64hi(unsigned long long"),
+                translated.index("cts_mul64hi(long long"),
+            )
+        signed_only = """\
+#include <cuda_runtime.h>
+__global__ void product(long long* w) {
+    *w = __mul64hi(-3, 5);
+}
+"""
+        signed = translate_source(signed_only, "hip")
+        self.assertIn("cts_umul64hi(unsigned long long", signed)
+        self.assertLess(
+            signed.index("cts_umul64hi(unsigned long long"),
+            signed.index("cts_mul64hi(long long"),
+        )
+        self.assertEqual(translate_source(source, "maca"), source)
+
     def test_unparsed_source_is_refused(self) -> None:
         with self.assertRaises(TranslateError):
             translate_source("int main( {\n", "hip", filename="broken.cu")
@@ -539,6 +581,27 @@ class CorpusTests(unittest.TestCase):
             self.assertEqual(translated.count("cts_hadd("), 4)
         self.assertIn("__hadd", maca)
         self.assertNotIn("cts_hadd", maca)
+
+    def test_hip_and_musa_lower_the_census_mulhi(self) -> None:
+        path = CENSUS / "mulhi" / "main.cu"
+        if not path.is_file():
+            self.skipTest("mulhi is not in the census corpus")
+        hip = translate_path(path, "hip")
+        musa = translate_path(path, "musa")
+        maca = translate_path(path, "maca")
+        for translated in (hip, musa):
+            self.assertIn("cts_mulhi(a, 1)", translated)
+            self.assertIn("cts_mulhi(a, -1)", translated)
+            self.assertIn("cts_mulhi(a, a)", translated)
+            self.assertIn("cts_umulhi(0xffffffffu, 0xffffffffu)", translated)
+            self.assertIn("cts_mul64hi(-3, 5)", translated)
+            self.assertIn("cts_mul64hi(m, m)", translated)
+            self.assertIn("cts_umul64hi(~0ull, ~0ull)", translated)
+            self.assertNotIn("__mulhi(", translated)
+            self.assertNotIn("__mul64hi(", translated)
+            self.assertEqual(translated.count("cts_mulhi("), 4)
+        self.assertIn("__mulhi", maca)
+        self.assertNotIn("cts_mulhi", maca)
 
     def test_only_hip_pins_warp_size(self) -> None:
         path = CENSUS / "warp_size" / "main.cu"
@@ -1337,6 +1400,72 @@ int main() {{
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "avg.cu"
             binary = Path(directory) / "avg"
+            path.write_text(source, encoding="utf-8")
+            env = {**os.environ, "CUDA_VISIBLE_DEVICES": device}
+            compiled = subprocess.run(
+                [nvcc, "-arch=native", str(path), "-o", str(binary)],
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+            )
+            if compiled.returncode != 0:
+                self.fail(compiled.stderr)
+            ran = subprocess.run(
+                [str(binary)],
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+            )
+        self.assertEqual(ran.returncode, 0, ran.stderr)
+        self.assertEqual(ran.stdout.strip(), "mismatch=0")
+
+    def test_mulhi_helpers_agree_with_the_intrinsics(self) -> None:
+        nvcc = shutil.which("nvcc")
+        if nvcc is None:
+            self.skipTest("nvcc is not installed")
+        device = _idle_gpu()
+        if device is None:
+            self.skipTest("every GPU has a compute process")
+        helpers = "\n".join(helper.strip("\n") for _name, helper in MULHI_HELPERS.values())
+        source = f"""\
+#include <cstdio>
+#include <cuda_runtime.h>
+{helpers}
+__global__ void compare(int* bad) {{
+    int a = (int)0x80000000;
+    long long m = (long long)0x8000000000000000ull;
+    if (__mulhi(a, 1) != cts_mulhi(a, 1)) atomicExch(bad, 1);
+    if (__mulhi(a, -1) != cts_mulhi(a, -1)) atomicExch(bad, 1);
+    if (__mulhi(a, a) != cts_mulhi(a, a)) atomicExch(bad, 1);
+    if (__mulhi(100000, 100000) != cts_mulhi(100000, 100000)) atomicExch(bad, 1);
+    if (__umulhi(0xffffffffu, 0xffffffffu) != cts_umulhi(0xffffffffu, 0xffffffffu))
+        atomicExch(bad, 1);
+    if (__umulhi(0x80000000u, 2u) != cts_umulhi(0x80000000u, 2u)) atomicExch(bad, 1);
+    if (__mul64hi(m, 1) != cts_mul64hi(m, 1)) atomicExch(bad, 1);
+    if (__mul64hi(m, -1) != cts_mul64hi(m, -1)) atomicExch(bad, 1);
+    if (__mul64hi(m, m) != cts_mul64hi(m, m)) atomicExch(bad, 1);
+    if (__mul64hi(-3, 5) != cts_mul64hi(-3, 5)) atomicExch(bad, 1);
+    if (__umul64hi(~0ull, ~0ull) != cts_umul64hi(~0ull, ~0ull)) atomicExch(bad, 1);
+    if (__umul64hi(~0ull, 2ull) != cts_umul64hi(~0ull, 2ull)) atomicExch(bad, 1);
+}}
+int main() {{
+    int* bad = nullptr;
+    if (cudaMalloc(&bad, sizeof(*bad)) != cudaSuccess) return 2;
+    if (cudaMemset(bad, 0, sizeof(*bad)) != cudaSuccess) return 2;
+    compare<<<1, 1>>>(bad);
+    if (cudaDeviceSynchronize() != cudaSuccess) return 3;
+    int mismatch = 0;
+    if (cudaMemcpy(&mismatch, bad, sizeof(mismatch), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
+    std::printf("mismatch=%d\\n", mismatch);
+    cudaFree(bad);
+    return 0;
+}}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mulhi.cu"
+            binary = Path(directory) / "mulhi"
             path.write_text(source, encoding="utf-8")
             env = {**os.environ, "CUDA_VISIBLE_DEVICES": device}
             compiled = subprocess.run(

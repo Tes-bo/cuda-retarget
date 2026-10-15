@@ -250,9 +250,15 @@ class Dialect:
     nibble, and every bit above bit 15, is ignored.
     `lower_hadd` replaces `__hadd`, `__rhadd`, `__uhadd`, and `__urhadd`.
     The plain forms are `(x + y) >> 1`. The rounded forms add one before
-    the shift. The sum is computed without a 32-bit overflow, so the
+    the shift.     The sum is computed without a 32-bit overflow, so the
     average of two minimum signed values stays negative and the average
     of `0xFFFFFFFF` and `1` is `2^31`.
+    `lower_mulhi` replaces `__mulhi`, `__umulhi`, `__mul64hi`, and
+    `__umul64hi` with the high half of the full product. The 32-bit
+    forms widen to 64 bits. The 64-bit forms build a 128-bit product
+    from 32-bit halves. A negative product sign-extends, so the high
+    half of a small negative product is all ones. `INT_MIN * INT_MIN`
+    keeps the high half `2^30` instead of wrapping a 32-bit multiply.
     """
 
     name: str
@@ -270,6 +276,7 @@ class Dialect:
     lower_packed_abs: bool
     lower_byte_perm: bool
     lower_hadd: bool
+    lower_mulhi: bool
 
 
 DIALECTS = {
@@ -289,6 +296,7 @@ DIALECTS = {
         lower_packed_abs=True,
         lower_byte_perm=True,
         lower_hadd=True,
+        lower_mulhi=True,
     ),
     "musa": Dialect(
         name="musa",
@@ -306,6 +314,7 @@ DIALECTS = {
         lower_packed_abs=True,
         lower_byte_perm=True,
         lower_hadd=True,
+        lower_mulhi=True,
     ),
     "maca": Dialect(
         name="maca",
@@ -323,6 +332,7 @@ DIALECTS = {
         lower_packed_abs=False,
         lower_byte_perm=False,
         lower_hadd=False,
+        lower_mulhi=False,
     ),
 }
 
@@ -648,6 +658,56 @@ PACKED_ABS_HELPERS = {
         ("__vabsdiffs4", 4, "diffs", 2),
         ("__vabsdiffu4", 4, "diffu", 2),
     )
+}
+
+
+# __mul64hi calls cts_umul64hi, so the unsigned 64-bit helper is emitted before it.
+MULHI_HELPERS = {
+    "__mulhi": (
+        "cts_mulhi",
+        """
+static __device__ int cts_mulhi(int x, int y) {
+    return static_cast<int>((static_cast<long long>(x) * static_cast<long long>(y)) >> 32);
+}
+""",
+    ),
+    "__umulhi": (
+        "cts_umulhi",
+        """
+static __device__ unsigned cts_umulhi(unsigned x, unsigned y) {
+    return static_cast<unsigned>((static_cast<unsigned long long>(x) * y) >> 32);
+}
+""",
+    ),
+    "__umul64hi": (
+        "cts_umul64hi",
+        """
+static __device__ unsigned long long cts_umul64hi(unsigned long long x, unsigned long long y) {
+    unsigned long long x0 = x & 0xffffffffull;
+    unsigned long long x1 = x >> 32;
+    unsigned long long y0 = y & 0xffffffffull;
+    unsigned long long y1 = y >> 32;
+    unsigned long long p00 = x0 * y0;
+    unsigned long long p01 = x0 * y1;
+    unsigned long long p10 = x1 * y0;
+    unsigned long long p11 = x1 * y1;
+    unsigned long long mid = (p00 >> 32) + (p01 & 0xffffffffull) + (p10 & 0xffffffffull);
+    return p11 + (p01 >> 32) + (p10 >> 32) + (mid >> 32);
+}
+""",
+    ),
+    "__mul64hi": (
+        "cts_mul64hi",
+        """
+static __device__ long long cts_mul64hi(long long x, long long y) {
+    unsigned long long hi = cts_umul64hi(static_cast<unsigned long long>(x),
+                                         static_cast<unsigned long long>(y));
+    if (x < 0) hi -= static_cast<unsigned long long>(y);
+    if (y < 0) hi -= static_cast<unsigned long long>(x);
+    return static_cast<long long>(hi);
+}
+""",
+    ),
 }
 
 
