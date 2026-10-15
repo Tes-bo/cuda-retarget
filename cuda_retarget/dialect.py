@@ -238,6 +238,12 @@ class Dialect:
     `__vmaxu2`, and the 4-byte forms. `s` compares each lane as signed.
     `u` compares it as unsigned. `0x8000` is -32768 on one and 32768
     on the other.
+    `lower_packed_abs` replaces per-lane absolute value, negation, and
+    absolute difference. Plain `__vabs2` / `__vabs4` wrap, so the minimum
+    lane stays the minimum bit pattern. The `ss` absolute value saturates
+    that lane to the maximum. `__vnegss2` does not: a `0x8000` lane stays
+    `0x8000`, the same bits as `__vneg2`. `__vnegss4` saturates `0x80` to
+    `0x7F`. Signed and unsigned absolute differences are different lanes.
     """
 
     name: str
@@ -252,6 +258,7 @@ class Dialect:
     lower_dp4a: bool
     lower_packed_arith: bool
     lower_packed_minmax: bool
+    lower_packed_abs: bool
 
 
 DIALECTS = {
@@ -268,6 +275,7 @@ DIALECTS = {
         lower_dp4a=True,
         lower_packed_arith=True,
         lower_packed_minmax=True,
+        lower_packed_abs=True,
     ),
     "musa": Dialect(
         name="musa",
@@ -282,6 +290,7 @@ DIALECTS = {
         lower_dp4a=True,
         lower_packed_arith=True,
         lower_packed_minmax=True,
+        lower_packed_abs=True,
     ),
     "maca": Dialect(
         name="maca",
@@ -296,6 +305,7 @@ DIALECTS = {
         lower_dp4a=False,
         lower_packed_arith=False,
         lower_packed_minmax=False,
+        lower_packed_abs=False,
     ),
 }
 
@@ -531,6 +541,95 @@ PACKED_MINMAX_HELPERS = {
         ("__vminu4", 4, False, "min"),
         ("__vmaxs4", 4, True, "max"),
         ("__vmaxu4", 4, False, "max"),
+    )
+}
+
+
+def _signed_lane(lanes: int, shift: int, mask: int, var: str) -> str:
+    cast = "short" if lanes == 2 else "signed char"
+    if lanes == 2:
+        return f"static_cast<{cast}>({var} >> ({shift} * i))"
+    return f"static_cast<{cast}>(({var} >> ({shift} * i)) & {mask:#x}u)"
+
+
+def _packed_abs_helper(name: str, lanes: int, mode: str) -> str:
+    shift = 32 // lanes
+    mask = (1 << shift) - 1
+    floor = -(1 << (shift - 1))
+    limit = (1 << (shift - 1)) - 1
+    extract = _signed_lane(lanes, shift, mask, "a")
+    if mode == "abs":
+        mag = "int mag = lane < 0 ? -lane : lane;"
+    elif mode == "absss":
+        mag = f"int mag = lane == {floor} ? {limit} : (lane < 0 ? -lane : lane);"
+    elif mode == "neg":
+        mag = "int mag = -lane;"
+    elif mode == "negss":
+        mag = f"int mag = lane == {floor} ? {limit} : -lane;"
+    elif mode == "diffs":
+        other = _signed_lane(lanes, shift, mask, "b")
+        return f"""
+static __device__ unsigned {name}(unsigned a, unsigned b) {{
+    unsigned out = 0;
+#pragma unroll
+    for (int i = 0; i < {lanes}; ++i) {{
+        int aa = {extract};
+        int bb = {other};
+        int diff = aa - bb;
+        int mag = diff < 0 ? -diff : diff;
+        out |= (static_cast<unsigned>(mag) & {mask:#x}u) << ({shift} * i);
+    }}
+    return out;
+}}
+"""
+    else:
+        return f"""
+static __device__ unsigned {name}(unsigned a, unsigned b) {{
+    unsigned out = 0;
+#pragma unroll
+    for (int i = 0; i < {lanes}; ++i) {{
+        unsigned aa = (a >> ({shift} * i)) & {mask:#x}u;
+        unsigned bb = (b >> ({shift} * i)) & {mask:#x}u;
+        unsigned mag = aa > bb ? aa - bb : bb - aa;
+        out |= mag << ({shift} * i);
+    }}
+    return out;
+}}
+"""
+    return f"""
+static __device__ unsigned {name}(unsigned a) {{
+    unsigned out = 0;
+#pragma unroll
+    for (int i = 0; i < {lanes}; ++i) {{
+        int lane = {extract};
+        {mag}
+        out |= (static_cast<unsigned>(mag) & {mask:#x}u) << ({shift} * i);
+    }}
+    return out;
+}}
+"""
+
+
+# (replacement, helper, argument count). __vnegss2 matches __vneg2 on CUDA.
+PACKED_ABS_HELPERS = {
+    intrinsic: (
+        f"cts_{intrinsic[2:]}",
+        _packed_abs_helper(f"cts_{intrinsic[2:]}", lanes, mode),
+        arity,
+    )
+    for intrinsic, lanes, mode, arity in (
+        ("__vabs2", 2, "abs", 1),
+        ("__vabsss2", 2, "absss", 1),
+        ("__vneg2", 2, "neg", 1),
+        ("__vnegss2", 2, "neg", 1),
+        ("__vabs4", 4, "abs", 1),
+        ("__vabsss4", 4, "absss", 1),
+        ("__vneg4", 4, "neg", 1),
+        ("__vnegss4", 4, "negss", 1),
+        ("__vabsdiffs2", 2, "diffs", 2),
+        ("__vabsdiffu2", 2, "diffu", 2),
+        ("__vabsdiffs4", 4, "diffs", 2),
+        ("__vabsdiffu4", 4, "diffu", 2),
     )
 }
 

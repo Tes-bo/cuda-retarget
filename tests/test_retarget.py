@@ -21,6 +21,7 @@ from cuda_retarget.dialect import (
     FUNNEL_HELPERS,
     MATCH_ALL_HELPER,
     MATCH_ANY_HELPER,
+    PACKED_ABS_HELPERS,
     PACKED_HELPERS,
     PACKED_MINMAX_HELPERS,
     VOTE_HELPERS,
@@ -294,6 +295,39 @@ __global__ void pick(unsigned* out) {
             self.assertIn("0xffu", translated)
         self.assertEqual(translate_source(source, "maca"), source)
 
+    def test_hip_and_musa_lower_packed_abs(self) -> None:
+        source = """\
+#include <cuda_runtime.h>
+__global__ void magnitude(unsigned* out) {
+    const char* label = "__vabs2";
+    unsigned a = 0x80000002u;
+    unsigned b = 0x00000001u;
+    out[0] = __vabs2(a);
+    out[1] = __vabsss2(a);
+    out[2] = __vneg2(a);
+    out[3] = __vnegss2(a);
+    out[4] = __vnegss4(__vabs4(a));
+    out[5] = __vabsdiffs2(a, b);
+    out[6] = __vabsdiffu2(a, b);
+    out[7] = label[0];
+}
+"""
+        for target in ("hip", "musa"):
+            translated = translate_source(source, target)
+            self.assertIn('"__vabs2"', translated)
+            self.assertIn("cts_vabs2(a)", translated)
+            self.assertIn("cts_vabsss2(a)", translated)
+            self.assertIn("cts_vneg2(a)", translated)
+            self.assertIn("cts_vnegss2(a)", translated)
+            self.assertIn("cts_vnegss4(cts_vabs4(a))", translated)
+            self.assertIn("cts_vabsdiffs2(a, b)", translated)
+            self.assertIn("cts_vabsdiffu2(a, b)", translated)
+            self.assertNotIn("__vabs2(", translated)
+            self.assertNotIn("__vnegss4(", translated)
+            self.assertIn("32767", translated)
+            self.assertIn("lane == -128", translated)
+        self.assertEqual(translate_source(source, "maca"), source)
+
     def test_unparsed_source_is_refused(self) -> None:
         with self.assertRaises(TranslateError):
             translate_source("int main( {\n", "hip", filename="broken.cu")
@@ -404,6 +438,23 @@ class CorpusTests(unittest.TestCase):
             self.assertEqual(translated.count("cts_vmins2("), 2)
         self.assertIn("__vmins2", maca)
         self.assertNotIn("cts_vmins2", maca)
+
+    def test_hip_and_musa_lower_the_census_packed_abs(self) -> None:
+        path = CENSUS / "packed_abs" / "main.cu"
+        if not path.is_file():
+            self.skipTest("packed_abs is not in the census corpus")
+        hip = translate_path(path, "hip")
+        musa = translate_path(path, "musa")
+        maca = translate_path(path, "maca")
+        for translated in (hip, musa):
+            self.assertIn("cts_vabs2(a2)", translated)
+            self.assertIn("cts_vabsss2(a2)", translated)
+            self.assertIn("cts_vnegss4(a4)", translated)
+            self.assertIn("cts_vabsdiffu4(x4, y4)", translated)
+            self.assertNotIn("__vabs2(", translated)
+            self.assertEqual(translated.count("cts_vabs2("), 2)
+        self.assertIn("__vabs2", maca)
+        self.assertNotIn("cts_vabs2", maca)
 
     def test_only_hip_pins_warp_size(self) -> None:
         path = CENSUS / "warp_size" / "main.cu"
@@ -1032,9 +1083,80 @@ int main() {{
         self.assertEqual(ran.returncode, 0, ran.stderr)
         self.assertEqual(ran.stdout.strip(), "mismatch=0")
 
+    def test_packed_abs_helpers_agree_with_the_intrinsics(self) -> None:
+        nvcc = shutil.which("nvcc")
+        if nvcc is None:
+            self.skipTest("nvcc is not installed")
+        device = _idle_gpu()
+        if device is None:
+            self.skipTest("every GPU has a compute process")
+        helpers = "\n".join(helper.strip("\n") for _name, helper, _arity in PACKED_ABS_HELPERS.values())
+        source = f"""\
+#include <cstdio>
+#include <cuda_runtime.h>
+{helpers}
+__global__ void compare(int* bad) {{
+    unsigned a2 = 0x80000002u;
+    unsigned a4 = 0x80017F80u;
+    unsigned x2 = 0x8000FFFFu;
+    unsigned y2 = 0x00000001u;
+    unsigned x4 = 0x01800080u;
+    unsigned y4 = 0x00010100u;
+    if (__vabs2(a2) != cts_vabs2(a2)) atomicExch(bad, 1);
+    if (__vabsss2(a2) != cts_vabsss2(a2)) atomicExch(bad, 1);
+    if (__vneg2(a2) != cts_vneg2(a2)) atomicExch(bad, 1);
+    if (__vnegss2(a2) != cts_vnegss2(a2)) atomicExch(bad, 1);
+    if (__vnegss2(0x80008000u) != cts_vnegss2(0x80008000u)) atomicExch(bad, 1);
+    if (__vabs4(a4) != cts_vabs4(a4)) atomicExch(bad, 1);
+    if (__vabsss4(a4) != cts_vabsss4(a4)) atomicExch(bad, 1);
+    if (__vneg4(a4) != cts_vneg4(a4)) atomicExch(bad, 1);
+    if (__vnegss4(a4) != cts_vnegss4(a4)) atomicExch(bad, 1);
+    if (__vabsdiffs2(x2, y2) != cts_vabsdiffs2(x2, y2)) atomicExch(bad, 1);
+    if (__vabsdiffu2(x2, y2) != cts_vabsdiffu2(x2, y2)) atomicExch(bad, 1);
+    if (__vabsdiffs4(x4, y4) != cts_vabsdiffs4(x4, y4)) atomicExch(bad, 1);
+    if (__vabsdiffu4(x4, y4) != cts_vabsdiffu4(x4, y4)) atomicExch(bad, 1);
+}}
+int main() {{
+    int* bad = nullptr;
+    if (cudaMalloc(&bad, sizeof(*bad)) != cudaSuccess) return 2;
+    if (cudaMemset(bad, 0, sizeof(*bad)) != cudaSuccess) return 2;
+    compare<<<1, 1>>>(bad);
+    if (cudaDeviceSynchronize() != cudaSuccess) return 3;
+    int mismatch = 0;
+    if (cudaMemcpy(&mismatch, bad, sizeof(mismatch), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
+    std::printf("mismatch=%d\\n", mismatch);
+    cudaFree(bad);
+    return 0;
+}}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "abs.cu"
+            binary = Path(directory) / "abs"
+            path.write_text(source, encoding="utf-8")
+            env = {**os.environ, "CUDA_VISIBLE_DEVICES": device}
+            compiled = subprocess.run(
+                [nvcc, "-arch=native", str(path), "-o", str(binary)],
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+            )
+            if compiled.returncode != 0:
+                self.fail(compiled.stderr)
+            ran = subprocess.run(
+                [str(binary)],
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+            )
+        self.assertEqual(ran.returncode, 0, ran.stderr)
+        self.assertEqual(ran.stdout.strip(), "mismatch=0")
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
