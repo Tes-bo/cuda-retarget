@@ -93,6 +93,51 @@ static __device__ float cts_uint_bits(unsigned int bits) {
 }
 
 
+# Concatenate hi:lo, then shift. Wrap uses shift & 31. Clamp uses min(shift, 32).
+FUNNEL_HELPERS = {
+    "__funnelshift_l": (
+        "cts_funnelshift_l",
+        """
+static __device__ unsigned cts_funnelshift_l(unsigned lo, unsigned hi, unsigned shift) {
+    unsigned amt = shift & 31u;
+    unsigned long long value = (static_cast<unsigned long long>(hi) << 32) | lo;
+    return static_cast<unsigned>((value << amt) >> 32);
+}
+""",
+    ),
+    "__funnelshift_lc": (
+        "cts_funnelshift_lc",
+        """
+static __device__ unsigned cts_funnelshift_lc(unsigned lo, unsigned hi, unsigned shift) {
+    unsigned amt = shift > 32u ? 32u : shift;
+    unsigned long long value = (static_cast<unsigned long long>(hi) << 32) | lo;
+    return static_cast<unsigned>((value << amt) >> 32);
+}
+""",
+    ),
+    "__funnelshift_r": (
+        "cts_funnelshift_r",
+        """
+static __device__ unsigned cts_funnelshift_r(unsigned lo, unsigned hi, unsigned shift) {
+    unsigned amt = shift & 31u;
+    unsigned long long value = (static_cast<unsigned long long>(hi) << 32) | lo;
+    return static_cast<unsigned>(value >> amt);
+}
+""",
+    ),
+    "__funnelshift_rc": (
+        "cts_funnelshift_rc",
+        """
+static __device__ unsigned cts_funnelshift_rc(unsigned lo, unsigned hi, unsigned shift) {
+    unsigned amt = shift > 32u ? 32u : shift;
+    unsigned long long value = (static_cast<unsigned long long>(hi) << 32) | lo;
+    return static_cast<unsigned>(value >> amt);
+}
+""",
+    ),
+}
+
+
 @dataclass(frozen=True)
 class Dialect:
     """One emission target.
@@ -117,6 +162,9 @@ class Dialect:
     `syncwarp_mask_32` rewrites a no-argument `__syncwarp()` to
     `__syncwarp(0xffffffff)`. CUDA's default mask names 32 lanes. A header
     default on a 64-lane wavefront does not.
+    `lower_funnelshifts` replaces `__funnelshift_l`, `__funnelshift_lc`,
+    `__funnelshift_r`, and `__funnelshift_rc` with 64-bit shift helpers.
+    Wrap (`l`, `r`) uses `shift & 31`. Clamp (`lc`, `rc`) uses `min(shift, 32)`.
     """
 
     name: str
@@ -127,6 +175,7 @@ class Dialect:
     match_width_32: bool
     vote_width_32: bool
     syncwarp_mask_32: bool
+    lower_funnelshifts: bool
 
 
 DIALECTS = {
@@ -139,6 +188,7 @@ DIALECTS = {
         match_width_32=True,
         vote_width_32=True,
         syncwarp_mask_32=True,
+        lower_funnelshifts=True,
     ),
     "musa": Dialect(
         name="musa",
@@ -149,6 +199,7 @@ DIALECTS = {
         match_width_32=False,
         vote_width_32=False,
         syncwarp_mask_32=False,
+        lower_funnelshifts=True,
     ),
     "maca": Dialect(
         name="maca",
@@ -159,6 +210,7 @@ DIALECTS = {
         match_width_32=False,
         vote_width_32=False,
         syncwarp_mask_32=False,
+        lower_funnelshifts=False,
     ),
 }
 

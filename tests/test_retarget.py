@@ -14,7 +14,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from cuda_retarget.dialect import BITCAST_HELPERS, MATCH_ALL_HELPER, MATCH_ANY_HELPER, VOTE_HELPERS
+from cuda_retarget.dialect import (
+    BITCAST_HELPERS,
+    FUNNEL_HELPERS,
+    MATCH_ALL_HELPER,
+    MATCH_ANY_HELPER,
+    VOTE_HELPERS,
+)
 from cuda_retarget.translate import TranslateError, translate_path, translate_source
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -144,6 +150,31 @@ __global__ void vote(unsigned* out) {
         self.assertNotIn("cts_ballot_sync", musa)
         self.assertEqual(translate_source(source, "maca"), source)
 
+    def test_hip_and_musa_lower_funnelshifts(self) -> None:
+        source = """\
+#include <cuda_runtime.h>
+__global__ void shift(unsigned* out) {
+    const char* label = "__funnelshift_l";
+    unsigned lo = 0xA5A5A5A5u;
+    unsigned hi = 0x3C3C3C3Cu;
+    out[0] = __funnelshift_l(lo, hi, 1);
+    out[1] = __funnelshift_lc(lo, hi, 32);
+    out[2] = __funnelshift_r(lo, hi, 1);
+    out[3] = __funnelshift_rc(lo, hi, 32);
+    out[4] = label[0];
+}
+"""
+        for target in ("hip", "musa"):
+            translated = translate_source(source, target)
+            self.assertIn('"__funnelshift_l"', translated)
+            for intrinsic, (name, _helper) in FUNNEL_HELPERS.items():
+                self.assertNotIn(intrinsic + "(", translated)
+                self.assertIn(name + "(", translated)
+                self.assertEqual(translated.count(name + "("), 2)
+            self.assertIn("shift & 31u", translated)
+            self.assertIn("shift > 32u", translated)
+        self.assertEqual(translate_source(source, "maca"), source)
+
     def test_hip_and_musa_lower_bitcasts(self) -> None:
         for target in ("hip", "musa"):
             translated = translate_source(BITCAST_SOURCE, target)
@@ -199,6 +230,23 @@ class CorpusTests(unittest.TestCase):
         self.assertIn("__shfl_xor_sync(0xffffffff, value, 1, 32)", hip)
         self.assertIn("__shfl_xor_sync(0xffffffff, value, 16);", musa)
         self.assertNotIn(", 32)", musa)
+
+    def test_hip_and_musa_lower_the_census_funnelshift(self) -> None:
+        path = CENSUS / "funnelshift" / "main.cu"
+        if not path.is_file():
+            self.skipTest("funnelshift is not in the census corpus")
+        hip = translate_path(path, "hip")
+        musa = translate_path(path, "musa")
+        maca = translate_path(path, "maca")
+        for translated in (hip, musa):
+            self.assertIn("cts_funnelshift_l(lo, hi, 1)", translated)
+            self.assertIn("cts_funnelshift_l(lo, hi, 32)", translated)
+            self.assertIn("cts_funnelshift_lc(lo, hi, 32)", translated)
+            self.assertIn("cts_funnelshift_r(lo, hi, 1)", translated)
+            self.assertIn("cts_funnelshift_rc(lo, hi, 32)", translated)
+            self.assertNotIn("__funnelshift_l(", translated)
+        self.assertIn("__funnelshift_l", maca)
+        self.assertNotIn("cts_funnelshift_l", maca)
 
     def test_only_hip_pins_warp_size(self) -> None:
         path = CENSUS / "warp_size" / "main.cu"
@@ -451,6 +499,73 @@ int main() {{
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "vote.cu"
             binary = Path(directory) / "vote"
+            path.write_text(source, encoding="utf-8")
+            env = {**os.environ, "CUDA_VISIBLE_DEVICES": device}
+            compiled = subprocess.run(
+                [nvcc, "-arch=native", str(path), "-o", str(binary)],
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+            )
+            if compiled.returncode != 0:
+                self.fail(compiled.stderr)
+            ran = subprocess.run(
+                [str(binary)],
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+            )
+        self.assertEqual(ran.returncode, 0, ran.stderr)
+        self.assertEqual(ran.stdout.strip(), "mismatch=0")
+
+    def test_funnel_helper_agrees_with_the_intrinsic(self) -> None:
+        nvcc = shutil.which("nvcc")
+        if nvcc is None:
+            self.skipTest("nvcc is not installed")
+        device = _idle_gpu()
+        if device is None:
+            self.skipTest("every GPU has a compute process")
+        helpers = "\n".join(helper.strip("\n") for _name, helper in FUNNEL_HELPERS.values())
+        source = f"""\
+#include <cstdio>
+#include <cuda_runtime.h>
+{helpers}
+__global__ void compare(int* bad) {{
+    unsigned lo = 0xA5A5A5A5u;
+    unsigned hi = 0x3C3C3C3Cu;
+    if (__funnelshift_l(lo, hi, 1) != cts_funnelshift_l(lo, hi, 1))
+        atomicExch(bad, 1);
+    if (__funnelshift_l(lo, hi, 32) != cts_funnelshift_l(lo, hi, 32))
+        atomicExch(bad, 1);
+    if (__funnelshift_lc(lo, hi, 32) != cts_funnelshift_lc(lo, hi, 32))
+        atomicExch(bad, 1);
+    if (__funnelshift_lc(lo, hi, 33) != cts_funnelshift_lc(lo, hi, 33))
+        atomicExch(bad, 1);
+    if (__funnelshift_r(lo, hi, 1) != cts_funnelshift_r(lo, hi, 1))
+        atomicExch(bad, 1);
+    if (__funnelshift_rc(lo, hi, 32) != cts_funnelshift_rc(lo, hi, 32))
+        atomicExch(bad, 1);
+    if (__funnelshift_rc(lo, hi, 33) != cts_funnelshift_rc(lo, hi, 33))
+        atomicExch(bad, 1);
+}}
+int main() {{
+    int* bad = nullptr;
+    if (cudaMalloc(&bad, sizeof(*bad)) != cudaSuccess) return 2;
+    if (cudaMemset(bad, 0, sizeof(*bad)) != cudaSuccess) return 2;
+    compare<<<1, 1>>>(bad);
+    if (cudaDeviceSynchronize() != cudaSuccess) return 3;
+    int mismatch = 0;
+    if (cudaMemcpy(&mismatch, bad, sizeof(mismatch), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
+    std::printf("mismatch=%d\\n", mismatch);
+    cudaFree(bad);
+    return 0;
+}}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "funnel.cu"
+            binary = Path(directory) / "funnel"
             path.write_text(source, encoding="utf-8")
             env = {**os.environ, "CUDA_VISIBLE_DEVICES": device}
             compiled = subprocess.run(

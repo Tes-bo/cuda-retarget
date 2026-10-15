@@ -15,6 +15,7 @@ from pathlib import Path
 from cuda_retarget.dialect import (
     BITCAST_HELPERS,
     DIALECTS,
+    FUNNEL_HELPERS,
     MATCH_ALL_HELPER,
     MATCH_ANY_HELPER,
     VOTE_HELPERS,
@@ -156,6 +157,12 @@ def _call_edit(
             raise TranslateError(f"{token.spelling} must have one argument")
         replacement, _helper = BITCAST_HELPERS[token.spelling]
         return (token.start, token.end, replacement)
+    if dialect.lower_funnelshifts and token.spelling in FUNNEL_HELPERS:
+        parsed = _arguments(tokens, index + 1)
+        if parsed is None or len(parsed[0]) != 3:
+            raise TranslateError(f"{token.spelling} must have three arguments")
+        replacement, _helper = FUNNEL_HELPERS[token.spelling]
+        return (token.start, token.end, replacement)
     return None
 
 
@@ -229,6 +236,10 @@ def _helpers(dialect: Dialect, rewritten: str) -> str:
             for name in used:
                 if name != "cts_ballot_sync":
                     blocks.append(VOTE_HELPERS[name].strip("\n"))
+    if dialect.lower_funnelshifts:
+        for name, helper in FUNNEL_HELPERS.values():
+            if f"{name}(" in rewritten:
+                blocks.append(helper.strip("\n"))
     return "\n\n".join(blocks)
 
 
