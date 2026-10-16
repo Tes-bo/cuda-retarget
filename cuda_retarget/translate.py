@@ -40,6 +40,12 @@ from cuda_retarget.dialect import (
     ROUND_I32,
     ROUND_I64,
     SATURATE_HELPERS,
+    DARITH_ADD,
+    DARITH_FMA,
+    DARITH_HELPERS,
+    DARITH_MUL,
+    DARITH_PACK,
+    DARITH_SUB,
     FARITH_ADD,
     FARITH_FMA,
     FARITH_HELPERS,
@@ -67,6 +73,10 @@ from cuda_retarget.dialect import (
     HPRED_NAN,
     HPRED_SIGN,
     Dialect,
+    darith_needs_add,
+    darith_needs_fma,
+    darith_needs_mul,
+    darith_needs_sub,
     farith_needs_add,
     farith_needs_fma,
     farith_needs_mul,
@@ -369,6 +379,13 @@ def _call_edit(
             raise TranslateError(f"{token.spelling} must have {arity} arguments")
         replacement, _helper = HPRED_HELPERS[token.spelling]
         return (token.start, token.end, replacement)
+    if dialect.lower_darith and token.spelling in DARITH_HELPERS:
+        parsed = _arguments(tokens, index + 1)
+        arity = 3 if token.spelling.startswith("__fma_") else 2
+        if parsed is None or len(parsed[0]) != arity:
+            raise TranslateError(f"{token.spelling} must have {arity} arguments")
+        replacement, _helper = DARITH_HELPERS[token.spelling]
+        return (token.start, token.end, replacement)
     if dialect.lower_farith and token.spelling in FARITH_HELPERS:
         parsed = _arguments(tokens, index + 1)
         arity = 3 if token.spelling.startswith("__fmaf_") else 2
@@ -647,6 +664,21 @@ def _helpers(dialect: Dialect, rewritten: str) -> str:
                 blocks.append(FARITH_MUL.strip("\n"))
             if farith_needs_fma(names):
                 blocks.append(FARITH_FMA.strip("\n"))
+            for _name, helper in used:
+                blocks.append(helper.strip("\n"))
+    if dialect.lower_darith:
+        used = [(name, helper) for name, helper in DARITH_HELPERS.values() if f"{name}(" in rewritten]
+        names = {name for name, _helper in used}
+        if names:
+            blocks.append(DARITH_PACK.strip("\n"))
+            if darith_needs_add(names):
+                blocks.append(DARITH_ADD.strip("\n"))
+            if darith_needs_sub(names):
+                blocks.append(DARITH_SUB.strip("\n"))
+            if darith_needs_mul(names):
+                blocks.append(DARITH_MUL.strip("\n"))
+            if darith_needs_fma(names):
+                blocks.append(DARITH_FMA.strip("\n"))
             for _name, helper in used:
                 blocks.append(helper.strip("\n"))
     return "\n\n".join(blocks)

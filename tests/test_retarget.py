@@ -36,6 +36,12 @@ from cuda_retarget.dialect import (
     ROUND_I32,
     ROUND_I64,
     SATURATE_HELPERS,
+    DARITH_ADD,
+    DARITH_FMA,
+    DARITH_HELPERS,
+    DARITH_MUL,
+    DARITH_PACK,
+    DARITH_SUB,
     FARITH_ADD,
     FARITH_FMA,
     FARITH_HELPERS,
@@ -703,6 +709,52 @@ __global__ void round_float(float* f) { *f = __fadd_rn(*f, 1.0f); }
         self.assertIn("cts_fadd(", hip)
         self.assertNotIn("cts_fmul(", hip)
         self.assertNotIn("cts_ffma(", hip)
+        self.assertEqual(translate_source(source, "maca"), source)
+
+    def test_hip_and_musa_lower_directed_double(self) -> None:
+        source = """\
+#include <cuda_runtime.h>
+__global__ void round_double(double* d) {
+    const char* label = "__dadd_rn __dsub_rd __dmul_ru __fma_rz";
+    *d = __dadd_rn(*d, 1.0);
+    *d = __dsub_rd(*d, 1.0);
+    *d = __dmul_ru(*d, 2.0);
+    *d = __fma_rz(*d, *d, 1.0);
+    *d += label[0];
+}
+"""
+        for target in ("hip", "musa"):
+            translated = translate_source(source, target)
+            self.assertIn('"__dadd_rn __dsub_rd __dmul_ru __fma_rz"', translated)
+            self.assertIn("cts_dadd_rn(*d, 1.0)", translated)
+            self.assertIn("cts_dsub_rd(*d, 1.0)", translated)
+            self.assertIn("cts_dmul_ru(*d, 2.0)", translated)
+            self.assertIn("cts_dfma_rz(*d, *d, 1.0)", translated)
+            self.assertIn("cts_dpack", translated)
+            self.assertIn("cts_dadd(", translated)
+            self.assertIn("cts_dsub(", translated)
+            self.assertIn("cts_dfma(", translated)
+            self.assertNotIn("__dadd_rn(", translated)
+            self.assertNotIn("__dsub_rd(", translated)
+            self.assertNotIn("__dmul_ru(", translated)
+            self.assertNotIn("__fma_rz(", translated)
+            self.assertNotIn("__fmaf_rz(", translated)
+        mul_only = """\
+#include <cuda_runtime.h>
+__global__ void round_double(double* d) { *d = __dmul_rn(*d, 2.0); }
+"""
+        hip = translate_source(mul_only, "hip")
+        self.assertIn("cts_dmul(", hip)
+        self.assertNotIn("cts_dadd(", hip)
+        self.assertNotIn("cts_dfma(", hip)
+        fma_only = """\
+#include <cuda_runtime.h>
+__global__ void round_double(double* d) { *d = __fma_rn(*d, *d, 1.0); }
+"""
+        hip = translate_source(fma_only, "hip")
+        self.assertIn("cts_dfma(", hip)
+        self.assertIn("cts_dadd(", hip)
+        self.assertNotIn("cts_dmul(", hip)
         self.assertEqual(translate_source(source, "maca"), source)
 
     def test_hip_and_musa_lower_double_rounding(self) -> None:
@@ -1413,6 +1465,33 @@ class CorpusTests(unittest.TestCase):
             self.assertEqual(translated.count("cts_fmaf_rn("), 3)
         self.assertIn("__fadd_rn", maca)
         self.assertNotIn("cts_fadd_rn", maca)
+
+    def test_hip_and_musa_lower_the_census_darith(self) -> None:
+        path = CENSUS / "darith" / "main.cu"
+        if not path.is_file():
+            self.skipTest("darith is not in the census corpus")
+        hip = translate_path(path, "hip")
+        musa = translate_path(path, "musa")
+        maca = translate_path(path, "maca")
+        for translated in (hip, musa):
+            self.assertIn("cts_dadd_rn(p0, m0)", translated)
+            self.assertIn("cts_dadd_rd(p0, p0)", translated)
+            self.assertIn("cts_dadd_rn(nan1, nan2)", translated)
+            self.assertIn("cts_dsub_rn(one, nnan)", translated)
+            self.assertIn("cts_dmul_rn(inf, p0)", translated)
+            self.assertIn("cts_dadd_ru(one, tie)", translated)
+            self.assertIn("cts_dfma_rn(nxt, nxt, -dv(prod))", translated)
+            self.assertIn("cts_dfma_rz(big, big, one)", translated)
+            self.assertIn("cts_dsub_rd(one, tie)", translated)
+            self.assertIn("cts_dpack", translated)
+            self.assertNotIn("__dadd_rn(", translated)
+            self.assertNotIn("__dsub_rn(", translated)
+            self.assertNotIn("__fma_rn(", translated)
+            self.assertEqual(translated.count("cts_dadd_rn("), 6)
+            self.assertEqual(translated.count("cts_dfma_rn("), 2)
+        self.assertIn("__dadd_rn", maca)
+        self.assertIn("__fma_rn", maca)
+        self.assertNotIn("cts_dadd_rn", maca)
 
     def test_hip_and_musa_lower_the_census_dround(self) -> None:
         path = CENSUS / "dround" / "main.cu"
@@ -3046,6 +3125,98 @@ int main() {{
     cudaFree(bad);
     return 0;
 }}
+""",
+        )
+
+    def test_directed_double_helpers_agree_with_the_intrinsics(self) -> None:
+        helpers = "\n".join(
+            [
+                DARITH_PACK.strip("\n"),
+                DARITH_ADD.strip("\n"),
+                DARITH_SUB.strip("\n"),
+                DARITH_MUL.strip("\n"),
+                DARITH_FMA.strip("\n"),
+                *(helper.strip("\n") for _name, helper in DARITH_HELPERS.values()),
+            ]
+        )
+        self._nvcc_mismatch(
+            "darith",
+            """\
+#include <cstdio>
+#include <cuda_runtime.h>
+"""
+            + helpers
+            + """
+__device__ __noinline__ unsigned long long ref_add(double x, double y, int mode) {
+    double r = mode == 0 ? __dadd_rn(x, y) : mode == 1 ? __dadd_rz(x, y) : mode == 2 ? __dadd_ru(x, y) : __dadd_rd(x, y);
+    return __double_as_longlong(r);
+}
+__device__ __noinline__ unsigned long long ref_sub(double x, double y, int mode) {
+    double r = mode == 0 ? __dsub_rn(x, y) : mode == 1 ? __dsub_rz(x, y) : mode == 2 ? __dsub_ru(x, y) : __dsub_rd(x, y);
+    return __double_as_longlong(r);
+}
+__device__ __noinline__ unsigned long long ref_mul(double x, double y, int mode) {
+    double r = mode == 0 ? __dmul_rn(x, y) : mode == 1 ? __dmul_rz(x, y) : mode == 2 ? __dmul_ru(x, y) : __dmul_rd(x, y);
+    return __double_as_longlong(r);
+}
+__device__ __noinline__ unsigned long long ref_fma(double x, double y, double z, int mode) {
+    double r = mode == 0 ? __fma_rn(x, y, z) : mode == 1 ? __fma_rz(x, y, z) : mode == 2 ? __fma_ru(x, y, z) : __fma_rd(x, y, z);
+    return __double_as_longlong(r);
+}
+__device__ unsigned long long got_add(double x, double y, int mode) {
+    double r = mode == 0 ? cts_dadd_rn(x, y) : mode == 1 ? cts_dadd_rz(x, y) : mode == 2 ? cts_dadd_ru(x, y) : cts_dadd_rd(x, y);
+    return __double_as_longlong(r);
+}
+__device__ unsigned long long got_sub(double x, double y, int mode) {
+    double r = mode == 0 ? cts_dsub_rn(x, y) : mode == 1 ? cts_dsub_rz(x, y) : mode == 2 ? cts_dsub_ru(x, y) : cts_dsub_rd(x, y);
+    return __double_as_longlong(r);
+}
+__device__ unsigned long long got_mul(double x, double y, int mode) {
+    double r = mode == 0 ? cts_dmul_rn(x, y) : mode == 1 ? cts_dmul_rz(x, y) : mode == 2 ? cts_dmul_ru(x, y) : cts_dmul_rd(x, y);
+    return __double_as_longlong(r);
+}
+__device__ unsigned long long got_fma(double x, double y, double z, int mode) {
+    double r = mode == 0 ? cts_dfma_rn(x, y, z) : mode == 1 ? cts_dfma_rz(x, y, z) : mode == 2 ? cts_dfma_ru(x, y, z) : cts_dfma_rd(x, y, z);
+    return __double_as_longlong(r);
+}
+__global__ void compare(int* bad) {
+    const unsigned long long vals[] = {
+        0ull, 0x8000000000000000ull, 1ull, 0x8000000000000001ull,
+        0x000fffffffffffffull, 0x800fffffffffffffull, 0x0010000000000000ull,
+        0x3ff0000000000000ull, 0x3ff0000000000001ull, 0xbff0000000000000ull,
+        0x3ca0000000000000ull, 0x3c90000000000000ull, 0x7fefffffffffffffull,
+        0xffefffffffffffffull, 0x7ff0000000000000ull, 0xfff0000000000000ull,
+        0x7ff8000000000001ull, 0xfff8000000000005ull, 0x7ff0000000000001ull,
+        0x4000000000000000ull, 0x7fe0000000000000ull, 0x0010000000000001ull,
+        0x3ff0000000000002ull, 0x0000000000000002ull
+    };
+    const int n = 24;
+    for (int i = 0; i < n; ++i) for (int j = 0; j < n; ++j) for (int mode = 0; mode < 4; ++mode) {
+        double x = __longlong_as_double((long long)vals[i]);
+        double y = __longlong_as_double((long long)vals[j]);
+        if (got_add(x, y, mode) != ref_add(x, y, mode)) atomicExch(bad, 1);
+        if (got_sub(x, y, mode) != ref_sub(x, y, mode)) atomicExch(bad, 1);
+        if (got_mul(x, y, mode) != ref_mul(x, y, mode)) atomicExch(bad, 1);
+    }
+    for (int i = 0; i < n; ++i) for (int j = 0; j < n; ++j) for (int k = 0; k < n; k += 3) for (int mode = 0; mode < 4; ++mode) {
+        double x = __longlong_as_double((long long)vals[i]);
+        double y = __longlong_as_double((long long)vals[j]);
+        double z = __longlong_as_double((long long)vals[k]);
+        if (got_fma(x, y, z, mode) != ref_fma(x, y, z, mode)) atomicExch(bad, 1);
+    }
+}
+int main() {
+    int* bad = nullptr;
+    if (cudaMalloc(&bad, sizeof(*bad)) != cudaSuccess) return 2;
+    if (cudaMemset(bad, 0, sizeof(*bad)) != cudaSuccess) return 2;
+    compare<<<1, 1>>>(bad);
+    if (cudaDeviceSynchronize() != cudaSuccess) return 3;
+    int mismatch = 0;
+    if (cudaMemcpy(&mismatch, bad, sizeof(mismatch), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
+    std::printf("mismatch=%d\\n", mismatch);
+    cudaFree(bad);
+    return 0;
+}
 """,
         )
 

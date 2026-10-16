@@ -313,6 +313,17 @@ class Dialect:
     becomes the canonical quiet NaN `0x7fffffff`. Fused multiply-add of
     `(1+2^-23)` squared minus the rounded square is `2^-46`, which a
     rounded product plus the addend loses.
+    `lower_darith` replaces `__dadd_*`, `__dsub_*`, `__dmul_*`, and
+    `__fma_rn`, `__fma_rz`, `__fma_ru`, `__fma_rd`. The double fused
+    multiply-add is spelled `__fma_rn`, not `__dfma_rn`. There is no wider
+    type than double, so the product is rounded from a 106-bit significand.
+    `__dadd_rn` of 1 and `2^-53` stays on 1, and round-up takes the next
+    double. Overflow toward zero stays at the finite maximum. `+0` plus
+    `-0` is `-0` only when rounding toward -inf. A NaN keeps the second
+    operand's sign and payload, and a signaling NaN is quieted. `inf * 0`
+    is the negative quiet NaN `0xfff8000000000000`. `__dsub` does not flip
+    the sign of a NaN. Fused multiply-add of `(1+2^-52)` squared minus the
+    rounded square is `2^-104`, which a rounded product plus the addend loses.
     `lower_half` replaces `__float2half`, `__float2half_*`, and
     `__half2float`. `__float2half` is the nearest-even conversion.
     `__float2half_rn(1+2^-11)` stays on 1 and round-up takes the next
@@ -371,6 +382,7 @@ class Dialect:
     lower_round: bool
     lower_saturate: bool
     lower_farith: bool
+    lower_darith: bool
     lower_half: bool
 
 
@@ -402,6 +414,7 @@ DIALECTS = {
         lower_round=True,
         lower_saturate=True,
         lower_farith=True,
+        lower_darith=True,
         lower_half=True,
     ),
     "musa": Dialect(
@@ -431,6 +444,7 @@ DIALECTS = {
         lower_round=True,
         lower_saturate=True,
         lower_farith=True,
+        lower_darith=True,
         lower_half=True,
     ),
     "maca": Dialect(
@@ -460,6 +474,7 @@ DIALECTS = {
         lower_round=False,
         lower_saturate=False,
         lower_farith=False,
+        lower_darith=False,
         lower_half=False,
     ),
 }
@@ -1861,6 +1876,228 @@ def farith_needs_mul(names: set[str]) -> bool:
 
 def farith_needs_fma(names: set[str]) -> bool:
     return any(name.startswith("cts_fmaf_") for name in names)
+
+
+DARITH_PACK = """
+static __device__ int cts_disnan(unsigned long long x) {
+    return ((x >> 52) & 0x7ff) == 0x7ff && (x & 0xfffffffffffffull);
+}
+
+static __device__ unsigned long long cts_dquiet(unsigned long long x) {
+    return x | 0x0008000000000000ull;
+}
+
+static __device__ unsigned long long cts_dpack(int sign, int exp, unsigned __int128 mag, int mode) {
+    if (mag == 0) return sign ? 0x8000000000000000ull : 0ull;
+    while (mag >= ((unsigned __int128)1 << 117)) { mag >>= 1; exp++; }
+    while (mag < ((unsigned __int128)1 << 116) && exp > 1) { mag <<= 1; exp--; }
+    if (exp < 1 || (exp == 1 && mag < ((unsigned __int128)1 << 116))) {
+        int need = 1 - exp;
+        exp = 0;
+        if (need >= 128) mag = mag ? 1 : 0;
+        else if (need) {
+            unsigned __int128 lost = mag & (((unsigned __int128)1 << need) - 1);
+            mag >>= need;
+            if (lost) mag |= 1;
+        }
+    }
+    unsigned long long rem = (unsigned long long)mag;
+    unsigned long long sig = (unsigned long long)(mag >> 64) & 0x1fffffffffffffull;
+    int toward_inf = sign ? (mode == 3) : (mode == 2);
+    int up = 0;
+    if (mode == 0) up = rem > 0x8000000000000000ull || (rem == 0x8000000000000000ull && (sig & 1ull));
+    else if (toward_inf) up = rem != 0;
+    if (up) {
+        sig += 1ull;
+        if (exp == 0) {
+            if (sig == 0x10000000000000ull) exp = 1;
+        } else if (sig == 0x20000000000000ull) {
+            sig = 0x10000000000000ull;
+            exp++;
+        }
+    }
+    if (exp >= 2047) {
+        int to_inf = (mode == 0) || (sign ? mode == 3 : mode == 2);
+        if (to_inf) return ((unsigned long long)sign << 63) | 0x7ff0000000000000ull;
+        return ((unsigned long long)sign << 63) | 0x7fefffffffffffffull;
+    }
+    if (exp <= 0) return ((unsigned long long)sign << 63) | (sig & 0xfffffffffffffull);
+    return ((unsigned long long)sign << 63) | ((unsigned long long)exp << 52) | (sig & 0xfffffffffffffull);
+}
+"""
+
+DARITH_ADD = """
+static __device__ unsigned long long cts_dadd(unsigned long long a, unsigned long long b, int mode) {
+    if (cts_disnan(a) || cts_disnan(b)) return cts_dquiet(cts_disnan(b) ? b : a);
+    unsigned long long sa = a >> 63, sb = b >> 63;
+    int ea = (int)((a >> 52) & 0x7ff), eb = (int)((b >> 52) & 0x7ff);
+    unsigned long long fa = a & 0xfffffffffffffull, fb = b & 0xfffffffffffffull;
+    if (ea == 2047 || eb == 2047) {
+        if (ea == 2047 && eb == 2047) {
+            return sa == sb ? ((sa << 63) | 0x7ff0000000000000ull) : 0xfff8000000000000ull;
+        }
+        return ea == 2047 ? ((sa << 63) | 0x7ff0000000000000ull) : ((sb << 63) | 0x7ff0000000000000ull);
+    }
+    unsigned __int128 ma, mb;
+    int aexp, bexp;
+    if (ea == 0) { ma = (unsigned __int128)fa << 64; aexp = 1; }
+    else { ma = (unsigned __int128)(fa | 0x10000000000000ull) << 64; aexp = ea; }
+    if (eb == 0) { mb = (unsigned __int128)fb << 64; bexp = 1; }
+    else { mb = (unsigned __int128)(fb | 0x10000000000000ull) << 64; bexp = eb; }
+    if (aexp < bexp || (aexp == bexp && ma < mb)) {
+        unsigned long long ts = sa; sa = sb; sb = ts;
+        int te = aexp; aexp = bexp; bexp = te;
+        unsigned __int128 tm = ma; ma = mb; mb = tm;
+    }
+    int sh = aexp - bexp;
+    if (sh >= 128) mb = mb ? 1 : 0;
+    else if (sh) {
+        unsigned __int128 lost = mb & (((unsigned __int128)1 << sh) - 1);
+        mb >>= sh;
+        if (lost) mb |= 1;
+    }
+    if (sa == sb) return cts_dpack((int)sa, aexp, ma + mb, mode);
+    if (ma == mb) return mode == 3 ? 0x8000000000000000ull : 0ull;
+    return cts_dpack((int)sa, aexp, ma - mb, mode);
+}
+"""
+
+DARITH_SUB = """
+static __device__ unsigned long long cts_dsub(unsigned long long a, unsigned long long b, int mode) {
+    if (cts_disnan(a) || cts_disnan(b)) return cts_dadd(a, b, mode);
+    return cts_dadd(a, b ^ 0x8000000000000000ull, mode);
+}
+"""
+
+DARITH_MUL = """
+static __device__ unsigned long long cts_dmul(unsigned long long a, unsigned long long b, int mode) {
+    if (cts_disnan(a) || cts_disnan(b)) return cts_dquiet(cts_disnan(b) ? b : a);
+    int sign = (int)((a >> 63) ^ (b >> 63));
+    int ea = (int)((a >> 52) & 0x7ff), eb = (int)((b >> 52) & 0x7ff);
+    unsigned long long fa = a & 0xfffffffffffffull, fb = b & 0xfffffffffffffull;
+    if (ea == 2047 || eb == 2047) {
+        int a0 = (ea | fa) == 0, b0 = (eb | fb) == 0;
+        if ((ea == 2047 && b0) || (eb == 2047 && a0)) return 0xfff8000000000000ull;
+        return ((unsigned long long)sign << 63) | 0x7ff0000000000000ull;
+    }
+    if ((ea | fa) == 0 || (eb | fb) == 0) return sign ? 0x8000000000000000ull : 0ull;
+    unsigned __int128 pa = ea ? (fa | 0x10000000000000ull) : fa;
+    unsigned __int128 pb = eb ? (fb | 0x10000000000000ull) : fb;
+    int exp = (ea ? ea : 1) + (eb ? eb : 1) - 1023;
+    unsigned __int128 mag = (pa * pb) << 12;
+    return cts_dpack(sign, exp, mag, mode);
+}
+"""
+
+DARITH_FMA = """
+static __device__ unsigned long long cts_dfma(unsigned long long a, unsigned long long b, unsigned long long c, int mode) {
+    if (cts_disnan(b)) return cts_dquiet(b);
+    if (cts_disnan(c)) return cts_dquiet(c);
+    if (cts_disnan(a)) return cts_dquiet(a);
+    int signp = (int)((a >> 63) ^ (b >> 63));
+    int ea = (int)((a >> 52) & 0x7ff), eb = (int)((b >> 52) & 0x7ff), ec = (int)((c >> 52) & 0x7ff);
+    unsigned long long fa = a & 0xfffffffffffffull, fb = b & 0xfffffffffffffull, fc = c & 0xfffffffffffffull;
+    int a0 = (ea | fa) == 0, b0 = (eb | fb) == 0;
+    int ainf = ea == 2047, binf = eb == 2047, cinf = ec == 2047;
+    unsigned long long sc = c >> 63;
+    if ((ainf && b0) || (binf && a0)) return 0xfff8000000000000ull;
+    if (ainf || binf) {
+        if (cinf && sc != (unsigned long long)signp) return 0xfff8000000000000ull;
+        return ((unsigned long long)signp << 63) | 0x7ff0000000000000ull;
+    }
+    if (cinf) return c;
+    if (a0 || b0) return cts_dadd(signp ? 0x8000000000000000ull : 0ull, c, mode);
+    unsigned __int128 pa = ea ? (fa | 0x10000000000000ull) : fa;
+    unsigned __int128 pb = eb ? (fb | 0x10000000000000ull) : fb;
+    int exp = (ea ? ea : 1) + (eb ? eb : 1) - 1023;
+    unsigned __int128 mag = (pa * pb) << 12;
+    if (mag) {
+        while (mag >= ((unsigned __int128)1 << 117)) { mag >>= 1; exp++; }
+        while (mag < ((unsigned __int128)1 << 116) && exp > 1) { mag <<= 1; exp--; }
+    }
+    if ((ec | fc) == 0) return cts_dpack(signp, exp, mag, mode);
+    unsigned __int128 mc = ec ? ((unsigned __int128)(fc | 0x10000000000000ull) << 64)
+                              : ((unsigned __int128)fc << 64);
+    int cexp = ec ? ec : 1;
+    int sh = exp - cexp;
+    unsigned __int128 acc = mag;
+    if (sh >= 0) {
+        if (sh >= 128) mc = mc ? 1 : 0;
+        else if (sh) {
+            unsigned __int128 lost = mc & (((unsigned __int128)1 << sh) - 1);
+            mc >>= sh;
+            if (lost) mc |= 1;
+        }
+    } else {
+        int shc = -sh;
+        if (shc >= 128) acc = acc ? 1 : 0;
+        else {
+            unsigned __int128 lost = acc & (((unsigned __int128)1 << shc) - 1);
+            acc >>= shc;
+            if (lost) acc |= 1;
+        }
+        exp = cexp;
+    }
+    if ((unsigned long long)signp == sc) return cts_dpack(signp, exp, acc + mc, mode);
+    if (acc == mc) return mode == 3 ? 0x8000000000000000ull : 0ull;
+    if (acc < mc) return cts_dpack((int)sc, exp, mc - acc, mode);
+    return cts_dpack(signp, exp, acc - mc, mode);
+}
+"""
+
+def _darith_binary(kind: str, mode: str) -> str:
+    code = _FARITH_CODE[mode]
+    call = f"cts_d{kind}(x.as_bits, y.as_bits, {code})"
+    return f"""
+static __device__ double cts_d{kind}_{mode}(double a, double b) {{
+    union {{ double as_double; unsigned long long as_bits; }} x, y, out;
+    x.as_double = a;
+    y.as_double = b;
+    out.as_bits = {call};
+    return out.as_double;
+}}
+"""
+
+
+def _darith_fma(mode: str) -> str:
+    code = _FARITH_CODE[mode]
+    return f"""
+static __device__ double cts_dfma_{mode}(double a, double b, double c) {{
+    union {{ double as_double; unsigned long long as_bits; }} x, y, z, out;
+    x.as_double = a;
+    y.as_double = b;
+    z.as_double = c;
+    out.as_bits = cts_dfma(x.as_bits, y.as_bits, z.as_bits, {code});
+    return out.as_double;
+}}
+"""
+
+
+DARITH_HELPERS: dict[str, tuple[str, str]] = {}
+for _kind in ("add", "sub", "mul"):
+    for _mode in ("rn", "rz", "ru", "rd"):
+        DARITH_HELPERS[f"__d{_kind}_{_mode}"] = (f"cts_d{_kind}_{_mode}", _darith_binary(_kind, _mode))
+for _mode in ("rn", "rz", "ru", "rd"):
+    DARITH_HELPERS[f"__fma_{_mode}"] = (f"cts_dfma_{_mode}", _darith_fma(_mode))
+
+
+def darith_needs_add(names: set[str]) -> bool:
+    return any(
+        name.startswith("cts_dadd_") or name.startswith("cts_dsub_") or name.startswith("cts_dfma_")
+        for name in names
+    )
+
+
+def darith_needs_sub(names: set[str]) -> bool:
+    return any(name.startswith("cts_dsub_") for name in names)
+
+
+def darith_needs_mul(names: set[str]) -> bool:
+    return any(name.startswith("cts_dmul_") for name in names)
+
+
+def darith_needs_fma(names: set[str]) -> bool:
+    return any(name.startswith("cts_dfma_") for name in names)
 
 
 # Half keeps 10 explicit bits. A NaN becomes 0x7fff, and widening that NaN
