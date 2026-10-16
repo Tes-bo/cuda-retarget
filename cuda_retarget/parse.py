@@ -24,6 +24,9 @@ class Tok:
     spelling: str
     start: int
     end: int
+    # Result type of a call whose name starts at this token. Only `__hadd`
+    # is recorded: the integer average and the half add share that spelling.
+    call_type: str = ""
 
 
 def _load_libclang() -> None:
@@ -86,17 +89,37 @@ def parse_file(path: Path) -> list[Tok]:
             errors.append(str(diag))
     if errors:
         raise ParseError("\n".join(errors[:8]))
+    real = os.path.realpath(path)
+    half_adds = _half_add_types(tu.cursor, real)
     tokens: list[Tok] = []
     for token in tu.get_tokens(extent=tu.cursor.extent):
         location = token.location
-        if location.file is None or os.path.realpath(str(location.file)) != os.path.realpath(path):
+        if location.file is None or os.path.realpath(str(location.file)) != real:
             continue
+        start = token.extent.start.offset
         tokens.append(
             Tok(
                 kind=token.kind.name,
                 spelling=token.spelling,
-                start=token.extent.start.offset,
+                start=start,
                 end=token.extent.end.offset,
+                call_type=half_adds.get(start, "") if token.spelling == "__hadd" else "",
             )
         )
     return tokens
+
+
+def _half_add_types(cursor: clang.cindex.Cursor, path: str) -> dict[int, str]:
+    found: dict[int, str] = {}
+
+    def walk(node: clang.cindex.Cursor) -> None:
+        loc = node.location
+        if loc.file is not None and os.path.realpath(str(loc.file)) != path:
+            return
+        if node.kind == clang.cindex.CursorKind.CALL_EXPR and node.spelling == "__hadd":
+            found[node.extent.start.offset] = node.type.spelling
+        for child in node.get_children():
+            walk(child)
+
+    walk(cursor)
+    return found

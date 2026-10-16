@@ -327,7 +327,14 @@ class Dialect:
     becomes `0x7fff`, and `-0` stays `-0`. `__half2int_rn` of 1.5 is 2
     and toward zero is 1. A half of 32768 stays 32768 in 32 bits and
     saturates to 32767 in a short. A half NaN becomes 0 for 32-bit and
-    16-bit results, and the high bit for 64-bit results.
+    16-bit results, and the high bit for 64-bit results. `__hadd` and
+    `__hadd_rn` are the same nearest-even add. `+0` plus `-0` is `+0`,
+    and `-0` plus `-0` stays `-0`. A NaN becomes `0x7fff`. Fused
+    multiply-add of `(1+2^-10)` squared minus its rounded square is
+    `2^-20`, which a separate product plus addend loses. The saturate
+    forms clamp to `[0, 1]`, and a NaN or a negative zero becomes `+0`.
+    A direct `__hadd` on `__half` is this add. `__hadd` on `int` stays
+    the overflow-free integer average.
     """
 
     name: str
@@ -2206,6 +2213,198 @@ def half_needs_to_int(names: set[str]) -> bool:
 def half_needs_to_float(names: set[str]) -> bool:
     return any(name.startswith("cts_half2float") for name in names) or half_needs_to_int(names)
 
+
+
+# Half arithmetic is nearest-even only. A NaN is 0x7fff. Exact cancellation
+# of opposite signs is +0. The saturate forms clamp into [0, 1].
+HARITH_ADD = """
+static __device__ unsigned short cts_f16add(unsigned short a, unsigned short b) {
+    unsigned sa = a >> 15, sb = b >> 15;
+    int ea = (a >> 10) & 0x1f, eb = (b >> 10) & 0x1f;
+    unsigned fa = a & 0x3ffu, fb = b & 0x3ffu;
+    if (ea == 31 || eb == 31) {
+        if ((ea == 31 && fa) || (eb == 31 && fb)) return (unsigned short)0x7fff;
+        if (ea == 31 && eb == 31) return sa == sb ? (unsigned short)((sa << 15) | 0x7c00) : (unsigned short)0x7fff;
+        return ea == 31 ? (unsigned short)((sa << 15) | 0x7c00) : (unsigned short)((sb << 15) | 0x7c00);
+    }
+    unsigned long long ma, mb;
+    int aexp, bexp;
+    if (ea == 0) { ma = (unsigned long long)fa << 23; aexp = 1; }
+    else { ma = (unsigned long long)(fa | 0x400u) << 23; aexp = ea; }
+    if (eb == 0) { mb = (unsigned long long)fb << 23; bexp = 1; }
+    else { mb = (unsigned long long)(fb | 0x400u) << 23; bexp = eb; }
+    if (aexp < bexp || (aexp == bexp && ma < mb)) {
+        unsigned ts = sa; sa = sb; sb = ts;
+        int te = aexp; aexp = bexp; bexp = te;
+        unsigned long long tm = ma; ma = mb; mb = tm;
+    }
+    int sh = aexp - bexp;
+    if (sh >= 63) mb = mb ? 1ull : 0ull;
+    else if (sh) {
+        unsigned long long lost = mb & ((1ull << sh) - 1ull);
+        mb >>= sh;
+        if (lost) mb |= 1ull;
+    }
+    if (sa == sb) return cts_hpack((int)sa, aexp, ma + mb, 0);
+    if (ma == mb) return 0;
+    return cts_hpack((int)sa, aexp, ma - mb, 0);
+}
+"""
+
+HARITH_MUL = """
+static __device__ unsigned short cts_f16mul(unsigned short a, unsigned short b) {
+    unsigned sa = a >> 15, sb = b >> 15;
+    int sign = (int)(sa ^ sb);
+    int ea = (a >> 10) & 0x1f, eb = (b >> 10) & 0x1f;
+    unsigned fa = a & 0x3ffu, fb = b & 0x3ffu;
+    if (ea == 31 || eb == 31) {
+        if ((ea == 31 && fa) || (eb == 31 && fb)) return (unsigned short)0x7fff;
+        int a0 = (ea | fa) == 0, b0 = (eb | fb) == 0;
+        if ((ea == 31 && b0) || (eb == 31 && a0)) return (unsigned short)0x7fff;
+        return (unsigned short)((sign << 15) | 0x7c00);
+    }
+    if ((ea | fa) == 0 || (eb | fb) == 0) return (unsigned short)(sign ? 0x8000 : 0);
+    unsigned long long ma = ea ? (fa | 0x400u) : fa;
+    unsigned long long mb = eb ? (fb | 0x400u) : fb;
+    int exp = (ea ? ea : 1) + (eb ? eb : 1) - 15;
+    unsigned long long mag = (ma * mb) << 13;
+    return cts_hpack(sign, exp, mag, 0);
+}
+"""
+
+HARITH_FMA = """
+static __device__ unsigned short cts_f16fma(unsigned short a, unsigned short b, unsigned short c) {
+    unsigned sa = a >> 15, sb = b >> 15, sc = c >> 15;
+    int signp = (int)(sa ^ sb);
+    int ea = (a >> 10) & 0x1f, eb = (b >> 10) & 0x1f, ec = (c >> 10) & 0x1f;
+    unsigned fa = a & 0x3ffu, fb = b & 0x3ffu, fc = c & 0x3ffu;
+    if ((ea == 31 && fa) || (eb == 31 && fb) || (ec == 31 && fc)) return (unsigned short)0x7fff;
+    int a0 = (ea | fa) == 0, b0 = (eb | fb) == 0;
+    int ainf = ea == 31, binf = eb == 31, cinf = ec == 31;
+    if ((ainf && b0) || (binf && a0)) return (unsigned short)0x7fff;
+    if (ainf || binf) {
+        if (cinf && sc != (unsigned)signp) return (unsigned short)0x7fff;
+        return (unsigned short)((signp << 15) | 0x7c00);
+    }
+    if (a0 || b0) return cts_f16add((unsigned short)(signp ? 0x8000 : 0), c);
+    unsigned long long pa = ea ? (fa | 0x400u) : fa;
+    unsigned long long pb = eb ? (fb | 0x400u) : fb;
+    int exp = (ea ? ea : 1) + (eb ? eb : 1) - 15;
+    unsigned long long mag = (pa * pb) << 13;
+    if (mag) {
+        while (mag >= (1ull << 34)) { mag >>= 1; exp++; }
+        while (mag < (1ull << 33) && exp > 1) { mag <<= 1; exp--; }
+    }
+    if ((ec | fc) == 0) return cts_hpack(signp, exp, mag, 0);
+    unsigned long long mc = ec ? ((unsigned long long)(fc | 0x400u) << 23) : ((unsigned long long)fc << 23);
+    int cexp = ec ? ec : 1;
+    int sh = exp - cexp;
+    unsigned long long acc = mag;
+    if (sh >= 0) {
+        if (sh >= 63) mc = mc ? 1ull : 0ull;
+        else if (sh) {
+            unsigned long long lost = mc & ((1ull << sh) - 1ull);
+            mc >>= sh;
+            if (lost) mc |= 1ull;
+        }
+    } else {
+        int shc = -sh;
+        if (shc >= 63) acc = acc ? 1ull : 0ull;
+        else {
+            unsigned long long lost = acc & ((1ull << shc) - 1ull);
+            acc >>= shc;
+            if (lost) acc |= 1ull;
+        }
+        exp = cexp;
+    }
+    if ((unsigned)signp == sc) return cts_hpack(signp, exp, acc + mc, 0);
+    if (acc == mc) return 0;
+    if (acc < mc) return cts_hpack((int)sc, exp, mc - acc, 0);
+    return cts_hpack(signp, exp, acc - mc, 0);
+}
+"""
+
+HARITH_SAT = """
+static __device__ unsigned short cts_f16sat(unsigned short bits) {
+    unsigned sign = bits >> 15;
+    unsigned exp = (bits >> 10) & 0x1f;
+    unsigned frac = bits & 0x3ffu;
+    if ((exp == 31 && frac) || sign) return 0;
+    if (exp >= 15) return (unsigned short)0x3c00;
+    return bits;
+}
+"""
+
+
+def _harith_binary(stem: str, call: str) -> str:
+    return f"""
+static __device__ __half {stem}(__half a, __half b) {{
+    union {{ unsigned short as_bits; __half as_half; }} x, y, out;
+    x.as_half = a;
+    y.as_half = b;
+    out.as_bits = {call};
+    return out.as_half;
+}}
+"""
+
+
+def _harith_fma(stem: str, sat: bool) -> str:
+    call = "cts_f16fma(x.as_bits, y.as_bits, z.as_bits)"
+    if sat:
+        call = f"cts_f16sat({call})"
+    return f"""
+static __device__ __half {stem}(__half a, __half b, __half c) {{
+    union {{ unsigned short as_bits; __half as_half; }} x, y, z, out;
+    x.as_half = a;
+    y.as_half = b;
+    z.as_half = c;
+    out.as_bits = {call};
+    return out.as_half;
+}}
+"""
+
+
+HARITH_HELPERS: dict[str, tuple[str, str]] = {
+    "__hadd": ("cts_f16add", _harith_binary("cts_f16add", "cts_f16add(x.as_bits, y.as_bits)")),
+    "__hsub": (
+        "cts_f16sub",
+        _harith_binary("cts_f16sub", "cts_f16add(x.as_bits, (unsigned short)(y.as_bits ^ 0x8000u))"),
+    ),
+    "__hmul": ("cts_f16mul", _harith_binary("cts_f16mul", "cts_f16mul(x.as_bits, y.as_bits)")),
+    "__hadd_sat": (
+        "cts_f16add_sat",
+        _harith_binary("cts_f16add_sat", "cts_f16sat(cts_f16add(x.as_bits, y.as_bits))"),
+    ),
+    "__hsub_sat": (
+        "cts_f16sub_sat",
+        _harith_binary("cts_f16sub_sat", "cts_f16sat(cts_f16add(x.as_bits, (unsigned short)(y.as_bits ^ 0x8000u)))"),
+    ),
+    "__hmul_sat": (
+        "cts_f16mul_sat",
+        _harith_binary("cts_f16mul_sat", "cts_f16sat(cts_f16mul(x.as_bits, y.as_bits))"),
+    ),
+    "__hfma": ("cts_f16fma", _harith_fma("cts_f16fma", False)),
+    "__hfma_sat": ("cts_f16fma_sat", _harith_fma("cts_f16fma_sat", True)),
+}
+HARITH_HELPERS["__hadd_rn"] = HARITH_HELPERS["__hadd"]
+HARITH_HELPERS["__hsub_rn"] = HARITH_HELPERS["__hsub"]
+HARITH_HELPERS["__hmul_rn"] = HARITH_HELPERS["__hmul"]
+
+
+def harith_needs_add(names: set[str]) -> bool:
+    return any(name.startswith(("cts_f16add", "cts_f16sub", "cts_f16fma")) for name in names)
+
+
+def harith_needs_mul(names: set[str]) -> bool:
+    return any(name.startswith("cts_f16mul") for name in names)
+
+
+def harith_needs_fma(names: set[str]) -> bool:
+    return any(name.startswith("cts_f16fma") for name in names)
+
+
+def harith_needs_sat(names: set[str]) -> bool:
+    return any(name.endswith("_sat") for name in names)
 
 
 def runtime_name(spelling: str, dialect: Dialect) -> str | None:

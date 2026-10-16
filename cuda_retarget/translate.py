@@ -51,6 +51,11 @@ from cuda_retarget.dialect import (
     HALF_HELPERS,
     HALF_TO_FLOAT,
     HALF_TO_INT,
+    HARITH_ADD,
+    HARITH_FMA,
+    HARITH_HELPERS,
+    HARITH_MUL,
+    HARITH_SAT,
     Dialect,
     farith_needs_add,
     farith_needs_fma,
@@ -60,6 +65,10 @@ from cuda_retarget.dialect import (
     half_needs_int,
     half_needs_to_float,
     half_needs_to_int,
+    harith_needs_add,
+    harith_needs_fma,
+    harith_needs_mul,
+    harith_needs_sat,
     round_needs_bits,
     round_needs_d2f,
     round_needs_i32,
@@ -242,7 +251,11 @@ def _call_edit(
         if parsed is None or len(parsed[0]) != 3:
             raise TranslateError("__byte_perm must have three arguments")
         return (token.start, token.end, "cts_byte_perm")
-    if dialect.lower_hadd and token.spelling in HADD_HELPERS:
+    if (
+        dialect.lower_hadd
+        and token.spelling in HADD_HELPERS
+        and not (token.spelling == "__hadd" and _is_half_result(token.call_type))
+    ):
         parsed = _arguments(tokens, index + 1)
         if parsed is None or len(parsed[0]) != 2:
             raise TranslateError(f"{token.spelling} must have two arguments")
@@ -314,6 +327,13 @@ def _call_edit(
             raise TranslateError(f"{token.spelling} must have one argument")
         replacement, _helper = HALF_HELPERS[token.spelling]
         return (token.start, token.end, replacement)
+    if dialect.lower_half and token.spelling in HARITH_HELPERS:
+        parsed = _arguments(tokens, index + 1)
+        arity = 3 if token.spelling.startswith("__hfma") else 2
+        if parsed is None or len(parsed[0]) != arity:
+            raise TranslateError(f"{token.spelling} must have {arity} arguments")
+        replacement, _helper = HARITH_HELPERS[token.spelling]
+        return (token.start, token.end, replacement)
     if dialect.lower_farith and token.spelling in FARITH_HELPERS:
         parsed = _arguments(tokens, index + 1)
         arity = 3 if token.spelling.startswith("__fmaf_") else 2
@@ -322,6 +342,13 @@ def _call_edit(
         replacement, _helper = FARITH_HELPERS[token.spelling]
         return (token.start, token.end, replacement)
     return None
+
+
+def _is_half_result(spelling: str) -> bool:
+    text = spelling.strip()
+    if text.startswith("const "):
+        text = text[len("const ") :].strip()
+    return text == "__half"
 
 
 def _is_define_name(tokens: list[Tok], index: int) -> bool:
@@ -492,6 +519,25 @@ def _helpers(dialect: Dialect, rewritten: str) -> str:
                 if name in seen:
                     continue
                 seen.add(name)
+                blocks.append(helper.strip("\n"))
+        harith = [(name, helper) for name, helper in HARITH_HELPERS.values() if f"{name}(" in rewritten]
+        harith_names = {name for name, _helper in harith}
+        if harith_names:
+            if "cts_hpack(" not in "\n".join(blocks):
+                blocks.append(HALF_FROM_FLOAT.strip("\n"))
+            if harith_needs_add(harith_names):
+                blocks.append(HARITH_ADD.strip("\n"))
+            if harith_needs_mul(harith_names):
+                blocks.append(HARITH_MUL.strip("\n"))
+            if harith_needs_fma(harith_names):
+                blocks.append(HARITH_FMA.strip("\n"))
+            if harith_needs_sat(harith_names):
+                blocks.append(HARITH_SAT.strip("\n"))
+            seen_harith: set[str] = set()
+            for name, helper in harith:
+                if name in seen_harith:
+                    continue
+                seen_harith.add(name)
                 blocks.append(helper.strip("\n"))
     if dialect.lower_farith:
         used = [(name, helper) for name, helper in FARITH_HELPERS.values() if f"{name}(" in rewritten]
