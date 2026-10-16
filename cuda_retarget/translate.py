@@ -56,6 +56,11 @@ from cuda_retarget.dialect import (
     HARITH_HELPERS,
     HARITH_MUL,
     HARITH_SAT,
+    H2_ADD,
+    H2_FMA,
+    H2_HELPERS,
+    H2_MUL,
+    H2_SAT,
     Dialect,
     farith_needs_add,
     farith_needs_fma,
@@ -69,6 +74,13 @@ from cuda_retarget.dialect import (
     harith_needs_fma,
     harith_needs_mul,
     harith_needs_sat,
+    h2_arity,
+    h2_needs_add,
+    h2_needs_fma,
+    h2_needs_from_float,
+    h2_needs_mul,
+    h2_needs_sat,
+    h2_needs_to_float,
     round_needs_bits,
     round_needs_d2f,
     round_needs_i32,
@@ -334,6 +346,13 @@ def _call_edit(
             raise TranslateError(f"{token.spelling} must have {arity} arguments")
         replacement, _helper = HARITH_HELPERS[token.spelling]
         return (token.start, token.end, replacement)
+    if dialect.lower_half and token.spelling in H2_HELPERS:
+        parsed = _arguments(tokens, index + 1)
+        arity = h2_arity(token.spelling)
+        if parsed is None or len(parsed[0]) != arity:
+            raise TranslateError(f"{token.spelling} must have {arity} arguments")
+        replacement, _helper = H2_HELPERS[token.spelling]
+        return (token.start, token.end, replacement)
     if dialect.lower_farith and token.spelling in FARITH_HELPERS:
         parsed = _arguments(tokens, index + 1)
         arity = 3 if token.spelling.startswith("__fmaf_") else 2
@@ -538,6 +557,49 @@ def _helpers(dialect: Dialect, rewritten: str) -> str:
                 if name in seen_harith:
                     continue
                 seen_harith.add(name)
+                blocks.append(helper.strip("\n"))
+        h2 = [(name, helper) for name, helper in H2_HELPERS.values() if f"{name}(" in rewritten]
+        h2_names = {name for name, _helper in h2}
+        if h2_names:
+            joined = "\n".join(blocks)
+            needs_pack = (
+                h2_needs_from_float(h2_names)
+                or h2_needs_add(h2_names)
+                or h2_needs_mul(h2_names)
+                or h2_needs_fma(h2_names)
+            )
+            if needs_pack and "cts_hpack(" not in joined:
+                blocks.append(HALF_FROM_FLOAT.strip("\n"))
+                joined = "\n".join(blocks)
+            if h2_needs_to_float(h2_names) and "cts_h2f(" not in joined:
+                blocks.append(HALF_TO_FLOAT.strip("\n"))
+                joined = "\n".join(blocks)
+            if (h2_needs_add(h2_names) or h2_needs_fma(h2_names)) and (
+                "static __device__ unsigned short cts_f16add(" not in joined
+            ):
+                blocks.append(HARITH_ADD.strip("\n"))
+                joined = "\n".join(blocks)
+            if h2_needs_mul(h2_names) and "static __device__ unsigned short cts_f16mul(" not in joined:
+                blocks.append(HARITH_MUL.strip("\n"))
+                joined = "\n".join(blocks)
+            if h2_needs_fma(h2_names) and "static __device__ unsigned short cts_f16fma(" not in joined:
+                blocks.append(HARITH_FMA.strip("\n"))
+                joined = "\n".join(blocks)
+            if h2_needs_sat(h2_names) and "static __device__ unsigned short cts_f16sat(" not in joined:
+                blocks.append(HARITH_SAT.strip("\n"))
+            if h2_needs_add(h2_names):
+                blocks.append(H2_ADD.strip("\n"))
+            if h2_needs_mul(h2_names):
+                blocks.append(H2_MUL.strip("\n"))
+            if h2_needs_fma(h2_names):
+                blocks.append(H2_FMA.strip("\n"))
+            if h2_needs_sat(h2_names):
+                blocks.append(H2_SAT.strip("\n"))
+            seen_h2: set[str] = set()
+            for name, helper in h2:
+                if name in seen_h2:
+                    continue
+                seen_h2.add(name)
                 blocks.append(helper.strip("\n"))
     if dialect.lower_farith:
         used = [(name, helper) for name, helper in FARITH_HELPERS.values() if f"{name}(" in rewritten]

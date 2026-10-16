@@ -334,7 +334,10 @@ class Dialect:
     `2^-20`, which a separate product plus addend loses. The saturate
     forms clamp to `[0, 1]`, and a NaN or a negative zero becomes `+0`.
     A direct `__hadd` on `__half` is this add. `__hadd` on `int` stays
-    the overflow-free integer average.
+    the overflow-free integer average. `__hadd2` and the other packed
+    forms run that operation on each lane of a `__half2`. The low lane
+    is the low 16 bits. A NaN in one lane stays in that lane.
+    `__floats2half2_rn` puts the first float in the low lane.
     """
 
     name: str
@@ -2391,20 +2394,281 @@ HARITH_HELPERS["__hsub_rn"] = HARITH_HELPERS["__hsub"]
 HARITH_HELPERS["__hmul_rn"] = HARITH_HELPERS["__hmul"]
 
 
+def _scalar_half_name(name: str, stem: str) -> bool:
+    return name.startswith(stem) and not name.startswith(stem + "2")
+
+
 def harith_needs_add(names: set[str]) -> bool:
-    return any(name.startswith(("cts_f16add", "cts_f16sub", "cts_f16fma")) for name in names)
+    return any(
+        _scalar_half_name(name, "cts_f16add")
+        or _scalar_half_name(name, "cts_f16sub")
+        or _scalar_half_name(name, "cts_f16fma")
+        for name in names
+    )
 
 
 def harith_needs_mul(names: set[str]) -> bool:
-    return any(name.startswith("cts_f16mul") for name in names)
+    return any(_scalar_half_name(name, "cts_f16mul") for name in names)
 
 
 def harith_needs_fma(names: set[str]) -> bool:
-    return any(name.startswith("cts_f16fma") for name in names)
+    return any(_scalar_half_name(name, "cts_f16fma") for name in names)
 
 
 def harith_needs_sat(names: set[str]) -> bool:
     return any(name.endswith("_sat") for name in names)
+
+
+# Packed half2 is two independent lanes. The low lane occupies bits 0..15.
+H2_ADD = """
+static __device__ unsigned cts_f16add2(unsigned a, unsigned b) {
+    unsigned lo = cts_f16add((unsigned short)a, (unsigned short)b);
+    unsigned hi = cts_f16add((unsigned short)(a >> 16), (unsigned short)(b >> 16));
+    return lo | (hi << 16);
+}
+"""
+
+H2_MUL = """
+static __device__ unsigned cts_f16mul2(unsigned a, unsigned b) {
+    unsigned lo = cts_f16mul((unsigned short)a, (unsigned short)b);
+    unsigned hi = cts_f16mul((unsigned short)(a >> 16), (unsigned short)(b >> 16));
+    return lo | (hi << 16);
+}
+"""
+
+H2_FMA = """
+static __device__ unsigned cts_f16fma2(unsigned a, unsigned b, unsigned c) {
+    unsigned lo = cts_f16fma((unsigned short)a, (unsigned short)b, (unsigned short)c);
+    unsigned hi = cts_f16fma((unsigned short)(a >> 16), (unsigned short)(b >> 16), (unsigned short)(c >> 16));
+    return lo | (hi << 16);
+}
+"""
+
+H2_SAT = """
+static __device__ unsigned cts_f16sat2(unsigned bits) {
+    unsigned lo = cts_f16sat((unsigned short)bits);
+    unsigned hi = cts_f16sat((unsigned short)(bits >> 16));
+    return lo | (hi << 16);
+}
+"""
+
+
+def _h2_binary(stem: str, call: str) -> str:
+    return f"""
+static __device__ __half2 {stem}(__half2 a, __half2 b) {{
+    union {{ __half2 as_h; unsigned as_bits; }} x, y, out;
+    x.as_h = a;
+    y.as_h = b;
+    out.as_bits = {call};
+    return out.as_h;
+}}
+"""
+
+
+def _h2_ternary(stem: str, call: str) -> str:
+    return f"""
+static __device__ __half2 {stem}(__half2 a, __half2 b, __half2 c) {{
+    union {{ __half2 as_h; unsigned as_bits; }} x, y, z, out;
+    x.as_h = a;
+    y.as_h = b;
+    z.as_h = c;
+    out.as_bits = {call};
+    return out.as_h;
+}}
+"""
+
+
+H2_HELPERS: dict[str, tuple[str, str]] = {
+    "__hadd2": ("cts_f16add2", _h2_binary("cts_f16add2", "cts_f16add2(x.as_bits, y.as_bits)")),
+    "__hsub2": ("cts_f16sub2", _h2_binary("cts_f16sub2", "cts_f16add2(x.as_bits, y.as_bits ^ 0x80008000u)")),
+    "__hmul2": ("cts_f16mul2", _h2_binary("cts_f16mul2", "cts_f16mul2(x.as_bits, y.as_bits)")),
+    "__hadd2_sat": (
+        "cts_f16add2_sat",
+        _h2_binary("cts_f16add2_sat", "cts_f16sat2(cts_f16add2(x.as_bits, y.as_bits))"),
+    ),
+    "__hsub2_sat": (
+        "cts_f16sub2_sat",
+        _h2_binary("cts_f16sub2_sat", "cts_f16sat2(cts_f16add2(x.as_bits, y.as_bits ^ 0x80008000u))"),
+    ),
+    "__hmul2_sat": (
+        "cts_f16mul2_sat",
+        _h2_binary("cts_f16mul2_sat", "cts_f16sat2(cts_f16mul2(x.as_bits, y.as_bits))"),
+    ),
+    "__hfma2": ("cts_f16fma2", _h2_ternary("cts_f16fma2", "cts_f16fma2(x.as_bits, y.as_bits, z.as_bits)")),
+    "__hfma2_sat": (
+        "cts_f16fma2_sat",
+        _h2_ternary("cts_f16fma2_sat", "cts_f16sat2(cts_f16fma2(x.as_bits, y.as_bits, z.as_bits))"),
+    ),
+    "__float2half2_rn": (
+        "cts_float2half2_rn",
+        """
+static __device__ __half2 cts_float2half2_rn(float a) {
+    union { __half2 as_h; unsigned as_bits; } out;
+    unsigned bits = cts_f2h(a, 0);
+    out.as_bits = bits | (bits << 16);
+    return out.as_h;
+}
+""",
+    ),
+    "__floats2half2_rn": (
+        "cts_floats2half2_rn",
+        """
+static __device__ __half2 cts_floats2half2_rn(float a, float b) {
+    union { __half2 as_h; unsigned as_bits; } out;
+    out.as_bits = cts_f2h(a, 0) | (cts_f2h(b, 0) << 16);
+    return out.as_h;
+}
+""",
+    ),
+    "__float22half2_rn": (
+        "cts_float22half2_rn",
+        """
+static __device__ __half2 cts_float22half2_rn(float2 a) {
+    union { __half2 as_h; unsigned as_bits; } out;
+    out.as_bits = cts_f2h(a.x, 0) | (cts_f2h(a.y, 0) << 16);
+    return out.as_h;
+}
+""",
+    ),
+    "__half22float2": (
+        "cts_half22float2",
+        """
+static __device__ float2 cts_half22float2(__half2 a) {
+    union { __half2 as_h; unsigned as_bits; } in;
+    in.as_h = a;
+    return make_float2(cts_h2f((unsigned short)in.as_bits), cts_h2f((unsigned short)(in.as_bits >> 16)));
+}
+""",
+    ),
+    "__halves2half2": (
+        "cts_halves2half2",
+        """
+static __device__ __half2 cts_halves2half2(__half a, __half b) {
+    union { unsigned short as_bits; __half as_half; } lo, hi;
+    union { __half2 as_h; unsigned as_bits; } out;
+    lo.as_half = a;
+    hi.as_half = b;
+    out.as_bits = (unsigned)lo.as_bits | ((unsigned)hi.as_bits << 16);
+    return out.as_h;
+}
+""",
+    ),
+    "__low2half": (
+        "cts_low2half",
+        """
+static __device__ __half cts_low2half(__half2 a) {
+    union { __half2 as_h; unsigned as_bits; } in;
+    union { unsigned short as_bits; __half as_half; } lo;
+    in.as_h = a;
+    lo.as_bits = (unsigned short)in.as_bits;
+    return lo.as_half;
+}
+""",
+    ),
+    "__high2half": (
+        "cts_high2half",
+        """
+static __device__ __half cts_high2half(__half2 a) {
+    union { __half2 as_h; unsigned as_bits; } in;
+    union { unsigned short as_bits; __half as_half; } hi;
+    in.as_h = a;
+    hi.as_bits = (unsigned short)(in.as_bits >> 16);
+    return hi.as_half;
+}
+""",
+    ),
+    "__low2half2": (
+        "cts_low2half2",
+        """
+static __device__ __half2 cts_low2half2(__half2 a) {
+    union { __half2 as_h; unsigned as_bits; } in, out;
+    in.as_h = a;
+    unsigned lo = in.as_bits & 0xffffu;
+    out.as_bits = lo | (lo << 16);
+    return out.as_h;
+}
+""",
+    ),
+    "__high2half2": (
+        "cts_high2half2",
+        """
+static __device__ __half2 cts_high2half2(__half2 a) {
+    union { __half2 as_h; unsigned as_bits; } in, out;
+    in.as_h = a;
+    unsigned hi = in.as_bits >> 16;
+    out.as_bits = hi | (hi << 16);
+    return out.as_h;
+}
+""",
+    ),
+    "__lows2half2": (
+        "cts_lows2half2",
+        """
+static __device__ __half2 cts_lows2half2(__half2 a, __half2 b) {
+    union { __half2 as_h; unsigned as_bits; } x, y, out;
+    x.as_h = a;
+    y.as_h = b;
+    out.as_bits = (x.as_bits & 0xffffu) | ((y.as_bits & 0xffffu) << 16);
+    return out.as_h;
+}
+""",
+    ),
+    "__highs2half2": (
+        "cts_highs2half2",
+        """
+static __device__ __half2 cts_highs2half2(__half2 a, __half2 b) {
+    union { __half2 as_h; unsigned as_bits; } x, y, out;
+    x.as_h = a;
+    y.as_h = b;
+    out.as_bits = (x.as_bits >> 16) | ((y.as_bits >> 16) << 16);
+    return out.as_h;
+}
+""",
+    ),
+}
+H2_HELPERS["__hadd2_rn"] = H2_HELPERS["__hadd2"]
+H2_HELPERS["__hsub2_rn"] = H2_HELPERS["__hsub2"]
+H2_HELPERS["__hmul2_rn"] = H2_HELPERS["__hmul2"]
+
+
+def h2_arity(spelling: str) -> int:
+    if spelling.startswith("__hfma2"):
+        return 3
+    if spelling in {
+        "__float2half2_rn",
+        "__float22half2_rn",
+        "__half22float2",
+        "__low2half",
+        "__high2half",
+        "__low2half2",
+        "__high2half2",
+    }:
+        return 1
+    return 2
+
+
+def h2_needs_add(names: set[str]) -> bool:
+    return any(name.startswith(("cts_f16add2", "cts_f16sub2")) for name in names)
+
+
+def h2_needs_mul(names: set[str]) -> bool:
+    return any(name.startswith("cts_f16mul2") for name in names)
+
+
+def h2_needs_fma(names: set[str]) -> bool:
+    return any(name.startswith("cts_f16fma2") for name in names)
+
+
+def h2_needs_sat(names: set[str]) -> bool:
+    return any(name.endswith("_sat") for name in names)
+
+
+def h2_needs_from_float(names: set[str]) -> bool:
+    return any(name.startswith(("cts_float2half2_", "cts_floats2half2_", "cts_float22half2_")) for name in names)
+
+
+def h2_needs_to_float(names: set[str]) -> bool:
+    return any(name.startswith("cts_half22float2") for name in names)
 
 
 def runtime_name(spelling: str, dialect: Dialect) -> str | None:

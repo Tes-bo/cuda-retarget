@@ -64,7 +64,7 @@ Comments and string literals stay. A name inside a `#define` is rewritten at the
 | `musa` | the same rule with the `musa` prefix | `musa_runtime.h` | unchanged | lowered |
 | `maca` | unchanged | `cuda_runtime.h` | unchanged | unchanged |
 
-The helpers are bitcasts and double hi/lo words, funnel shifts, `__dp4a`, packed add/sub/min/max/abs, `__byte_perm`, averages, high-half products, absolute differences, packed absolute-difference sums, comparison masks, lane predicates, packed averages, bit scans, 24-bit products, rounding conversions, double-to-float rounding, float-to-half rounding, integer and double conversions into half, half-to-integer conversions, half add, multiply, fused multiply-add, `__saturatef`, and directed float add, sub, mul, and fused multiply-add.
+The helpers are bitcasts and double hi/lo words, funnel shifts, `__dp4a`, packed add/sub/min/max/abs, `__byte_perm`, averages, high-half products, absolute differences, packed absolute-difference sums, comparison masks, lane predicates, packed averages, bit scans, 24-bit products, rounding conversions, double-to-float rounding, float-to-half rounding, integer and double conversions into half, half-to-integer conversions, half add, multiply, fused multiply-add, packed half2 arithmetic, `__saturatef`, and directed float add, sub, mul, and fused multiply-add.
 
 Inserted helpers are `static __device__` and sit after the last `#include`.
 
@@ -112,6 +112,9 @@ These are the results a prefix swap gets wrong. HIP and MUSA both get the helper
 | a NaN operand of `__hadd` | `32767`. The sign and payload are dropped |
 | `__hfma` of `(1+2^-10)` squared minus the rounded square | `16` (`2^-20`). The separate product plus that square cancels to `0` |
 | `__hadd_sat` of a NaN, of `-0`, or of a value above 1 | `+0`, `+0`, or `1` |
+| `__hadd2` with a NaN in the low lane and `1+1` in the high lane | low `32767`, high `16384`, packed word `1073774591` |
+| `__hfma2` low lane of `(1+2^-10)` squared minus its rounded square | packed word `16`. The high lane can be `0` |
+| `__floats2half2_rn(1+2^-11, 65520)` | low lane `1`, high lane `+inf`, packed word `2080390144` |
 | `__saturatef` of a NaN or of `-0` | `+0`. Values outside `[0, 1]` clamp |
 | `__fadd_ru` of 1 and a value below one ulp | the next float above 1. The nearest-even tie stays on the even float |
 | `__fadd_rd(+0, -0)` / `__fadd_rd(+0, +0)` | `-0` / `+0`. Same-sign zeros keep their sign |

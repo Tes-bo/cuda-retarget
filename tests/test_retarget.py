@@ -52,6 +52,11 @@ from cuda_retarget.dialect import (
     HARITH_HELPERS,
     HARITH_MUL,
     HARITH_SAT,
+    H2_ADD,
+    H2_FMA,
+    H2_HELPERS,
+    H2_MUL,
+    H2_SAT,
     PACKED_AVG_HELPERS,
     PACKED_CMP_HELPERS,
     PACKED_SAD_HELPERS,
@@ -858,6 +863,7 @@ __global__ void calc(__half a, __half b, __half c, __half* o) {
             self.assertNotIn("__hfma(", translated)
             self.assertNotIn("__hadd_sat(", translated)
             self.assertNotIn("cts_hadd(", translated)
+            self.assertNotIn("cts_f16add2(", translated)
             self.assertEqual(translated.count("cts_f16add(a, b)"), 2)
         only = """\
 #include <cuda_fp16.h>
@@ -879,6 +885,69 @@ __global__ void both(int a, int b, __half h, __half g, int* s, __half* o) {
         self.assertIn("cts_f16add(h, g)", mixed)
         self.assertIn("(x & y) + ((x ^ y) >> 1)", mixed)
         self.assertIn("cts_hpack(", mixed)
+        self.assertEqual(translate_source(source, "maca"), source)
+
+    def test_hip_and_musa_lower_half2(self) -> None:
+        source = """\
+#include <cuda_fp16.h>
+__global__ void calc(__half2 a, __half2 b, __half2 c, float x, float y, float2 f, __half2* o, float* g) {
+    const char* label = "__hadd2 __hfma2 __floats2half2_rn";
+    o[0] = __hadd2(a, b);
+    o[1] = __hadd2_rn(a, b);
+    o[2] = __hsub2(a, b);
+    o[3] = __hmul2(a, b);
+    o[4] = __hfma2(a, b, c);
+    o[5] = __hadd2_sat(a, b);
+    o[6] = __hfma2_sat(a, b, c);
+    o[7] = __float2half2_rn(x);
+    o[8] = __floats2half2_rn(x, y);
+    o[9] = __float22half2_rn(f);
+    o[10] = __lows2half2(a, b);
+    o[11] = __highs2half2(a, b);
+    o[12] = __low2half2(a);
+    g[0] = __half22float2(a).x;
+    o[13] = __halves2half2(__low2half(a), __high2half(b));
+}
+"""
+        for target in ("hip", "musa"):
+            translated = translate_source(source, target)
+            self.assertIn('"__hadd2 __hfma2 __floats2half2_rn"', translated)
+            self.assertIn("cts_f16add2(a, b)", translated)
+            self.assertIn("cts_f16sub2(a, b)", translated)
+            self.assertIn("cts_f16mul2(a, b)", translated)
+            self.assertIn("cts_f16fma2(a, b, c)", translated)
+            self.assertIn("cts_f16add2_sat(a, b)", translated)
+            self.assertIn("cts_f16fma2_sat(a, b, c)", translated)
+            self.assertIn("cts_float2half2_rn(x)", translated)
+            self.assertIn("cts_floats2half2_rn(x, y)", translated)
+            self.assertIn("cts_float22half2_rn(f)", translated)
+            self.assertIn("cts_lows2half2(a, b)", translated)
+            self.assertIn("cts_highs2half2(a, b)", translated)
+            self.assertIn("cts_half22float2(a)", translated)
+            self.assertIn("cts_hpack(", translated)
+            self.assertIn("cts_h2f(", translated)
+            self.assertIn("cts_f16sat2(", translated)
+            self.assertNotIn("__hadd2(", translated)
+            self.assertNotIn("__hfma2(", translated)
+            self.assertNotIn("__floats2half2_rn(", translated)
+            self.assertNotIn("cts_hadd(", translated)
+            self.assertEqual(translated.count("cts_f16add2(a, b)"), 2)
+        mul = """\
+#include <cuda_fp16.h>
+__global__ void mul(__half2 a, __half2 b, __half2* o) { *o = __hmul2(a, b); }
+"""
+        hip = translate_source(mul, "hip")
+        self.assertIn("cts_f16mul2(", hip)
+        self.assertNotIn("cts_f16add(", hip)
+        self.assertNotIn("cts_f16fma(", hip)
+        lane = """\
+#include <cuda_fp16.h>
+__global__ void lane(__half2 a, __half* o) { *o = __low2half(a); }
+"""
+        hip = translate_source(lane, "hip")
+        self.assertIn("cts_low2half(", hip)
+        self.assertNotIn("cts_f16add(", hip)
+        self.assertNotIn("cts_hpack(", hip)
         self.assertEqual(translate_source(source, "maca"), source)
 
     def test_unparsed_source_is_refused(self) -> None:
@@ -1424,6 +1493,36 @@ class CorpusTests(unittest.TestCase):
         self.assertIn("__hadd", maca)
         self.assertIn("__hfma", maca)
         self.assertNotIn("cts_f16add", maca)
+
+    def test_hip_and_musa_lower_the_census_half2(self) -> None:
+        path = CENSUS / "half2" / "main.cu"
+        if not path.is_file():
+            self.skipTest("half2 is not in the census corpus")
+        hip = translate_path(path, "hip")
+        musa = translate_path(path, "musa")
+        maca = translate_path(path, "maca")
+        for translated in (hip, musa):
+            self.assertIn("cts_f16add2(p0m0, m0p0)", translated)
+            self.assertIn("cts_f16add2(m0m0, m0m0)", translated)
+            self.assertIn("cts_f16mul2(m0p0, p0m0)", translated)
+            self.assertIn("cts_f16sub2(m0p0, p0m0)", translated)
+            self.assertIn("cts_f16fma2(nxt, nxt, neg)", translated)
+            self.assertIn("cts_floats2half2_rn(1.0f + 0x1p-11f, 65520.0f)", translated)
+            self.assertIn("cts_float22half2_rn(wide)", translated)
+            self.assertIn("cts_half22float2(", translated)
+            self.assertIn("cts_lows2half2(left, right)", translated)
+            self.assertIn("cts_highs2half2(left, right)", translated)
+            self.assertIn("cts_hpack(", translated)
+            self.assertNotIn("__hadd2(", translated)
+            self.assertNotIn("__hadd2_rn(", translated)
+            self.assertNotIn("__hmul2(", translated)
+            self.assertNotIn("__hfma2(", translated)
+            self.assertNotIn("__floats2half2_rn(", translated)
+            self.assertNotIn("cts_hadd(", translated)
+            self.assertEqual(translated.count("cts_f16add2(p0m0, m0p0)"), 2)
+        self.assertIn("__hadd2", maca)
+        self.assertIn("__hfma2", maca)
+        self.assertNotIn("cts_f16add2", maca)
 
     def test_only_hip_pins_warp_size(self) -> None:
         path = CENSUS / "warp_size" / "main.cu"
@@ -3179,6 +3278,112 @@ __global__ void compare(int* bad) {{
     if (__half_as_ushort(__hadd_sat(nan, one)) != __half_as_ushort(cts_f16add_sat(nan, one))) atomicExch(bad, 1);
     if (__half_as_ushort(__hadd_sat(m0, m0)) != 0) atomicExch(bad, 1);
     if (__half_as_ushort(cts_f16add_sat(pinf, p0)) != 0x3c00) atomicExch(bad, 1);
+}}
+int main() {{
+    int* bad = nullptr;
+    if (cudaMalloc(&bad, sizeof(*bad)) != cudaSuccess) return 2;
+    if (cudaMemset(bad, 0, sizeof(*bad)) != cudaSuccess) return 2;
+    compare<<<1, 1>>>(bad);
+    if (cudaDeviceSynchronize() != cudaSuccess) return 3;
+    int mismatch = 0;
+    if (cudaMemcpy(&mismatch, bad, sizeof(mismatch), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
+    std::printf("mismatch=%d\\n", mismatch);
+    cudaFree(bad);
+    return 0;
+}}
+""",
+        )
+
+    def test_half2_helpers_agree_with_the_intrinsics(self) -> None:
+        skip = {"__hadd2_rn", "__hsub2_rn", "__hmul2_rn"}
+        wrappers = "\n".join(
+            body.strip("\n")
+            for key, (_name, body) in H2_HELPERS.items()
+            if key not in skip
+        )
+        helpers = "\n".join(
+            [
+                HALF_FROM_FLOAT.strip("\n"),
+                HALF_TO_FLOAT.strip("\n"),
+                HARITH_ADD.strip("\n"),
+                HARITH_MUL.strip("\n"),
+                HARITH_FMA.strip("\n"),
+                HARITH_SAT.strip("\n"),
+                H2_ADD.strip("\n"),
+                H2_MUL.strip("\n"),
+                H2_FMA.strip("\n"),
+                H2_SAT.strip("\n"),
+                wrappers,
+            ]
+        )
+        self._nvcc_mismatch(
+            "half2",
+            f"""\
+#include <cstdio>
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+{helpers}
+__device__ unsigned word(__half2 h) {{
+    union {{ __half2 as_h; unsigned as_bits; }} in;
+    in.as_h = h;
+    return in.as_bits;
+}}
+__device__ __half2 lanes(unsigned short lo, unsigned short hi) {{
+    return __halves2half2(__ushort_as_half(lo), __ushort_as_half(hi));
+}}
+__global__ void compare(int* bad) {{
+    for (unsigned a = 0; a < 65536u; a += 128u) {{
+        for (unsigned b = 0; b < 65536u; b += 128u) {{
+            __half2 ha = lanes((unsigned short)a, (unsigned short)(a ^ 0x8000u));
+            __half2 hb = lanes((unsigned short)b, (unsigned short)(b ^ 0x00ffu));
+            if (word(__hadd2(ha, hb)) != word(cts_f16add2(ha, hb))) atomicExch(bad, 1);
+            if (word(__hadd2_rn(ha, hb)) != word(cts_f16add2(ha, hb))) atomicExch(bad, 1);
+            if (word(__hsub2(ha, hb)) != word(cts_f16sub2(ha, hb))) atomicExch(bad, 1);
+            if (word(__hmul2(ha, hb)) != word(cts_f16mul2(ha, hb))) atomicExch(bad, 1);
+            if (word(__hadd2_sat(ha, hb)) != word(cts_f16add2_sat(ha, hb))) atomicExch(bad, 1);
+            if (word(__hmul2_sat(ha, hb)) != word(cts_f16mul2_sat(ha, hb))) atomicExch(bad, 1);
+        }}
+    }}
+    for (unsigned a = 0; a < 65536u; a += 512u) {{
+        for (unsigned b = 0; b < 65536u; b += 520u) {{
+            for (unsigned c = 0; c < 65536u; c += 528u) {{
+                __half2 ha = lanes((unsigned short)a, (unsigned short)(a ^ 0x1111u));
+                __half2 hb = lanes((unsigned short)b, (unsigned short)(b ^ 0x2222u));
+                __half2 hc = lanes((unsigned short)c, (unsigned short)(c ^ 0x3333u));
+                if (word(__hfma2(ha, hb, hc)) != word(cts_f16fma2(ha, hb, hc))) atomicExch(bad, 1);
+                if (word(__hfma2_sat(ha, hb, hc)) != word(cts_f16fma2_sat(ha, hb, hc))) atomicExch(bad, 1);
+            }}
+        }}
+    }}
+    __half2 p0m0 = lanes(0x0000, 0x8000);
+    __half2 m0p0 = lanes(0x8000, 0x0000);
+    __half2 m0m0 = lanes(0x8000, 0x8000);
+    __half2 one = lanes(0x3c00, 0x3c00);
+    __half2 nxt = lanes(0x3c01, 0x3c00);
+    __half2 nanone = lanes(0x7fff, 0x3c00);
+    volatile unsigned prod_bits = word(__hmul2(nxt, nxt));
+    unsigned pb = prod_bits;
+    __half2 prod = lanes((unsigned short)pb, (unsigned short)(pb >> 16));
+    __half2 neg = lanes((unsigned short)((pb & 0xffffu) ^ 0x8000u), (unsigned short)((pb >> 16) ^ 0x8000u));
+    if (word(__hadd2(prod, neg)) != 0) atomicExch(bad, 1);
+    if (word(cts_f16fma2(nxt, nxt, neg)) != 16) atomicExch(bad, 1);
+    if (word(__hfma2(nxt, nxt, neg)) != word(cts_f16fma2(nxt, nxt, neg))) atomicExch(bad, 1);
+    if (word(__hadd2(nanone, one)) != 1073774591u) atomicExch(bad, 1);
+    if (word(cts_f16add2(nanone, one)) != word(__hadd2(nanone, one))) atomicExch(bad, 1);
+    if (word(__hadd2(m0m0, m0m0)) != 2147516416u) atomicExch(bad, 1);
+    if (word(__hadd2(p0m0, m0p0)) != 0) atomicExch(bad, 1);
+    if (word(cts_float2half2_rn(1.0f + 0x1p-11f)) != 1006648320u) atomicExch(bad, 1);
+    if (word(cts_floats2half2_rn(1.0f + 0x1p-11f, 65520.0f)) != 2080390144u) atomicExch(bad, 1);
+    float2 wide = make_float2(1.0f + 0x1p-11f, 65520.0f);
+    if (word(cts_float22half2_rn(wide)) != word(__float22half2_rn(wide))) atomicExch(bad, 1);
+    float2 back = cts_half22float2(lanes(0x3c00, 0xbc00));
+    if (__float_as_uint(back.x) != 1065353216u) atomicExch(bad, 1);
+    if (__float_as_uint(back.y) != 3212836864u) atomicExch(bad, 1);
+    __half2 left = lanes(1, 2);
+    __half2 right = lanes(3, 4);
+    if (word(__lows2half2(left, right)) != word(cts_lows2half2(left, right))) atomicExch(bad, 1);
+    if (word(__highs2half2(left, right)) != word(cts_highs2half2(left, right))) atomicExch(bad, 1);
+    if (word(cts_low2half2(lanes(0x3c01, 0x3c02))) != 1006713857u) atomicExch(bad, 1);
 }}
 int main() {{
     int* bad = nullptr;
