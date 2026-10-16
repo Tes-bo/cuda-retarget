@@ -42,6 +42,13 @@ from cuda_retarget.dialect import (
     FDIV_ROUND,
     FDIV_RSQRT,
     FDIV_SQRT,
+    DMIN_LESS,
+    DMIN_MINMAX,
+    DMIN_NEXT,
+    FMIN_HELPERS,
+    FMIN_LESS,
+    FMIN_MINMAX,
+    FMIN_NEXT,
     DARITH_ADD,
     DARITH_FMA,
     DARITH_HELPERS,
@@ -809,6 +816,75 @@ __global__ void divide(float* f) { *f = __fsqrt_rn(*f); }
         self.assertNotIn("cts_fdiv(", hip)
         self.assertEqual(translate_source(source, "maca"), source)
 
+    def test_hip_and_musa_lower_minmax_and_nextafter(self) -> None:
+        source = """\
+#include <cuda_runtime.h>
+__global__ void hold(float* f) {
+    float fmin = *f;
+    *f = fmin;
+}
+__global__ void pick(float* f, double* d) {
+    const char* label = "fminf fmaxf fmin fmax nextafterf nextafter copysignf copysign";
+    *f = fminf(*f, -0.0f);
+    *f = fmaxf(*f, 1.0f);
+    *f = nextafterf(*f, 0.0f);
+    *f = copysignf(*f, -0.0f);
+    *d = fmin(*d, -0.0);
+    *d = fmax(*d, 1.0);
+    *d = nextafter(*d, 1.0);
+    *d = copysign(*d, -0.0);
+    *f += label[0];
+}
+"""
+        for target in ("hip", "musa"):
+            translated = translate_source(source, target)
+            self.assertIn('"fminf fmaxf fmin fmax nextafterf nextafter copysignf copysign"', translated)
+            self.assertIn("float fmin = *f;", translated)
+            self.assertIn("*f = fmin;", translated)
+            self.assertIn("cts_fminf(*f, -0.0f)", translated)
+            self.assertIn("cts_fmaxf(*f, 1.0f)", translated)
+            self.assertIn("cts_nextafterf(*f, 0.0f)", translated)
+            self.assertIn("cts_copysignf(*f, -0.0f)", translated)
+            self.assertIn("cts_fmin(*d, -0.0)", translated)
+            self.assertIn("cts_nextafter(*d, 1.0)", translated)
+            self.assertIn("cts_copysign(*d, -0.0)", translated)
+            self.assertIn("cts_fless", translated)
+            self.assertIn("cts_fminmax", translated)
+            self.assertIn("cts_dminmax", translated)
+            self.assertIn("cts_dnext", translated)
+            self.assertNotIn("(fminf(", translated)
+            self.assertNotIn("(nextafterf(", translated)
+            self.assertNotIn("(copysignf(", translated)
+        copy_only = """\
+#include <cuda_runtime.h>
+__global__ void pick(float* f) { *f = copysignf(*f, -1.0f); }
+"""
+        hip = translate_source(copy_only, "hip")
+        self.assertIn("cts_copysignf(", hip)
+        self.assertNotIn("cts_fless", hip)
+        self.assertNotIn("cts_fminmax", hip)
+        self.assertNotIn("cts_dless", hip)
+        float_only = """\
+#include <cuda_runtime.h>
+__global__ void pick(float* f) { *f = fminf(*f, 1.0f); }
+"""
+        hip = translate_source(float_only, "hip")
+        self.assertIn("cts_fless", hip)
+        self.assertIn("cts_fminmax", hip)
+        self.assertNotIn("cts_fnext", hip)
+        self.assertNotIn("cts_dless", hip)
+        self.assertNotIn("cts_dminmax", hip)
+        step_only = """\
+#include <cuda_runtime.h>
+__global__ void pick(double* d) { *d = nextafter(*d, 1.0); }
+"""
+        hip = translate_source(step_only, "hip")
+        self.assertIn("cts_dless", hip)
+        self.assertIn("cts_dnext", hip)
+        self.assertNotIn("cts_dminmax", hip)
+        self.assertNotIn("cts_fless", hip)
+        self.assertEqual(translate_source(source, "maca"), source)
+
     def test_hip_and_musa_lower_double_rounding(self) -> None:
         source = """\
 #include <cuda_runtime.h>
@@ -1570,6 +1646,42 @@ class CorpusTests(unittest.TestCase):
         self.assertIn("__fdiv_rn", maca)
         self.assertIn("__frsqrt_rn", maca)
         self.assertNotIn("cts_fdiv_rn", maca)
+
+    def test_hip_and_musa_lower_the_census_fminmax(self) -> None:
+        path = CENSUS / "fminmax" / "main.cu"
+        if not path.is_file():
+            self.skipTest("fminmax is not in the census corpus")
+        hip = translate_path(path, "hip")
+        musa = translate_path(path, "musa")
+        maca = translate_path(path, "maca")
+        for translated in (hip, musa):
+            self.assertIn("cts_fminf(p0, m0)", translated)
+            self.assertIn("cts_fmaxf(m0, m0)", translated)
+            self.assertIn("cts_fminf(nan1, nan2)", translated)
+            self.assertIn("cts_nextafterf(p0, m0)", translated)
+            self.assertIn("cts_nextafterf(nan1, one)", translated)
+            self.assertIn("cts_copysignf(nan1, m0)", translated)
+            self.assertIn("cts_copysignf(sig, m0)", translated)
+            self.assertIn("cts_fmin(dnan1, dnan5)", translated)
+            self.assertIn("cts_nextafter(dnan1, done)", translated)
+            self.assertIn("cts_copysign(dnan1, dm0)", translated)
+            self.assertIn("cts_fless", translated)
+            self.assertIn("cts_dnext", translated)
+            self.assertNotIn("(fminf(", translated)
+            self.assertNotIn("(nextafterf(", translated)
+            self.assertNotIn("(fmin(", translated)
+            self.assertNotIn("(copysign(", translated)
+            self.assertEqual(translated.count("cts_fminf("), 7)
+            self.assertEqual(translated.count("cts_fmaxf("), 5)
+            self.assertEqual(translated.count("cts_nextafterf("), 8)
+            self.assertEqual(translated.count("cts_copysignf("), 3)
+            self.assertEqual(translated.count("cts_fmin("), 4)
+            self.assertEqual(translated.count("cts_fmax("), 3)
+            self.assertEqual(translated.count("cts_nextafter("), 4)
+            self.assertEqual(translated.count("cts_copysign("), 2)
+        self.assertIn("fminf(", maca)
+        self.assertIn("nextafter(", maca)
+        self.assertNotIn("cts_fminf", maca)
 
     def test_hip_and_musa_lower_the_census_dround(self) -> None:
         path = CENSUS / "dround" / "main.cu"
@@ -3353,6 +3465,96 @@ int main() {
     int mismatch = 0;
     if (cudaMemcpy(&mismatch, bad, sizeof(mismatch), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
     std::printf("mismatch=%d\\n", mismatch);
+    cudaFree(bad);
+    return 0;
+}
+""",
+        )
+
+    def test_minmax_helpers_agree_with_the_intrinsics(self) -> None:
+        helpers = "\n".join(
+            [
+                FMIN_LESS.strip("\n"),
+                FMIN_MINMAX.strip("\n"),
+                FMIN_NEXT.strip("\n"),
+                DMIN_LESS.strip("\n"),
+                DMIN_MINMAX.strip("\n"),
+                DMIN_NEXT.strip("\n"),
+                *(helper.strip("\n") for _name, helper in FMIN_HELPERS.values()),
+            ]
+        )
+        self._nvcc_mismatch(
+            "fminmax",
+            """\
+#include <cstdio>
+#include <cuda_runtime.h>
+"""
+            + helpers
+            + """
+__global__ void compare(const unsigned* fv, const unsigned long long* dv, int* bad) {
+    for (int i = 0; i < 16; ++i) for (int j = 0; j < 16; ++j) {
+        float x = __uint_as_float(fv[i]);
+        float y = __uint_as_float(fv[j]);
+        if (__float_as_uint(cts_fminf(x, y)) != __float_as_uint(fminf(x, y))) atomicExch(bad, 1);
+        if (__float_as_uint(cts_fmaxf(x, y)) != __float_as_uint(fmaxf(x, y))) atomicExch(bad, 1);
+        if (__float_as_uint(cts_nextafterf(x, y)) != __float_as_uint(nextafterf(x, y))) atomicExch(bad, 1);
+        if (__float_as_uint(cts_copysignf(x, y)) != __float_as_uint(copysignf(x, y))) atomicExch(bad, 1);
+    }
+    for (int i = 0; i < 16; ++i) for (int j = 0; j < 16; ++j) {
+        union { double d; unsigned long long u; } x, y, r, g;
+        x.u = dv[i];
+        y.u = dv[j];
+        r.d = fmin(x.d, y.d);
+        if (cts_dminmax(x.u, y.u, 0) != r.u) atomicExch(bad, 1);
+        r.d = fmax(x.d, y.d);
+        if (cts_dminmax(x.u, y.u, 1) != r.u) atomicExch(bad, 1);
+        r.d = copysign(x.d, y.d);
+        g.d = cts_copysign(x.d, y.d);
+        if (g.u != r.u) atomicExch(bad, 1);
+        r.d = nextafter(x.d, y.d);
+        g.d = cts_nextafter(x.d, y.d);
+        if (g.u != r.u) atomicExch(bad, 1);
+    }
+    if (__float_as_uint(fminf(__uint_as_float(fv[13]), __uint_as_float(fv[14]))) != 0x7fffffffu)
+        atomicExch(bad, 1);
+    if (__float_as_uint(cts_copysignf(__uint_as_float(fv[13]), __uint_as_float(fv[1]))) != 0xffc00001u)
+        atomicExch(bad, 1);
+    if (cts_dminmax(dv[12], dv[13], 0) != dv[13]) atomicExch(bad, 1);
+    union { double d; unsigned long long u; } limit, step, got, ref;
+    limit.d = 3.40282346638528859811704183484516925e+38;
+    step.d = 1.0e308;
+    got.d = cts_nextafter(limit.d, step.d);
+    ref.d = nextafter(limit.d, step.d);
+    if (got.u != ref.u) atomicExch(bad, 1);
+}
+int main() {
+    unsigned fv[16] = {
+        0u, 0x80000000u, 1u, 0x80000001u, 0x007fffffu, 0x00800000u, 0x3f800000u,
+        0x3f800001u, 0xbf800000u, 0x7f7fffffu, 0x7f800000u, 0xff800000u,
+        0xff7fffffu, 0x7fc00001u, 0xffc00002u, 0x7f800001u
+    };
+    unsigned long long dv[16] = {
+        0ull, 0x8000000000000000ull, 1ull, 0x8000000000000001ull, 0x000fffffffffffffull,
+        0x0010000000000000ull, 0x3ff0000000000000ull, 0x3ff0000000000001ull, 0xbff0000000000000ull,
+        0x7fefffffffffffffull, 0x7ff0000000000000ull, 0xfff0000000000000ull,
+        0x7ff8000000000001ull, 0x7ff8000000000005ull, 0xfff8000000000002ull, 0x7ff0000000000002ull
+    };
+    unsigned* device_fv = nullptr;
+    unsigned long long* device_dv = nullptr;
+    int* bad = nullptr;
+    if (cudaMalloc(&device_fv, sizeof(fv)) != cudaSuccess) return 2;
+    if (cudaMalloc(&device_dv, sizeof(dv)) != cudaSuccess) return 2;
+    if (cudaMalloc(&bad, sizeof(*bad)) != cudaSuccess) return 2;
+    if (cudaMemcpy(device_fv, fv, sizeof(fv), cudaMemcpyHostToDevice) != cudaSuccess) return 2;
+    if (cudaMemcpy(device_dv, dv, sizeof(dv), cudaMemcpyHostToDevice) != cudaSuccess) return 2;
+    if (cudaMemset(bad, 0, sizeof(*bad)) != cudaSuccess) return 2;
+    compare<<<1, 1>>>(device_fv, device_dv, bad);
+    if (cudaDeviceSynchronize() != cudaSuccess) return 3;
+    int mismatch = 0;
+    if (cudaMemcpy(&mismatch, bad, sizeof(mismatch), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
+    std::printf("mismatch=%d\\n", mismatch);
+    cudaFree(device_fv);
+    cudaFree(device_dv);
     cudaFree(bad);
     return 0;
 }

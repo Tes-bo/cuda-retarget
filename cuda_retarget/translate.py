@@ -46,6 +46,13 @@ from cuda_retarget.dialect import (
     FDIV_ROUND,
     FDIV_RSQRT,
     FDIV_SQRT,
+    FMIN_HELPERS,
+    FMIN_LESS,
+    FMIN_MINMAX,
+    FMIN_NEXT,
+    DMIN_LESS,
+    DMIN_MINMAX,
+    DMIN_NEXT,
     DARITH_ADD,
     DARITH_FMA,
     DARITH_HELPERS,
@@ -82,6 +89,12 @@ from cuda_retarget.dialect import (
     fdiv_needs_div,
     fdiv_needs_rsqrt,
     fdiv_needs_sqrt,
+    fmin_needs_dless,
+    fmin_needs_dminmax,
+    fmin_needs_dnext,
+    fmin_needs_fless,
+    fmin_needs_fminmax,
+    fmin_needs_fnext,
     darith_needs_add,
     darith_needs_fma,
     darith_needs_mul,
@@ -395,6 +408,16 @@ def _call_edit(
             raise TranslateError(f"{token.spelling} must have {arity} arguments")
         replacement, _helper = FDIV_HELPERS[token.spelling]
         return (token.start, token.end, replacement)
+    if dialect.lower_fmin and token.spelling in FMIN_HELPERS:
+        if _is_define_name(tokens, index) or _is_declared_here(tokens, index):
+            return None
+        parsed = _arguments(tokens, index + 1)
+        if parsed is None:
+            return None
+        if len(parsed[0]) != 2:
+            raise TranslateError(f"{token.spelling} must have two arguments")
+        replacement, _helper = FMIN_HELPERS[token.spelling]
+        return (token.start, token.end, replacement)
     if dialect.lower_darith and token.spelling in DARITH_HELPERS:
         parsed = _arguments(tokens, index + 1)
         arity = 3 if token.spelling.startswith("__fma_") else 2
@@ -419,8 +442,38 @@ def _is_half_result(spelling: str) -> bool:
     return text == "__half"
 
 
+_TYPE_BEFORE = {
+    "float",
+    "double",
+    "int",
+    "void",
+    "auto",
+    "char",
+    "short",
+    "long",
+    "unsigned",
+    "signed",
+    "bool",
+    "const",
+    "volatile",
+    "static",
+    "__device__",
+    "__host__",
+    "__global__",
+    "__forceinline__",
+    "__inline__",
+    "*",
+    "&",
+    "&&",
+}
+
+
 def _is_define_name(tokens: list[Tok], index: int) -> bool:
     return index >= 2 and tokens[index - 2].spelling == "#" and tokens[index - 1].spelling == "define"
+
+
+def _is_declared_here(tokens: list[Tok], index: int) -> bool:
+    return index > 0 and tokens[index - 1].spelling in _TYPE_BEFORE
 
 
 def _arguments(tokens: list[Tok], open_index: int) -> tuple[list[tuple[int, int]], int] | None:
@@ -713,6 +766,24 @@ def _helpers(dialect: Dialect, rewritten: str) -> str:
                 blocks.append(FDIV_SQRT.strip("\n"))
             if fdiv_needs_rsqrt(names):
                 blocks.append(FDIV_RSQRT.strip("\n"))
+            for _name, helper in used:
+                blocks.append(helper.strip("\n"))
+    if dialect.lower_fmin:
+        used = [(name, helper) for name, helper in FMIN_HELPERS.values() if f"{name}(" in rewritten]
+        names = {name for name, _helper in used}
+        if names:
+            if fmin_needs_fless(names):
+                blocks.append(FMIN_LESS.strip("\n"))
+            if fmin_needs_fminmax(names):
+                blocks.append(FMIN_MINMAX.strip("\n"))
+            if fmin_needs_fnext(names):
+                blocks.append(FMIN_NEXT.strip("\n"))
+            if fmin_needs_dless(names):
+                blocks.append(DMIN_LESS.strip("\n"))
+            if fmin_needs_dminmax(names):
+                blocks.append(DMIN_MINMAX.strip("\n"))
+            if fmin_needs_dnext(names):
+                blocks.append(DMIN_NEXT.strip("\n"))
             for _name, helper in used:
                 blocks.append(helper.strip("\n"))
     return "\n\n".join(blocks)

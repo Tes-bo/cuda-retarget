@@ -64,7 +64,7 @@ Comments and string literals stay. A name inside a `#define` is rewritten at the
 | `musa` | the same rule with the `musa` prefix | `musa_runtime.h` | unchanged | lowered |
 | `maca` | unchanged | `cuda_runtime.h` | unchanged | unchanged |
 
-The helpers are bitcasts and double hi/lo words, funnel shifts, `__dp4a`, packed add/sub/min/max/abs, `__byte_perm`, averages, high-half products, absolute differences, packed absolute-difference sums, comparison masks, lane predicates, packed averages, bit scans, 24-bit products, rounding conversions, double-to-float rounding, float-to-half rounding, integer and double conversions into half, half-to-integer conversions, half add, multiply, fused multiply-add, packed half2 arithmetic, half comparisons, `__saturatef`, directed float add, sub, mul, and fused multiply-add, directed double add, sub, mul, and fused multiply-add, and directed float division, reciprocal, square root, and reciprocal square root.
+The helpers are bitcasts and double hi/lo words, funnel shifts, `__dp4a`, packed add/sub/min/max/abs, `__byte_perm`, averages, high-half products, absolute differences, packed absolute-difference sums, comparison masks, lane predicates, packed averages, bit scans, 24-bit products, rounding conversions, double-to-float rounding, float-to-half rounding, integer and double conversions into half, half-to-integer conversions, half add, multiply, fused multiply-add, packed half2 arithmetic, half comparisons, `__saturatef`, directed float add, sub, mul, and fused multiply-add, directed double add, sub, mul, and fused multiply-add, directed float division, reciprocal, square root, and reciprocal square root, and `fmin`/`fmax`, `nextafter`, and `copysign`.
 
 Inserted helpers are `static __device__` and sit after the last `#include`.
 
@@ -140,6 +140,12 @@ These are the results a prefix swap gets wrong. HIP and MUSA both get the helper
 | `__fdiv_rd` of an overflowing positive quotient | the finite maximum `2139095039` |
 | `__frsqrt_rn` of the normal `0x187fffff` | `1392508928`. The reciprocal of the rounded square root is `1392508929` |
 | `__frsqrt_rn(-0)` | `-inf` |
+| `fminf(+0, -0)` / `fmaxf(+0, -0)` | `-0` / `+0`. `fmaxf(-0, -0)` stays `-0` |
+| two float NaNs passed to `fminf` | the canonical quiet NaN `2147483647`. A number wins over one NaN |
+| `nextafterf(+0, -0)` | `-0`. `nextafterf(+0, +inf)` is the smallest subnormal |
+| `nextafterf` of a NaN | the canonical quiet NaN `2147483647` |
+| two double NaNs passed to `fmin` or `nextafter` | the second NaN, quieted (`9221120237041090565` for payloads 1 then 5) |
+| `copysignf` of NaN payload `0x7fc00001` and `-0` | `4290772993`. The payload stays |
 | `__mul24` | the high 8 bits are ignored. The square of the minimum 24-bit value keeps a low half of `0` |
 | `__clz(0)` / `__clzll(0)` / `__ffs(0)` | `32` / `64` / `0` |
 | `__dp4a` of a `0x80` byte | `-128` signed, `128` unsigned |

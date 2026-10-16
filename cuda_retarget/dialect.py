@@ -331,6 +331,16 @@ class Dialect:
     in the other modes. Overflow toward -inf stays at the finite maximum.
     `__frsqrt_rn` of the normal `0x187fffff` is `0x53000000`; the reciprocal
     of the rounded square root is the next float.
+    `lower_fmin` replaces `fminf`, `fmaxf`, `fmin`, `fmax`, `nextafterf`,
+    `nextafter`, `copysignf`, and `copysign`. `fminf(+0, -0)` is `-0` and
+    `fmaxf(+0, -0)` is `+0`. A float NaN loses to a number. Two float NaNs
+    become the canonical quiet NaN `0x7fffffff`. `nextafterf(+0, -0)` is
+    `-0`, and `nextafterf(+0, +inf)` is the smallest subnormal. A float
+    `nextafterf` with a NaN operand is that same canonical NaN. Two double
+    NaNs passed to `fmin`, `fmax`, or `nextafter` keep the second operand,
+    and a signaling NaN is quieted. One NaN passed to `nextafter` returns
+    that NaN, quieted.
+    `copysign` keeps the magnitude, including a NaN payload.
     `lower_half` replaces `__float2half`, `__float2half_*`, and
     `__half2float`. `__float2half` is the nearest-even conversion.
     `__float2half_rn(1+2^-11)` stays on 1 and round-up takes the next
@@ -391,6 +401,7 @@ class Dialect:
     lower_farith: bool
     lower_darith: bool
     lower_fdiv: bool
+    lower_fmin: bool
     lower_half: bool
 
 
@@ -424,6 +435,7 @@ DIALECTS = {
         lower_farith=True,
         lower_darith=True,
         lower_fdiv=True,
+        lower_fmin=True,
         lower_half=True,
     ),
     "musa": Dialect(
@@ -455,6 +467,7 @@ DIALECTS = {
         lower_farith=True,
         lower_darith=True,
         lower_fdiv=True,
+        lower_fmin=True,
         lower_half=True,
     ),
     "maca": Dialect(
@@ -486,6 +499,7 @@ DIALECTS = {
         lower_farith=False,
         lower_darith=False,
         lower_fdiv=False,
+        lower_fmin=False,
         lower_half=False,
     ),
 }
@@ -2301,6 +2315,172 @@ def fdiv_needs_sqrt(names: set[str]) -> bool:
 
 def fdiv_needs_rsqrt(names: set[str]) -> bool:
     return any(name.startswith("cts_frsqrt_") for name in names)
+
+
+# Float NaNs become 0x7fffffff. Signed zeros: min is -0 when either is -0,
+# max is +0 when either is +0. Two double NaNs passed to min or max keep
+# the second operand. nextafter does the same when both operands are NaN,
+# and returns the one NaN operand, quieted, when the other is a number.
+FMIN_LESS = """
+static __device__ int cts_fless(unsigned a, unsigned b) {
+    unsigned sa = a >> 31;
+    unsigned sb = b >> 31;
+    if (sa != sb) return (int)sa;
+    if (sa == 0u) return a < b;
+    return a > b;
+}
+"""
+
+FMIN_MINMAX = """
+static __device__ unsigned cts_fminmax(unsigned a, unsigned b, int is_max) {
+    int na = ((a >> 23) & 0xffu) == 0xffu && (a & 0x7fffffu);
+    int nb = ((b >> 23) & 0xffu) == 0xffu && (b & 0x7fffffu);
+    if (na && nb) return 0x7fffffffu;
+    if (na) return b;
+    if (nb) return a;
+    if (((a << 1) == 0u) && ((b << 1) == 0u)) {
+        if (!is_max) return (a | b) & 0x80000000u;
+        return (a & b) & 0x80000000u;
+    }
+    if (a == b) return a;
+    int less = cts_fless(a, b);
+    if (is_max) return less ? b : a;
+    return less ? a : b;
+}
+"""
+
+FMIN_NEXT = """
+static __device__ unsigned cts_fnext(unsigned x, unsigned y) {
+    int xnan = ((x >> 23) & 0xffu) == 0xffu && (x & 0x7fffffu);
+    int ynan = ((y >> 23) & 0xffu) == 0xffu && (y & 0x7fffffu);
+    if (xnan || ynan) return 0x7fffffffu;
+    if (((x << 1) == 0u) && ((y << 1) == 0u)) return y;
+    if (x == y) return x;
+    if ((x << 1) == 0u) return (y & 0x80000000u) | 1u;
+    int up = cts_fless(x, y);
+    unsigned neg = x >> 31;
+    if (up) return neg ? x - 1u : x + 1u;
+    return neg ? x + 1u : x - 1u;
+}
+"""
+
+DMIN_LESS = """
+static __device__ int cts_dless(unsigned long long a, unsigned long long b) {
+    unsigned long long sa = a >> 63;
+    unsigned long long sb = b >> 63;
+    if (sa != sb) return (int)sa;
+    if (sa == 0ull) return a < b;
+    return a > b;
+}
+"""
+
+DMIN_MINMAX = """
+static __device__ unsigned long long cts_dminmax(unsigned long long a, unsigned long long b, int is_max) {
+    int na = ((a >> 52) & 0x7ffull) == 0x7ffull && (a & 0xfffffffffffffull);
+    int nb = ((b >> 52) & 0x7ffull) == 0x7ffull && (b & 0xfffffffffffffull);
+    if (na && nb) return b | 0x0008000000000000ull;
+    if (na) return b;
+    if (nb) return a;
+    if (((a << 1) == 0ull) && ((b << 1) == 0ull)) {
+        if (!is_max) return (a | b) & 0x8000000000000000ull;
+        return (a & b) & 0x8000000000000000ull;
+    }
+    if (a == b) return a;
+    int less = cts_dless(a, b);
+    if (is_max) return less ? b : a;
+    return less ? a : b;
+}
+"""
+
+DMIN_NEXT = """
+static __device__ unsigned long long cts_dnext(unsigned long long x, unsigned long long y) {
+    int xnan = ((x >> 52) & 0x7ffull) == 0x7ffull && (x & 0xfffffffffffffull);
+    int ynan = ((y >> 52) & 0x7ffull) == 0x7ffull && (y & 0xfffffffffffffull);
+    if (ynan) return y | 0x0008000000000000ull;
+    if (xnan) return x | 0x0008000000000000ull;
+    if (((x << 1) == 0ull) && ((y << 1) == 0ull)) return y;
+    if (x == y) return x;
+    if ((x << 1) == 0ull) return (y & 0x8000000000000000ull) | 1ull;
+    int up = cts_dless(x, y);
+    unsigned long long neg = x >> 63;
+    if (up) return neg ? x - 1ull : x + 1ull;
+    return neg ? x + 1ull : x - 1ull;
+}
+"""
+
+
+def _fmin_float(name: str, expr: str) -> str:
+    return f"""
+static __device__ float {name}(float a, float b) {{
+    union {{ float as_float; unsigned as_bits; }} x, y, out;
+    x.as_float = a;
+    y.as_float = b;
+    out.as_bits = {expr};
+    return out.as_float;
+}}
+"""
+
+
+def _fmin_double(name: str, expr: str) -> str:
+    return f"""
+static __device__ double {name}(double a, double b) {{
+    union {{ double as_double; unsigned long long as_bits; }} x, y, out;
+    x.as_double = a;
+    y.as_double = b;
+    out.as_bits = {expr};
+    return out.as_double;
+}}
+"""
+
+
+FMIN_HELPERS: dict[str, tuple[str, str]] = {
+    "fminf": ("cts_fminf", _fmin_float("cts_fminf", "cts_fminmax(x.as_bits, y.as_bits, 0)")),
+    "fmaxf": ("cts_fmaxf", _fmin_float("cts_fmaxf", "cts_fminmax(x.as_bits, y.as_bits, 1)")),
+    "fmin": ("cts_fmin", _fmin_double("cts_fmin", "cts_dminmax(x.as_bits, y.as_bits, 0)")),
+    "fmax": ("cts_fmax", _fmin_double("cts_fmax", "cts_dminmax(x.as_bits, y.as_bits, 1)")),
+    "nextafterf": ("cts_nextafterf", _fmin_float("cts_nextafterf", "cts_fnext(x.as_bits, y.as_bits)")),
+    "nextafter": ("cts_nextafter", _fmin_double("cts_nextafter", "cts_dnext(x.as_bits, y.as_bits)")),
+    "copysignf": (
+        "cts_copysignf",
+        _fmin_float("cts_copysignf", "(x.as_bits & 0x7fffffffu) | (y.as_bits & 0x80000000u)"),
+    ),
+    "copysign": (
+        "cts_copysign",
+        _fmin_double(
+            "cts_copysign",
+            "(x.as_bits & 0x7fffffffffffffffull) | (y.as_bits & 0x8000000000000000ull)",
+        ),
+    ),
+}
+
+_FMIN_FLOAT_CMP = {"cts_fminf", "cts_fmaxf"}
+_FMIN_FLOAT_NEXT = {"cts_nextafterf"}
+_FMIN_DOUBLE_CMP = {"cts_fmin", "cts_fmax"}
+_FMIN_DOUBLE_NEXT = {"cts_nextafter"}
+
+
+def fmin_needs_fless(names: set[str]) -> bool:
+    return bool(names & (_FMIN_FLOAT_CMP | _FMIN_FLOAT_NEXT))
+
+
+def fmin_needs_fminmax(names: set[str]) -> bool:
+    return bool(names & _FMIN_FLOAT_CMP)
+
+
+def fmin_needs_fnext(names: set[str]) -> bool:
+    return bool(names & _FMIN_FLOAT_NEXT)
+
+
+def fmin_needs_dless(names: set[str]) -> bool:
+    return bool(names & (_FMIN_DOUBLE_CMP | _FMIN_DOUBLE_NEXT))
+
+
+def fmin_needs_dminmax(names: set[str]) -> bool:
+    return bool(names & _FMIN_DOUBLE_CMP)
+
+
+def fmin_needs_dnext(names: set[str]) -> bool:
+    return bool(names & _FMIN_DOUBLE_NEXT)
 
 
 # Half keeps 10 explicit bits. A NaN becomes 0x7fff, and widening that NaN
