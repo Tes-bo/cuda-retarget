@@ -40,6 +40,12 @@ from cuda_retarget.dialect import (
     ROUND_I32,
     ROUND_I64,
     SATURATE_HELPERS,
+    FDIV_DIV,
+    FDIV_HELPERS,
+    FDIV_ISQRT,
+    FDIV_ROUND,
+    FDIV_RSQRT,
+    FDIV_SQRT,
     DARITH_ADD,
     DARITH_FMA,
     DARITH_HELPERS,
@@ -73,6 +79,9 @@ from cuda_retarget.dialect import (
     HPRED_NAN,
     HPRED_SIGN,
     Dialect,
+    fdiv_needs_div,
+    fdiv_needs_rsqrt,
+    fdiv_needs_sqrt,
     darith_needs_add,
     darith_needs_fma,
     darith_needs_mul,
@@ -379,6 +388,13 @@ def _call_edit(
             raise TranslateError(f"{token.spelling} must have {arity} arguments")
         replacement, _helper = HPRED_HELPERS[token.spelling]
         return (token.start, token.end, replacement)
+    if dialect.lower_fdiv and token.spelling in FDIV_HELPERS:
+        parsed = _arguments(tokens, index + 1)
+        arity = 2 if token.spelling.startswith("__fdiv_") else 1
+        if parsed is None or len(parsed[0]) != arity:
+            raise TranslateError(f"{token.spelling} must have {arity} arguments")
+        replacement, _helper = FDIV_HELPERS[token.spelling]
+        return (token.start, token.end, replacement)
     if dialect.lower_darith and token.spelling in DARITH_HELPERS:
         parsed = _arguments(tokens, index + 1)
         arity = 3 if token.spelling.startswith("__fma_") else 2
@@ -679,6 +695,24 @@ def _helpers(dialect: Dialect, rewritten: str) -> str:
                 blocks.append(DARITH_MUL.strip("\n"))
             if darith_needs_fma(names):
                 blocks.append(DARITH_FMA.strip("\n"))
+            for _name, helper in used:
+                blocks.append(helper.strip("\n"))
+    if dialect.lower_fdiv:
+        used = [(name, helper) for name, helper in FDIV_HELPERS.values() if f"{name}(" in rewritten]
+        names = {name for name, _helper in used}
+        if names:
+            joined = "\n".join(blocks)
+            if "static __device__ unsigned cts_fpack(" not in joined:
+                blocks.append(FARITH_PACK.strip("\n"))
+            blocks.append(FDIV_ROUND.strip("\n"))
+            if fdiv_needs_div(names):
+                blocks.append(FDIV_DIV.strip("\n"))
+            if fdiv_needs_sqrt(names) or fdiv_needs_rsqrt(names):
+                blocks.append(FDIV_ISQRT.strip("\n"))
+            if fdiv_needs_sqrt(names):
+                blocks.append(FDIV_SQRT.strip("\n"))
+            if fdiv_needs_rsqrt(names):
+                blocks.append(FDIV_RSQRT.strip("\n"))
             for _name, helper in used:
                 blocks.append(helper.strip("\n"))
     return "\n\n".join(blocks)

@@ -324,6 +324,13 @@ class Dialect:
     is the negative quiet NaN `0xfff8000000000000`. `__dsub` does not flip
     the sign of a NaN. Fused multiply-add of `(1+2^-52)` squared minus the
     rounded square is `2^-104`, which a rounded product plus the addend loses.
+    `lower_fdiv` replaces `__fdiv_*`, `__frcp_*`, `__fsqrt_*`, and
+    `__frsqrt_rn`. `__frcp_rn(x)` is `__fdiv_rn(1, x)`. `0/0` and a negative
+    square root are the canonical quiet NaN `0x7fffffff`. `sqrt(-0)` stays
+    `-0`. A tiny quotient rounds up to the smallest subnormal and stays `0`
+    in the other modes. Overflow toward -inf stays at the finite maximum.
+    `__frsqrt_rn` of the normal `0x187fffff` is `0x53000000`; the reciprocal
+    of the rounded square root is the next float.
     `lower_half` replaces `__float2half`, `__float2half_*`, and
     `__half2float`. `__float2half` is the nearest-even conversion.
     `__float2half_rn(1+2^-11)` stays on 1 and round-up takes the next
@@ -383,6 +390,7 @@ class Dialect:
     lower_saturate: bool
     lower_farith: bool
     lower_darith: bool
+    lower_fdiv: bool
     lower_half: bool
 
 
@@ -415,6 +423,7 @@ DIALECTS = {
         lower_saturate=True,
         lower_farith=True,
         lower_darith=True,
+        lower_fdiv=True,
         lower_half=True,
     ),
     "musa": Dialect(
@@ -445,6 +454,7 @@ DIALECTS = {
         lower_saturate=True,
         lower_farith=True,
         lower_darith=True,
+        lower_fdiv=True,
         lower_half=True,
     ),
     "maca": Dialect(
@@ -475,6 +485,7 @@ DIALECTS = {
         lower_saturate=False,
         lower_farith=False,
         lower_darith=False,
+        lower_fdiv=False,
         lower_half=False,
     ),
 }
@@ -2098,6 +2109,198 @@ def darith_needs_mul(names: set[str]) -> bool:
 
 def darith_needs_fma(names: set[str]) -> bool:
     return any(name.startswith("cts_dfma_") for name in names)
+
+
+FDIV_ISQRT = """
+static __device__ unsigned long long cts_isqrt(unsigned __int128 x, int* sticky) {
+    unsigned __int128 rem = 0;
+    unsigned long long root = 0;
+    for (int i = 63; i >= 0; --i) {
+        rem = (rem << 2) | ((x >> (2 * i)) & 3);
+        unsigned __int128 trial = ((unsigned __int128)root << 2) | 1;
+        if (rem >= trial) {
+            rem -= trial;
+            root = (root << 1) | 1ull;
+        } else {
+            root <<= 1;
+        }
+    }
+    *sticky = rem != 0;
+    return root;
+}
+"""
+
+FDIV_ROUND = """
+static __device__ unsigned cts_fround(int sign, int exp, unsigned __int128 q, int sticky, int mode) {
+    while (q >= ((unsigned __int128)1 << 56)) {
+        if (q & 1) sticky = 1;
+        q >>= 1;
+        exp++;
+    }
+    while (q && q < ((unsigned __int128)1 << 55) && exp > 1) {
+        q <<= 1;
+        exp--;
+    }
+    if (sticky) q |= 1;
+    return cts_fpack(sign, exp, (unsigned long long)q, mode);
+}
+"""
+
+FDIV_DIV = """
+static __device__ unsigned cts_fdiv(unsigned a, unsigned b, int mode) {
+    unsigned sa = a >> 31, sb = b >> 31;
+    int sign = (int)(sa ^ sb);
+    int ea = (a >> 23) & 0xff, eb = (b >> 23) & 0xff;
+    unsigned fa = a & 0x7fffffu, fb = b & 0x7fffffu;
+    if ((ea == 255 && fa) || (eb == 255 && fb)) return 0x7fffffffu;
+    int a0 = (ea | fa) == 0, b0 = (eb | fb) == 0;
+    int ainf = ea == 255, binf = eb == 255;
+    if ((a0 && b0) || (ainf && binf)) return 0x7fffffffu;
+    if (a0 || binf) return sign ? 0x80000000u : 0u;
+    if (b0 || ainf) return ((unsigned)sign << 31) | 0x7f800000u;
+    unsigned ma = ea ? (fa | 0x800000u) : fa;
+    unsigned mb = eb ? (fb | 0x800000u) : fb;
+    int exp = (ea ? ea : 1) - (eb ? eb : 1) + 127;
+    unsigned __int128 num = (unsigned __int128)ma << 55;
+    unsigned __int128 q = num / mb;
+    int sticky = (num % mb) != 0;
+    return cts_fround(sign, exp, q, sticky, mode);
+}
+"""
+
+FDIV_SQRT = """
+static __device__ unsigned cts_fsqrt(unsigned a, int mode) {
+    unsigned sa = a >> 31;
+    int ea = (a >> 23) & 0xff;
+    unsigned fa = a & 0x7fffffu;
+    if (ea == 255) return fa ? 0x7fffffffu : (sa ? 0x7fffffffu : 0x7f800000u);
+    if ((ea | fa) == 0) return sa ? 0x80000000u : 0u;
+    if (sa) return 0x7fffffffu;
+    unsigned M;
+    int e;
+    if (ea == 0) {
+        M = fa;
+        int s = 0;
+        while ((M & 0x800000u) == 0) { M <<= 1; s++; }
+        e = -126 - s;
+    } else {
+        M = fa | 0x800000u;
+        e = ea - 127;
+    }
+    int half = (e >= 0) ? (e >> 1) : -(((-e) + 1) >> 1);
+    unsigned __int128 X = (unsigned __int128)M << ((e & 1) ? 88 : 87);
+    int sticky = 0;
+    unsigned long long root = cts_isqrt(X, &sticky);
+    return cts_fround(0, half + 127, root, sticky, mode);
+}
+"""
+
+FDIV_RSQRT = """
+static __device__ unsigned cts_frsqrt(unsigned a) {
+    unsigned sa = a >> 31;
+    int ea = (a >> 23) & 0xff;
+    unsigned fa = a & 0x7fffffu;
+    if (ea == 255) return fa ? 0x7fffffffu : (sa ? 0x7fffffffu : 0u);
+    if ((ea | fa) == 0) return sa ? 0xff800000u : 0x7f800000u;
+    if (sa) return 0x7fffffffu;
+    unsigned M;
+    int e;
+    if (ea == 0) {
+        M = fa;
+        int s = 0;
+        while ((M & 0x800000u) == 0) { M <<= 1; s++; }
+        e = -126 - s;
+    } else {
+        M = fa | 0x800000u;
+        e = ea - 127;
+    }
+    int half = (e >= 0) ? (e >> 1) : -(((-e) + 1) >> 1);
+    unsigned __int128 X = (unsigned __int128)M << ((e & 1) ? 88 : 87);
+    int sticky_sqrt = 0;
+    unsigned long long root = cts_isqrt(X, &sticky_sqrt);
+    unsigned __int128 root2 = (unsigned __int128)root * root;
+    unsigned __int128 rem = X - root2;
+    unsigned __int128 q = ((unsigned __int128)1 << 110) / root;
+    unsigned __int128 qrem = ((unsigned __int128)1 << 110) % root;
+    unsigned __int128 corr = 0;
+    unsigned __int128 crem = 0;
+    if (rem) {
+        unsigned __int128 den = root2 << 1;
+        unsigned __int128 cnum = q * rem;
+        corr = cnum / den;
+        crem = cnum % den;
+    }
+    unsigned __int128 mag = q - corr;
+    int sticky = (qrem != 0) || (crem != 0);
+    return cts_fround(0, 127 - half, mag, sticky, 0);
+}
+"""
+
+def _fdiv_binary(mode: str) -> str:
+    code = _FARITH_CODE[mode]
+    return f"""
+static __device__ float cts_fdiv_{mode}(float a, float b) {{
+    union {{ float as_float; unsigned as_bits; }} x, y, out;
+    x.as_float = a;
+    y.as_float = b;
+    out.as_bits = cts_fdiv(x.as_bits, y.as_bits, {code});
+    return out.as_float;
+}}
+"""
+
+
+def _fdiv_rcp(mode: str) -> str:
+    code = _FARITH_CODE[mode]
+    return f"""
+static __device__ float cts_frcp_{mode}(float a) {{
+    union {{ float as_float; unsigned as_bits; }} x, out;
+    x.as_float = a;
+    out.as_bits = cts_fdiv(0x3f800000u, x.as_bits, {code});
+    return out.as_float;
+}}
+"""
+
+
+def _fdiv_sqrt(mode: str) -> str:
+    code = _FARITH_CODE[mode]
+    return f"""
+static __device__ float cts_fsqrt_{mode}(float a) {{
+    union {{ float as_float; unsigned as_bits; }} x, out;
+    x.as_float = a;
+    out.as_bits = cts_fsqrt(x.as_bits, {code});
+    return out.as_float;
+}}
+"""
+
+
+FDIV_RSQRT_HELPER = """
+static __device__ float cts_frsqrt_rn(float a) {
+    union { float as_float; unsigned as_bits; } x, out;
+    x.as_float = a;
+    out.as_bits = cts_frsqrt(x.as_bits);
+    return out.as_float;
+}
+"""
+
+
+FDIV_HELPERS: dict[str, tuple[str, str]] = {}
+for _mode in ("rn", "rz", "ru", "rd"):
+    FDIV_HELPERS[f"__fdiv_{_mode}"] = (f"cts_fdiv_{_mode}", _fdiv_binary(_mode))
+    FDIV_HELPERS[f"__frcp_{_mode}"] = (f"cts_frcp_{_mode}", _fdiv_rcp(_mode))
+    FDIV_HELPERS[f"__fsqrt_{_mode}"] = (f"cts_fsqrt_{_mode}", _fdiv_sqrt(_mode))
+FDIV_HELPERS["__frsqrt_rn"] = ("cts_frsqrt_rn", FDIV_RSQRT_HELPER)
+
+
+def fdiv_needs_div(names: set[str]) -> bool:
+    return any(name.startswith("cts_fdiv_") or name.startswith("cts_frcp_") for name in names)
+
+
+def fdiv_needs_sqrt(names: set[str]) -> bool:
+    return any(name.startswith("cts_fsqrt_") for name in names)
+
+
+def fdiv_needs_rsqrt(names: set[str]) -> bool:
+    return any(name.startswith("cts_frsqrt_") for name in names)
 
 
 # Half keeps 10 explicit bits. A NaN becomes 0x7fff, and widening that NaN

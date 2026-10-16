@@ -64,7 +64,7 @@ Comments and string literals stay. A name inside a `#define` is rewritten at the
 | `musa` | the same rule with the `musa` prefix | `musa_runtime.h` | unchanged | lowered |
 | `maca` | unchanged | `cuda_runtime.h` | unchanged | unchanged |
 
-The helpers are bitcasts and double hi/lo words, funnel shifts, `__dp4a`, packed add/sub/min/max/abs, `__byte_perm`, averages, high-half products, absolute differences, packed absolute-difference sums, comparison masks, lane predicates, packed averages, bit scans, 24-bit products, rounding conversions, double-to-float rounding, float-to-half rounding, integer and double conversions into half, half-to-integer conversions, half add, multiply, fused multiply-add, packed half2 arithmetic, half comparisons, `__saturatef`, directed float add, sub, mul, and fused multiply-add, and directed double add, sub, mul, and fused multiply-add.
+The helpers are bitcasts and double hi/lo words, funnel shifts, `__dp4a`, packed add/sub/min/max/abs, `__byte_perm`, averages, high-half products, absolute differences, packed absolute-difference sums, comparison masks, lane predicates, packed averages, bit scans, 24-bit products, rounding conversions, double-to-float rounding, float-to-half rounding, integer and double conversions into half, half-to-integer conversions, half add, multiply, fused multiply-add, packed half2 arithmetic, half comparisons, `__saturatef`, directed float add, sub, mul, and fused multiply-add, directed double add, sub, mul, and fused multiply-add, and directed float division, reciprocal, square root, and reciprocal square root.
 
 Inserted helpers are `static __device__` and sit after the last `#include`.
 
@@ -132,6 +132,14 @@ These are the results a prefix swap gets wrong. HIP and MUSA both get the helper
 | `__dmul_rn(+inf, +0)` | the negative quiet NaN `18444492273895866368` |
 | `__fma_rn` of `(1+2^-52)` squared minus the rounded square | `2^-104` (`4138808057553485824`), not 0 |
 | `__dsub_rd` of 1 and `2^-53` | the double just below 1, `4607182418800017407` |
+| `__fdiv_rn(+0, -0)` / `__fdiv_rn(1, +0)` | the canonical NaN `2147483647` / `+inf` |
+| `__fsqrt_rn(-0)` / `__fsqrt_rn` of a negative | `-0` / the canonical NaN `2147483647` |
+| `__fsqrt_ru(2)` | one float above `__fsqrt_rn(2)` |
+| `__fdiv_rz(1, 3)` | one float below the nearest-even quotient |
+| `__fdiv_ru` of the smallest subnormal over the finite maximum | `1`. The other modes stay `0` |
+| `__fdiv_rd` of an overflowing positive quotient | the finite maximum `2139095039` |
+| `__frsqrt_rn` of the normal `0x187fffff` | `1392508928`. The reciprocal of the rounded square root is `1392508929` |
+| `__frsqrt_rn(-0)` | `-inf` |
 | `__mul24` | the high 8 bits are ignored. The square of the minimum 24-bit value keeps a low half of `0` |
 | `__clz(0)` / `__clzll(0)` / `__ffs(0)` | `32` / `64` / `0` |
 | `__dp4a` of a `0x80` byte | `-128` signed, `128` unsigned |

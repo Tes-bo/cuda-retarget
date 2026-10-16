@@ -36,6 +36,12 @@ from cuda_retarget.dialect import (
     ROUND_I32,
     ROUND_I64,
     SATURATE_HELPERS,
+    FDIV_DIV,
+    FDIV_HELPERS,
+    FDIV_ISQRT,
+    FDIV_ROUND,
+    FDIV_RSQRT,
+    FDIV_SQRT,
     DARITH_ADD,
     DARITH_FMA,
     DARITH_HELPERS,
@@ -755,6 +761,52 @@ __global__ void round_double(double* d) { *d = __fma_rn(*d, *d, 1.0); }
         self.assertIn("cts_dfma(", hip)
         self.assertIn("cts_dadd(", hip)
         self.assertNotIn("cts_dmul(", hip)
+        self.assertEqual(translate_source(source, "maca"), source)
+
+    def test_hip_and_musa_lower_float_division(self) -> None:
+        source = """\
+#include <cuda_runtime.h>
+__global__ void divide(float* f) {
+    const char* label = "__fdiv_rn __frcp_rd __fsqrt_ru __frsqrt_rn __fdividef";
+    *f = __fdiv_rn(*f, 3.0f);
+    *f = __frcp_rd(*f);
+    *f = __fsqrt_ru(*f);
+    *f = __frsqrt_rn(*f);
+    *f = __fdividef(*f, 3.0f);
+    *f += label[0];
+}
+"""
+        for target in ("hip", "musa"):
+            translated = translate_source(source, target)
+            self.assertIn('"__fdiv_rn __frcp_rd __fsqrt_ru __frsqrt_rn __fdividef"', translated)
+            self.assertIn("cts_fdiv_rn(*f, 3.0f)", translated)
+            self.assertIn("cts_frcp_rd(*f)", translated)
+            self.assertIn("cts_fsqrt_ru(*f)", translated)
+            self.assertIn("cts_frsqrt_rn(*f)", translated)
+            self.assertIn("__fdividef(*f, 3.0f)", translated)
+            self.assertIn("cts_fpack", translated)
+            self.assertIn("cts_fdiv(", translated)
+            self.assertIn("cts_isqrt", translated)
+            self.assertNotIn("__fdiv_rn(", translated)
+            self.assertNotIn("__frcp_rd(", translated)
+            self.assertNotIn("__fsqrt_ru(", translated)
+            self.assertNotIn("__frsqrt_rn(", translated)
+        rcp_only = """\
+#include <cuda_runtime.h>
+__global__ void divide(float* f) { *f = __frcp_rn(*f); }
+"""
+        hip = translate_source(rcp_only, "hip")
+        self.assertIn("cts_fdiv(", hip)
+        self.assertNotIn("cts_isqrt", hip)
+        self.assertNotIn("cts_fsqrt(", hip)
+        sqrt_only = """\
+#include <cuda_runtime.h>
+__global__ void divide(float* f) { *f = __fsqrt_rn(*f); }
+"""
+        hip = translate_source(sqrt_only, "hip")
+        self.assertIn("cts_isqrt", hip)
+        self.assertIn("cts_fsqrt(", hip)
+        self.assertNotIn("cts_fdiv(", hip)
         self.assertEqual(translate_source(source, "maca"), source)
 
     def test_hip_and_musa_lower_double_rounding(self) -> None:
@@ -1492,6 +1544,32 @@ class CorpusTests(unittest.TestCase):
         self.assertIn("__dadd_rn", maca)
         self.assertIn("__fma_rn", maca)
         self.assertNotIn("cts_dadd_rn", maca)
+
+    def test_hip_and_musa_lower_the_census_fdiv(self) -> None:
+        path = CENSUS / "fdiv" / "main.cu"
+        if not path.is_file():
+            self.skipTest("fdiv is not in the census corpus")
+        hip = translate_path(path, "hip")
+        musa = translate_path(path, "musa")
+        maca = translate_path(path, "maca")
+        for translated in (hip, musa):
+            self.assertIn("cts_fdiv_rn(p0, m0)", translated)
+            self.assertIn("cts_fdiv_rn(one, three)", translated)
+            self.assertIn("cts_fdiv_rz(one, three)", translated)
+            self.assertIn("cts_fdiv_ru(sub, big)", translated)
+            self.assertIn("cts_fdiv_rd(big, sub)", translated)
+            self.assertIn("cts_fsqrt_rn(m0)", translated)
+            self.assertIn("cts_fsqrt_ru(two)", translated)
+            self.assertIn("cts_frsqrt_rn(gap)", translated)
+            self.assertIn("cts_frcp_rn(cts_fsqrt_rn(gap))", translated)
+            self.assertIn("cts_isqrt", translated)
+            self.assertNotIn("__fdiv_rn(", translated)
+            self.assertNotIn("__frsqrt_rn(", translated)
+            self.assertEqual(translated.count("cts_fdiv_rn("), 8)
+            self.assertEqual(translated.count("cts_frsqrt_rn("), 4)
+        self.assertIn("__fdiv_rn", maca)
+        self.assertIn("__frsqrt_rn", maca)
+        self.assertNotIn("cts_fdiv_rn", maca)
 
     def test_hip_and_musa_lower_the_census_dround(self) -> None:
         path = CENSUS / "dround" / "main.cu"
@@ -3204,6 +3282,67 @@ __global__ void compare(int* bad) {
         double z = __longlong_as_double((long long)vals[k]);
         if (got_fma(x, y, z, mode) != ref_fma(x, y, z, mode)) atomicExch(bad, 1);
     }
+}
+int main() {
+    int* bad = nullptr;
+    if (cudaMalloc(&bad, sizeof(*bad)) != cudaSuccess) return 2;
+    if (cudaMemset(bad, 0, sizeof(*bad)) != cudaSuccess) return 2;
+    compare<<<1, 1>>>(bad);
+    if (cudaDeviceSynchronize() != cudaSuccess) return 3;
+    int mismatch = 0;
+    if (cudaMemcpy(&mismatch, bad, sizeof(mismatch), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
+    std::printf("mismatch=%d\\n", mismatch);
+    cudaFree(bad);
+    return 0;
+}
+""",
+        )
+
+    def test_float_division_helpers_agree_with_the_intrinsics(self) -> None:
+        helpers = "\n".join(
+            [
+                FARITH_PACK.strip("\n"),
+                FDIV_ROUND.strip("\n"),
+                FDIV_DIV.strip("\n"),
+                FDIV_ISQRT.strip("\n"),
+                FDIV_SQRT.strip("\n"),
+                FDIV_RSQRT.strip("\n"),
+                *(helper.strip("\n") for _name, helper in FDIV_HELPERS.values()),
+            ]
+        )
+        self._nvcc_mismatch(
+            "fdiv",
+            """\
+#include <cstdio>
+#include <cuda_runtime.h>
+"""
+            + helpers
+            + """
+__global__ void compare(int* bad) {
+    const unsigned vals[] = {
+        0u, 0x80000000u, 1u, 0x007fffffu, 0x00800000u, 0x3f800000u, 0x40000000u,
+        0x40400000u, 0x3f800001u, 0x7f7fffffu, 0x7f800000u, 0xff800000u,
+        0x7fc00001u, 0xbf800000u, 0xc0000000u, 0x187fffffu
+    };
+    const int n = 16;
+    for (int i = 0; i < n; ++i) for (int j = 0; j < n; ++j) for (int mode = 0; mode < 4; ++mode) {
+        float x = __uint_as_float(vals[i]);
+        float y = __uint_as_float(vals[j]);
+        float rd = mode == 0 ? __fdiv_rn(x, y) : mode == 1 ? __fdiv_rz(x, y) : mode == 2 ? __fdiv_ru(x, y) : __fdiv_rd(x, y);
+        float gd = mode == 0 ? cts_fdiv_rn(x, y) : mode == 1 ? cts_fdiv_rz(x, y) : mode == 2 ? cts_fdiv_ru(x, y) : cts_fdiv_rd(x, y);
+        if (__float_as_uint(rd) != __float_as_uint(gd)) atomicExch(bad, 1);
+        float rr = mode == 0 ? __frcp_rn(x) : mode == 1 ? __frcp_rz(x) : mode == 2 ? __frcp_ru(x) : __frcp_rd(x);
+        float gr = mode == 0 ? cts_frcp_rn(x) : mode == 1 ? cts_frcp_rz(x) : mode == 2 ? cts_frcp_ru(x) : cts_frcp_rd(x);
+        if (__float_as_uint(rr) != __float_as_uint(gr)) atomicExch(bad, 1);
+        float rs = mode == 0 ? __fsqrt_rn(x) : mode == 1 ? __fsqrt_rz(x) : mode == 2 ? __fsqrt_ru(x) : __fsqrt_rd(x);
+        float gs = mode == 0 ? cts_fsqrt_rn(x) : mode == 1 ? cts_fsqrt_rz(x) : mode == 2 ? cts_fsqrt_ru(x) : cts_fsqrt_rd(x);
+        if (__float_as_uint(rs) != __float_as_uint(gs)) atomicExch(bad, 1);
+    }
+    float gap = __uint_as_float(0x187fffffu);
+    if (__float_as_uint(__frsqrt_rn(gap)) == __float_as_uint(__frcp_rn(__fsqrt_rn(gap)))) atomicExch(bad, 1);
+    if (__float_as_uint(cts_frsqrt_rn(gap)) != __float_as_uint(__frsqrt_rn(gap))) atomicExch(bad, 1);
+    if (__float_as_uint(cts_frsqrt_rn(0.0f)) != __float_as_uint(__frsqrt_rn(0.0f))) atomicExch(bad, 1);
+    if (__float_as_uint(cts_frsqrt_rn(-0.0f)) != __float_as_uint(__frsqrt_rn(-0.0f))) atomicExch(bad, 1);
 }
 int main() {
     int* bad = nullptr;
