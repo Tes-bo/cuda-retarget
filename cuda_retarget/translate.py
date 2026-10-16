@@ -61,6 +61,11 @@ from cuda_retarget.dialect import (
     H2_HELPERS,
     H2_MUL,
     H2_SAT,
+    HPRED_CMP,
+    HPRED_HELPERS,
+    HPRED_MINMAX,
+    HPRED_NAN,
+    HPRED_SIGN,
     Dialect,
     farith_needs_add,
     farith_needs_fma,
@@ -81,6 +86,10 @@ from cuda_retarget.dialect import (
     h2_needs_mul,
     h2_needs_sat,
     h2_needs_to_float,
+    hpred_arity,
+    hpred_needs_cmp,
+    hpred_needs_minmax,
+    hpred_needs_sign,
     round_needs_bits,
     round_needs_d2f,
     round_needs_i32,
@@ -353,6 +362,13 @@ def _call_edit(
             raise TranslateError(f"{token.spelling} must have {arity} arguments")
         replacement, _helper = H2_HELPERS[token.spelling]
         return (token.start, token.end, replacement)
+    if dialect.lower_half and token.spelling in HPRED_HELPERS:
+        parsed = _arguments(tokens, index + 1)
+        arity = hpred_arity(token.spelling)
+        if parsed is None or len(parsed[0]) != arity:
+            raise TranslateError(f"{token.spelling} must have {arity} arguments")
+        replacement, _helper = HPRED_HELPERS[token.spelling]
+        return (token.start, token.end, replacement)
     if dialect.lower_farith and token.spelling in FARITH_HELPERS:
         parsed = _arguments(tokens, index + 1)
         arity = 3 if token.spelling.startswith("__fmaf_") else 2
@@ -600,6 +616,25 @@ def _helpers(dialect: Dialect, rewritten: str) -> str:
                 if name in seen_h2:
                     continue
                 seen_h2.add(name)
+                blocks.append(helper.strip("\n"))
+        pred = [(name, helper) for name, helper in HPRED_HELPERS.values() if f"{name}(" in rewritten]
+        pred_names = {name for name, _helper in pred}
+        if pred_names:
+            joined = "\n".join(blocks)
+            blocks.append(HPRED_NAN.strip("\n"))
+            if hpred_needs_sign(pred_names):
+                blocks.append(HPRED_SIGN.strip("\n"))
+            if (hpred_needs_cmp(pred_names) or hpred_needs_minmax(pred_names)) and "cts_h2f(" not in joined:
+                blocks.append(HALF_TO_FLOAT.strip("\n"))
+            if hpred_needs_cmp(pred_names):
+                blocks.append(HPRED_CMP.strip("\n"))
+            if hpred_needs_minmax(pred_names):
+                blocks.append(HPRED_MINMAX.strip("\n"))
+            seen_pred: set[str] = set()
+            for name, helper in pred:
+                if name in seen_pred:
+                    continue
+                seen_pred.add(name)
                 blocks.append(helper.strip("\n"))
     if dialect.lower_farith:
         used = [(name, helper) for name, helper in FARITH_HELPERS.values() if f"{name}(" in rewritten]

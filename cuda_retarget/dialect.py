@@ -338,6 +338,11 @@ class Dialect:
     forms run that operation on each lane of a `__half2`. The low lane
     is the low 16 bits. A NaN in one lane stays in that lane.
     `__floats2half2_rn` puts the first float in the low lane.
+    `__hne` of a NaN is false, and `__hneu` is true. A true `__heq2`
+    lane is `0x3c00`. A true `__heq2_mask` lane is `0xffff`. `__hmax`
+    keeps the number when the other value is NaN, and two NaNs become
+    `0x7fff`. `__hmax(+0, -0)` is `+0`. `__hmin(+0, -0)` is `-0`.
+    `__hneg` and `__habs` of a NaN are `0x7fff`.
     """
 
     name: str
@@ -2669,6 +2674,282 @@ def h2_needs_from_float(names: set[str]) -> bool:
 
 def h2_needs_to_float(names: set[str]) -> bool:
     return any(name.startswith("cts_half22float2") for name in names)
+
+
+# Ordered compares are false when either value is NaN. Unordered compares
+# are true. A half2 predicate lane is 0x3c00 or 0. A mask lane is 0xffff or 0.
+HPRED_NAN = """
+static __device__ int cts_hnan(unsigned short bits) {
+    return ((bits >> 10) & 31) == 31 && (bits & 0x3ffu);
+}
+"""
+
+HPRED_SIGN = """
+static __device__ unsigned short cts_hsign(unsigned short bits, int neg) {
+    if (cts_hnan(bits)) return (unsigned short)0x7fff;
+    if (neg) return (unsigned short)(bits ^ 0x8000u);
+    return (unsigned short)(bits & 0x7fffu);
+}
+"""
+
+HPRED_CMP = """
+static __device__ int cts_hcmp(unsigned short a, unsigned short b, int op) {
+    if (cts_hnan(a) || cts_hnan(b)) return (op & 8) ? 1 : 0;
+    float fa = cts_h2f(a), fb = cts_h2f(b);
+    int base = op & 7;
+    if (base == 0) return fa == fb;
+    if (base == 1) return fa != fb;
+    if (base == 2) return fa < fb;
+    if (base == 3) return fa <= fb;
+    if (base == 4) return fa > fb;
+    return fa >= fb;
+}
+
+static __device__ unsigned cts_hcmp2(unsigned a, unsigned b, int op) {
+    unsigned lo = cts_hcmp((unsigned short)a, (unsigned short)b, op) ? 0x3c00u : 0u;
+    unsigned hi = cts_hcmp((unsigned short)(a >> 16), (unsigned short)(b >> 16), op) ? 0x3c00u : 0u;
+    return lo | (hi << 16);
+}
+
+static __device__ unsigned cts_hcmp2_mask(unsigned a, unsigned b, int op) {
+    unsigned lo = cts_hcmp((unsigned short)a, (unsigned short)b, op) ? 0xffffu : 0u;
+    unsigned hi = cts_hcmp((unsigned short)(a >> 16), (unsigned short)(b >> 16), op) ? 0xffffu : 0u;
+    return lo | (hi << 16);
+}
+"""
+
+HPRED_MINMAX = """
+static __device__ unsigned short cts_hminmax(unsigned short a, unsigned short b, int ismin) {
+    int na = cts_hnan(a), nb = cts_hnan(b);
+    if (na && nb) return (unsigned short)0x7fff;
+    if (na) return b;
+    if (nb) return a;
+    if ((a & 0x7fffu) == 0 && (b & 0x7fffu) == 0) {
+        if (a == b) return a;
+        return (unsigned short)(ismin ? 0x8000 : 0);
+    }
+    float fa = cts_h2f(a), fb = cts_h2f(b);
+    if (ismin) return fa <= fb ? a : b;
+    return fa >= fb ? a : b;
+}
+"""
+
+
+def _hpred_bool(name: str, code: int) -> str:
+    return f"""
+static __device__ bool {name}(__half a, __half b) {{
+    union {{ unsigned short as_bits; __half as_half; }} x, y;
+    x.as_half = a;
+    y.as_half = b;
+    return cts_hcmp(x.as_bits, y.as_bits, {code});
+}}
+"""
+
+
+def _hpred_pair(name: str, code: int) -> str:
+    return f"""
+static __device__ __half2 {name}(__half2 a, __half2 b) {{
+    union {{ __half2 as_h; unsigned as_bits; }} x, y, out;
+    x.as_h = a;
+    y.as_h = b;
+    out.as_bits = cts_hcmp2(x.as_bits, y.as_bits, {code});
+    return out.as_h;
+}}
+"""
+
+
+def _hpred_mask(name: str, code: int) -> str:
+    return f"""
+static __device__ unsigned {name}(__half2 a, __half2 b) {{
+    union {{ __half2 as_h; unsigned as_bits; }} x, y;
+    x.as_h = a;
+    y.as_h = b;
+    return cts_hcmp2_mask(x.as_bits, y.as_bits, {code});
+}}
+"""
+
+
+def _hpred_both(name: str, code: int) -> str:
+    return f"""
+static __device__ bool {name}(__half2 a, __half2 b) {{
+    union {{ __half2 as_h; unsigned as_bits; }} x, y;
+    x.as_h = a;
+    y.as_h = b;
+    return cts_hcmp2(x.as_bits, y.as_bits, {code}) == 0x3c003c00u;
+}}
+"""
+
+
+_HPRED_OPS = (
+    ("eq", 0),
+    ("ne", 1),
+    ("lt", 2),
+    ("le", 3),
+    ("gt", 4),
+    ("ge", 5),
+    ("equ", 8),
+    ("neu", 9),
+    ("ltu", 10),
+    ("leu", 11),
+    ("gtu", 12),
+    ("geu", 13),
+)
+
+HPRED_HELPERS: dict[str, tuple[str, str]] = {}
+for _op, _code in _HPRED_OPS:
+    HPRED_HELPERS[f"__h{_op}"] = (f"cts_h{_op}", _hpred_bool(f"cts_h{_op}", _code))
+    HPRED_HELPERS[f"__h{_op}2"] = (f"cts_h{_op}2", _hpred_pair(f"cts_h{_op}2", _code))
+    HPRED_HELPERS[f"__h{_op}2_mask"] = (f"cts_h{_op}2_mask", _hpred_mask(f"cts_h{_op}2_mask", _code))
+    HPRED_HELPERS[f"__hb{_op}2"] = (f"cts_hb{_op}2", _hpred_both(f"cts_hb{_op}2", _code))
+
+HPRED_HELPERS["__hisnan"] = (
+    "cts_hisnan",
+    """
+static __device__ bool cts_hisnan(__half a) {
+    union { unsigned short as_bits; __half as_half; } x;
+    x.as_half = a;
+    return cts_hnan(x.as_bits);
+}
+""",
+)
+HPRED_HELPERS["__hisnan2"] = (
+    "cts_hisnan2",
+    """
+static __device__ __half2 cts_hisnan2(__half2 a) {
+    union { __half2 as_h; unsigned as_bits; } in, out;
+    in.as_h = a;
+    unsigned lo = cts_hnan((unsigned short)in.as_bits) ? 0x3c00u : 0u;
+    unsigned hi = cts_hnan((unsigned short)(in.as_bits >> 16)) ? 0x3c00u : 0u;
+    out.as_bits = lo | (hi << 16);
+    return out.as_h;
+}
+""",
+)
+HPRED_HELPERS["__hneg"] = (
+    "cts_hneg",
+    """
+static __device__ __half cts_hneg(__half a) {
+    union { unsigned short as_bits; __half as_half; } x, out;
+    x.as_half = a;
+    out.as_bits = cts_hsign(x.as_bits, 1);
+    return out.as_half;
+}
+""",
+)
+HPRED_HELPERS["__habs"] = (
+    "cts_habs",
+    """
+static __device__ __half cts_habs(__half a) {
+    union { unsigned short as_bits; __half as_half; } x, out;
+    x.as_half = a;
+    out.as_bits = cts_hsign(x.as_bits, 0);
+    return out.as_half;
+}
+""",
+)
+HPRED_HELPERS["__hneg2"] = (
+    "cts_hneg2",
+    """
+static __device__ __half2 cts_hneg2(__half2 a) {
+    union { __half2 as_h; unsigned as_bits; } in, out;
+    in.as_h = a;
+    unsigned lo = cts_hsign((unsigned short)in.as_bits, 1);
+    unsigned hi = cts_hsign((unsigned short)(in.as_bits >> 16), 1);
+    out.as_bits = lo | (hi << 16);
+    return out.as_h;
+}
+""",
+)
+HPRED_HELPERS["__habs2"] = (
+    "cts_habs2",
+    """
+static __device__ __half2 cts_habs2(__half2 a) {
+    union { __half2 as_h; unsigned as_bits; } in, out;
+    in.as_h = a;
+    unsigned lo = cts_hsign((unsigned short)in.as_bits, 0);
+    unsigned hi = cts_hsign((unsigned short)(in.as_bits >> 16), 0);
+    out.as_bits = lo | (hi << 16);
+    return out.as_h;
+}
+""",
+)
+HPRED_HELPERS["__hmax"] = (
+    "cts_hmax",
+    """
+static __device__ __half cts_hmax(__half a, __half b) {
+    union { unsigned short as_bits; __half as_half; } x, y, out;
+    x.as_half = a;
+    y.as_half = b;
+    out.as_bits = cts_hminmax(x.as_bits, y.as_bits, 0);
+    return out.as_half;
+}
+""",
+)
+HPRED_HELPERS["__hmin"] = (
+    "cts_hmin",
+    """
+static __device__ __half cts_hmin(__half a, __half b) {
+    union { unsigned short as_bits; __half as_half; } x, y, out;
+    x.as_half = a;
+    y.as_half = b;
+    out.as_bits = cts_hminmax(x.as_bits, y.as_bits, 1);
+    return out.as_half;
+}
+""",
+)
+HPRED_HELPERS["__hmax2"] = (
+    "cts_hmax2",
+    """
+static __device__ __half2 cts_hmax2(__half2 a, __half2 b) {
+    union { __half2 as_h; unsigned as_bits; } x, y, out;
+    x.as_h = a;
+    y.as_h = b;
+    unsigned lo = cts_hminmax((unsigned short)x.as_bits, (unsigned short)y.as_bits, 0);
+    unsigned hi = cts_hminmax((unsigned short)(x.as_bits >> 16), (unsigned short)(y.as_bits >> 16), 0);
+    out.as_bits = lo | (hi << 16);
+    return out.as_h;
+}
+""",
+)
+HPRED_HELPERS["__hmin2"] = (
+    "cts_hmin2",
+    """
+static __device__ __half2 cts_hmin2(__half2 a, __half2 b) {
+    union { __half2 as_h; unsigned as_bits; } x, y, out;
+    x.as_h = a;
+    y.as_h = b;
+    unsigned lo = cts_hminmax((unsigned short)x.as_bits, (unsigned short)y.as_bits, 1);
+    unsigned hi = cts_hminmax((unsigned short)(x.as_bits >> 16), (unsigned short)(y.as_bits >> 16), 1);
+    out.as_bits = lo | (hi << 16);
+    return out.as_h;
+}
+""",
+)
+
+
+def hpred_arity(spelling: str) -> int:
+    if spelling in {"__hneg", "__hneg2", "__habs", "__habs2", "__hisnan", "__hisnan2"}:
+        return 1
+    return 2
+
+
+def hpred_needs_cmp(names: set[str]) -> bool:
+    stems = ("cts_heq", "cts_hne", "cts_hlt", "cts_hle", "cts_hgt", "cts_hge", "cts_hb")
+
+    def match(name: str) -> bool:
+        if name.startswith("cts_hneg"):
+            return False
+        return name.startswith(stems)
+
+    return any(match(name) for name in names)
+
+
+def hpred_needs_minmax(names: set[str]) -> bool:
+    return any(name.startswith(("cts_hmax", "cts_hmin")) for name in names)
+
+
+def hpred_needs_sign(names: set[str]) -> bool:
+    return any(name.startswith(("cts_hneg", "cts_habs")) for name in names)
 
 
 def runtime_name(spelling: str, dialect: Dialect) -> str | None:

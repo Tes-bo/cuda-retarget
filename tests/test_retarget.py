@@ -57,6 +57,11 @@ from cuda_retarget.dialect import (
     H2_HELPERS,
     H2_MUL,
     H2_SAT,
+    HPRED_CMP,
+    HPRED_HELPERS,
+    HPRED_MINMAX,
+    HPRED_NAN,
+    HPRED_SIGN,
     PACKED_AVG_HELPERS,
     PACKED_CMP_HELPERS,
     PACKED_SAD_HELPERS,
@@ -950,6 +955,58 @@ __global__ void lane(__half2 a, __half* o) { *o = __low2half(a); }
         self.assertNotIn("cts_hpack(", hip)
         self.assertEqual(translate_source(source, "maca"), source)
 
+    def test_hip_and_musa_lower_half_compares(self) -> None:
+        source = """\
+#include <cuda_fp16.h>
+__global__ void calc(__half a, __half b, __half2 p, __half2 q, int* s, __half2* o, __half* h, unsigned* m) {
+    const char* label = "__hne __hneu __heq2 __heq2_mask __hmax";
+    s[0] = __heq(a, b);
+    s[1] = __hne(a, b);
+    s[2] = __hneu(a, b);
+    s[3] = __hisnan(a);
+    o[0] = __heq2(p, q);
+    o[1] = __hequ2(p, q);
+    m[0] = __heq2_mask(p, q);
+    m[1] = __hne2_mask(p, q);
+    s[4] = __hbeq2(p, q);
+    o[2] = __hmax2(p, q);
+    o[3] = __hmin2(p, q);
+    o[4] = __hneg2(p);
+    o[5] = __habs2(p);
+    o[6] = __hisnan2(p);
+    *h = __hmax(a, b);
+    *h = __hmin(a, b);
+}
+"""
+        for target in ("hip", "musa"):
+            translated = translate_source(source, target)
+            self.assertIn('"__hne __hneu __heq2 __heq2_mask __hmax"', translated)
+            self.assertIn("cts_heq(a, b)", translated)
+            self.assertIn("cts_hne(a, b)", translated)
+            self.assertIn("cts_hneu(a, b)", translated)
+            self.assertIn("cts_heq2(p, q)", translated)
+            self.assertIn("cts_heq2_mask(p, q)", translated)
+            self.assertIn("cts_hbeq2(p, q)", translated)
+            self.assertIn("cts_hmax2(p, q)", translated)
+            self.assertIn("cts_hneg2(p)", translated)
+            self.assertIn("cts_hcmp(", translated)
+            self.assertIn("cts_h2f(", translated)
+            self.assertIn("cts_hminmax(", translated)
+            self.assertNotIn("__hne(", translated)
+            self.assertNotIn("__heq2(", translated)
+            self.assertNotIn("__heq2_mask(", translated)
+            self.assertNotIn("__hmax(", translated)
+        neg = """\
+#include <cuda_fp16.h>
+__global__ void neg(__half a, __half* o) { *o = __hneg(a); }
+"""
+        hip = translate_source(neg, "hip")
+        self.assertIn("cts_hneg(", hip)
+        self.assertIn("cts_hsign(", hip)
+        self.assertNotIn("cts_h2f(", hip)
+        self.assertNotIn("cts_hcmp(", hip)
+        self.assertEqual(translate_source(source, "maca"), source)
+
     def test_unparsed_source_is_refused(self) -> None:
         with self.assertRaises(TranslateError):
             translate_source("int main( {\n", "hip", filename="broken.cu")
@@ -1477,12 +1534,13 @@ class CorpusTests(unittest.TestCase):
             self.assertIn("cts_f16mul(m0, p0)", translated)
             self.assertIn("cts_f16mul(nxt, nxt)", translated)
             self.assertIn("cts_f16sub(m0, p0)", translated)
-            self.assertIn("cts_f16fma(nxt, nxt, __hneg(prod))", translated)
+            self.assertIn("cts_f16fma(nxt, nxt, cts_hneg(prod))", translated)
             self.assertIn("cts_f16add_sat(", translated)
             self.assertIn("cts_f16fma_sat(nxt, nxt, __ushort_as_half(0xbc00))", translated)
             self.assertIn("cts_f16sat(", translated)
             self.assertIn("cts_hpack(", translated)
-            self.assertIn("__hneg", translated)
+            self.assertIn("cts_hneg(prod)", translated)
+            self.assertNotIn("__hneg(", translated)
             self.assertNotIn("__hadd(", translated)
             self.assertNotIn("__hadd_rn(", translated)
             self.assertNotIn("__hmul(", translated)
@@ -1523,6 +1581,35 @@ class CorpusTests(unittest.TestCase):
         self.assertIn("__hadd2", maca)
         self.assertIn("__hfma2", maca)
         self.assertNotIn("cts_f16add2", maca)
+
+    def test_hip_and_musa_lower_the_census_hcmp(self) -> None:
+        path = CENSUS / "hcmp" / "main.cu"
+        if not path.is_file():
+            self.skipTest("hcmp is not in the census corpus")
+        hip = translate_path(path, "hip")
+        musa = translate_path(path, "musa")
+        maca = translate_path(path, "maca")
+        for translated in (hip, musa):
+            self.assertIn("cts_heq(hv(in[0]), hv(in[1]))", translated)
+            self.assertIn("cts_hne(hv(in[2]), hv(in[3]))", translated)
+            self.assertIn("cts_hequ(hv(in[2]), hv(in[3]))", translated)
+            self.assertIn("cts_hgtu(hv(in[3]), hv(in[2]))", translated)
+            self.assertIn("cts_heq2(", translated)
+            self.assertIn("cts_heq2_mask(", translated)
+            self.assertIn("cts_hbeq2(", translated)
+            self.assertIn("cts_hmax(", translated)
+            self.assertIn("cts_hmin(", translated)
+            self.assertIn("cts_hneg(", translated)
+            self.assertIn("cts_hneg2(", translated)
+            self.assertIn("cts_hcmp(", translated)
+            self.assertIn("cts_h2f(", translated)
+            self.assertNotIn("__hne(", translated)
+            self.assertNotIn("__heq2(", translated)
+            self.assertNotIn("__heq2_mask(", translated)
+            self.assertNotIn("__hmax(", translated)
+        self.assertIn("__hne", maca)
+        self.assertIn("__heq2_mask", maca)
+        self.assertNotIn("cts_hcmp", maca)
 
     def test_only_hip_pins_warp_size(self) -> None:
         path = CENSUS / "warp_size" / "main.cu"
@@ -3384,6 +3471,94 @@ __global__ void compare(int* bad) {{
     if (word(__lows2half2(left, right)) != word(cts_lows2half2(left, right))) atomicExch(bad, 1);
     if (word(__highs2half2(left, right)) != word(cts_highs2half2(left, right))) atomicExch(bad, 1);
     if (word(cts_low2half2(lanes(0x3c01, 0x3c02))) != 1006713857u) atomicExch(bad, 1);
+}}
+int main() {{
+    int* bad = nullptr;
+    if (cudaMalloc(&bad, sizeof(*bad)) != cudaSuccess) return 2;
+    if (cudaMemset(bad, 0, sizeof(*bad)) != cudaSuccess) return 2;
+    compare<<<1, 1>>>(bad);
+    if (cudaDeviceSynchronize() != cudaSuccess) return 3;
+    int mismatch = 0;
+    if (cudaMemcpy(&mismatch, bad, sizeof(mismatch), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
+    std::printf("mismatch=%d\\n", mismatch);
+    cudaFree(bad);
+    return 0;
+}}
+""",
+        )
+
+    def test_half_compare_helpers_agree_with_the_intrinsics(self) -> None:
+        wrappers = "\n".join(body.strip("\n") for _name, body in HPRED_HELPERS.values())
+        helpers = "\n".join(
+            [
+                HALF_TO_FLOAT.strip("\n"),
+                HPRED_NAN.strip("\n"),
+                HPRED_SIGN.strip("\n"),
+                HPRED_CMP.strip("\n"),
+                HPRED_MINMAX.strip("\n"),
+                wrappers,
+            ]
+        )
+        self._nvcc_mismatch(
+            "hcmp",
+            f"""\
+#include <cstdio>
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+{helpers}
+__device__ __half hv(unsigned short bits) {{
+    volatile unsigned short held = bits;
+    return __ushort_as_half(held);
+}}
+__device__ __half2 pv(unsigned short lo, unsigned short hi) {{
+    return __halves2half2(hv(lo), hv(hi));
+}}
+__device__ unsigned word(__half2 h) {{
+    union {{ __half2 as_h; unsigned as_bits; }} in;
+    in.as_h = h;
+    return in.as_bits;
+}}
+__global__ void compare(int* bad) {{
+    for (unsigned a = 0; a < 65536u; a += 128u) {{
+        for (unsigned b = 0; b < 65536u; b += 128u) {{
+            __half ha = hv((unsigned short)a);
+            __half hb = hv((unsigned short)b);
+            if (__heq(ha, hb) != cts_heq(ha, hb)) atomicExch(bad, 1);
+            if (__hne(ha, hb) != cts_hne(ha, hb)) atomicExch(bad, 1);
+            if (__hlt(ha, hb) != cts_hlt(ha, hb)) atomicExch(bad, 1);
+            if (__hgtu(ha, hb) != cts_hgtu(ha, hb)) atomicExch(bad, 1);
+            if (__hequ(ha, hb) != cts_hequ(ha, hb)) atomicExch(bad, 1);
+            if (__half_as_ushort(__hmax(ha, hb)) != __half_as_ushort(cts_hmax(ha, hb))) atomicExch(bad, 1);
+            if (__half_as_ushort(__hmin(ha, hb)) != __half_as_ushort(cts_hmin(ha, hb))) atomicExch(bad, 1);
+            if (__half_as_ushort(__hneg(ha)) != __half_as_ushort(cts_hneg(ha))) atomicExch(bad, 1);
+            if (__half_as_ushort(__habs(ha)) != __half_as_ushort(cts_habs(ha))) atomicExch(bad, 1);
+            __half2 pa = pv((unsigned short)a, (unsigned short)(a ^ 0x8000u));
+            __half2 pb = pv((unsigned short)b, (unsigned short)(b ^ 0x00ffu));
+            if (word(__heq2(pa, pb)) != word(cts_heq2(pa, pb))) atomicExch(bad, 1);
+            if (word(__hne2(pa, pb)) != word(cts_hne2(pa, pb))) atomicExch(bad, 1);
+            if (__heq2_mask(pa, pb) != cts_heq2_mask(pa, pb)) atomicExch(bad, 1);
+            if (__hne2_mask(pa, pb) != cts_hne2_mask(pa, pb)) atomicExch(bad, 1);
+            if (__hbeq2(pa, pb) != cts_hbeq2(pa, pb)) atomicExch(bad, 1);
+            if (word(__hmax2(pa, pb)) != word(cts_hmax2(pa, pb))) atomicExch(bad, 1);
+            if (word(__hneg2(pa)) != word(cts_hneg2(pa))) atomicExch(bad, 1);
+            if (word(__hisnan2(pa)) != word(cts_hisnan2(pa))) atomicExch(bad, 1);
+        }}
+    }}
+    __half nan = hv(0x7fff);
+    __half one = hv(0x3c00);
+    __half p0 = hv(0x0000);
+    __half m0 = hv(0x8000);
+    if (__hne(nan, one) != 0) atomicExch(bad, 1);
+    if (__hneu(nan, nan) != 1) atomicExch(bad, 1);
+    if (__heq(p0, m0) != 1) atomicExch(bad, 1);
+    if (__half_as_ushort(cts_hneg(hv(0x7e01))) != 32767) atomicExch(bad, 1);
+    if (__half_as_ushort(cts_hneg(p0)) != 32768) atomicExch(bad, 1);
+    if (__half_as_ushort(cts_hmax(p0, m0)) != 0) atomicExch(bad, 1);
+    if (__half_as_ushort(cts_hmin(p0, m0)) != 32768) atomicExch(bad, 1);
+    if (__half_as_ushort(cts_hmax(nan, one)) != 15360) atomicExch(bad, 1);
+    if (word(cts_heq2(pv(0x3c00, 0x7fff), pv(0x3c00, 0x3c00))) != 15360u) atomicExch(bad, 1);
+    if (cts_heq2_mask(pv(0x3c00, 0x7fff), pv(0x3c00, 0x3c00)) != 65535u) atomicExch(bad, 1);
+    if (word(cts_hmax2(pv(0x7fff, 0xffff), pv(0x7e01, 0xfe01))) != 2147450879u) atomicExch(bad, 1);
 }}
 int main() {{
     int* bad = nullptr;
