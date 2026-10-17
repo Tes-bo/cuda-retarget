@@ -140,6 +140,9 @@ These are the results a prefix swap gets wrong. HIP and MUSA both get the helper
 | `__fdiv_rd` of an overflowing positive quotient | the finite maximum `2139095039` |
 | `__frsqrt_rn` of the normal `0x187fffff` | `1392508928`. The reciprocal of the rounded square root is `1392508929` |
 | `__frsqrt_rn(-0)` | `-inf` |
+| `__ddiv_rz` / `__ddiv_rd` of an overflowing positive quotient | the finite maximum `9218868437227405311` |
+| `__ddiv_ru` of a quotient that underflows to the bottom | `1`. `__ddiv_rn` gives `0` |
+| `__ddiv_rz/ru/rd` of two NaNs | the first operand, quieted. `__ddiv_rn` keeps the second |
 | `fminf(+0, -0)` / `fmaxf(+0, -0)` | `-0` / `+0`. `fmaxf(-0, -0)` stays `-0` |
 | two float NaNs passed to `fminf` | the canonical quiet NaN `2147483647`. A number wins over one NaN |
 | `nextafterf(+0, -0)` | `-0`. `nextafterf(+0, +inf)` is the smallest subnormal |

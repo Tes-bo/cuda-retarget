@@ -2305,6 +2305,106 @@ for _mode in ("rn", "rz", "ru", "rd"):
 FDIV_HELPERS["__frsqrt_rn"] = ("cts_frsqrt_rn", FDIV_RSQRT_HELPER)
 
 
+# Directed double division, reciprocal, and square root. NaN payloads are
+# kept and quieted; two NaNs keep the second operand. 0/0, inf/inf, and the
+# square root of a negative number are the negative quiet NaN.
+DDIV_DIV = """
+static __device__ unsigned long long cts_ddiv(unsigned long long a, unsigned long long b, int mode) {
+    if (cts_disnan(a) || cts_disnan(b)) return cts_dquiet(mode == 0 ? (cts_disnan(b) ? b : a) : (cts_disnan(a) ? a : b));
+    int sign = (int)((a >> 63) ^ (b >> 63));
+    int ea = (int)((a >> 52) & 0x7ff), eb = (int)((b >> 52) & 0x7ff);
+    unsigned long long fa = a & 0xfffffffffffffull, fb = b & 0xfffffffffffffull;
+    int a0 = (ea | fa) == 0, b0 = (eb | fb) == 0;
+    int ainf = ea == 2047, binf = eb == 2047;
+    if ((a0 && b0) || (ainf && binf)) return 0xfff8000000000000ull;
+    if (a0 || binf) return sign ? 0x8000000000000000ull : 0ull;
+    if (b0 || ainf) return ((unsigned long long)sign << 63) | 0x7ff0000000000000ull;
+    unsigned long long ma = ea ? (fa | 0x10000000000000ull) : fa;
+    unsigned long long mb = eb ? (fb | 0x10000000000000ull) : fb;
+    int xa = ea ? ea : 1, xb = eb ? eb : 1;
+    while (!(ma & 0x10000000000000ull)) { ma <<= 1; xa--; }
+    while (!(mb & 0x10000000000000ull)) { mb <<= 1; xb--; }
+    unsigned __int128 num = (unsigned __int128)ma << 75;
+    unsigned __int128 q = num / mb;
+    if (num % mb) q |= 1;
+    return cts_dpack(sign, xa - xb + 1023 + 41, q, mode);
+}
+"""
+
+DDIV_SQRT = """
+static __device__ unsigned long long cts_dsqrt(unsigned long long a, int mode) {
+    if (cts_disnan(a)) return cts_dquiet(a);
+    int ea = (int)((a >> 52) & 0x7ff);
+    unsigned long long fa = a & 0xfffffffffffffull;
+    if ((ea | fa) == 0) return a;
+    if (a >> 63) return 0xfff8000000000000ull;
+    if (ea == 2047) return a;
+    unsigned long long m = ea ? (fa | 0x10000000000000ull) : fa;
+    int e = (ea ? ea : 1) - 1023;
+    while (!(m & 0x10000000000000ull)) { m <<= 1; e--; }
+    int odd = e & 1;
+    int half = (e - odd) / 2;
+    unsigned __int128 x = (unsigned __int128)m << (odd ? 75 : 74);
+    int sticky = 0;
+    unsigned __int128 root = cts_isqrt(x, &sticky);
+    if (sticky) root |= 1;
+    return cts_dpack(0, half + 1023 + 53, root, mode);
+}
+"""
+
+
+def _ddiv_binary(mode: str) -> str:
+    code = _FARITH_CODE[mode]
+    return f"""
+static __device__ double cts_ddiv_{mode}(double a, double b) {{
+    union {{ double as_double; unsigned long long as_bits; }} x, y, out;
+    x.as_double = a;
+    y.as_double = b;
+    out.as_bits = cts_ddiv(x.as_bits, y.as_bits, {code});
+    return out.as_double;
+}}
+"""
+
+
+def _ddiv_rcp(mode: str) -> str:
+    code = _FARITH_CODE[mode]
+    return f"""
+static __device__ double cts_drcp_{mode}(double a) {{
+    union {{ double as_double; unsigned long long as_bits; }} x, out;
+    x.as_double = a;
+    out.as_bits = cts_ddiv(0x3ff0000000000000ull, x.as_bits, {code});
+    return out.as_double;
+}}
+"""
+
+
+def _ddiv_sqrt(mode: str) -> str:
+    code = _FARITH_CODE[mode]
+    return f"""
+static __device__ double cts_dsqrt_{mode}(double a) {{
+    union {{ double as_double; unsigned long long as_bits; }} x, out;
+    x.as_double = a;
+    out.as_bits = cts_dsqrt(x.as_bits, {code});
+    return out.as_double;
+}}
+"""
+
+
+DDIV_HELPERS: dict[str, tuple[str, str]] = {}
+for _mode in ("rn", "rz", "ru", "rd"):
+    DDIV_HELPERS[f"__ddiv_{_mode}"] = (f"cts_ddiv_{_mode}", _ddiv_binary(_mode))
+    DDIV_HELPERS[f"__drcp_{_mode}"] = (f"cts_drcp_{_mode}", _ddiv_rcp(_mode))
+    DDIV_HELPERS[f"__dsqrt_{_mode}"] = (f"cts_dsqrt_{_mode}", _ddiv_sqrt(_mode))
+
+
+def ddiv_needs_div(names: set[str]) -> bool:
+    return any(name.startswith("cts_ddiv_") or name.startswith("cts_drcp_") for name in names)
+
+
+def ddiv_needs_sqrt(names: set[str]) -> bool:
+    return any(name.startswith("cts_dsqrt_") for name in names)
+
+
 def fdiv_needs_div(names: set[str]) -> bool:
     return any(name.startswith("cts_fdiv_") or name.startswith("cts_frcp_") for name in names)
 

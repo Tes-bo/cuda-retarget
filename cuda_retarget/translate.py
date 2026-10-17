@@ -40,6 +40,9 @@ from cuda_retarget.dialect import (
     ROUND_I32,
     ROUND_I64,
     SATURATE_HELPERS,
+    DDIV_DIV,
+    DDIV_HELPERS,
+    DDIV_SQRT,
     FDIV_DIV,
     FDIV_HELPERS,
     FDIV_ISQRT,
@@ -86,6 +89,8 @@ from cuda_retarget.dialect import (
     HPRED_NAN,
     HPRED_SIGN,
     Dialect,
+    ddiv_needs_div,
+    ddiv_needs_sqrt,
     fdiv_needs_div,
     fdiv_needs_rsqrt,
     fdiv_needs_sqrt,
@@ -407,6 +412,13 @@ def _call_edit(
         if parsed is None or len(parsed[0]) != arity:
             raise TranslateError(f"{token.spelling} must have {arity} arguments")
         replacement, _helper = FDIV_HELPERS[token.spelling]
+        return (token.start, token.end, replacement)
+    if dialect.lower_fdiv and token.spelling in DDIV_HELPERS:
+        parsed = _arguments(tokens, index + 1)
+        arity = 2 if token.spelling.startswith("__ddiv_") else 1
+        if parsed is None or len(parsed[0]) != arity:
+            raise TranslateError(f"{token.spelling} must have {arity} arguments")
+        replacement, _helper = DDIV_HELPERS[token.spelling]
         return (token.start, token.end, replacement)
     if dialect.lower_fmin and token.spelling in FMIN_HELPERS:
         if _is_define_name(tokens, index) or _is_declared_here(tokens, index):
@@ -766,6 +778,21 @@ def _helpers(dialect: Dialect, rewritten: str) -> str:
                 blocks.append(FDIV_SQRT.strip("\n"))
             if fdiv_needs_rsqrt(names):
                 blocks.append(FDIV_RSQRT.strip("\n"))
+            for _name, helper in used:
+                blocks.append(helper.strip("\n"))
+    if dialect.lower_fdiv:
+        used = [(name, helper) for name, helper in DDIV_HELPERS.values() if f"{name}(" in rewritten]
+        names = {name for name, _helper in used}
+        if names:
+            joined = "\n".join(blocks)
+            if "static __device__ unsigned long long cts_dpack(" not in joined:
+                blocks.append(DARITH_PACK.strip("\n"))
+            if ddiv_needs_div(names):
+                blocks.append(DDIV_DIV.strip("\n"))
+            if ddiv_needs_sqrt(names):
+                if "cts_isqrt(" not in joined:
+                    blocks.append(FDIV_ISQRT.strip("\n"))
+                blocks.append(DDIV_SQRT.strip("\n"))
             for _name, helper in used:
                 blocks.append(helper.strip("\n"))
     if dialect.lower_fmin:

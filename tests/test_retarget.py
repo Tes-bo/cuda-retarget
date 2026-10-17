@@ -36,6 +36,9 @@ from cuda_retarget.dialect import (
     ROUND_I32,
     ROUND_I64,
     SATURATE_HELPERS,
+    DDIV_DIV,
+    DDIV_HELPERS,
+    DDIV_SQRT,
     FDIV_DIV,
     FDIV_HELPERS,
     FDIV_ISQRT,
@@ -814,6 +817,33 @@ __global__ void divide(float* f) { *f = __fsqrt_rn(*f); }
         self.assertIn("cts_isqrt", hip)
         self.assertIn("cts_fsqrt(", hip)
         self.assertNotIn("cts_fdiv(", hip)
+        self.assertEqual(translate_source(source, "maca"), source)
+
+    def test_hip_and_musa_lower_double_division(self) -> None:
+        source = """\
+#include <cuda_runtime.h>
+__global__ void divide(double* d) {
+    *d = __ddiv_ru(*d, 3.0);
+    *d = __drcp_rz(*d);
+    *d = __dsqrt_rd(*d);
+}
+"""
+        for target in ("hip", "musa"):
+            translated = translate_source(source, target)
+            self.assertIn("cts_ddiv_ru(*d, 3.0)", translated)
+            self.assertIn("cts_drcp_rz(*d)", translated)
+            self.assertIn("cts_dsqrt_rd(*d)", translated)
+            self.assertEqual(translated.count("unsigned long long cts_dpack("), 1)
+            self.assertIn("cts_isqrt", translated)
+            self.assertNotIn("__ddiv_ru(", translated)
+            self.assertNotIn("__dsqrt_rd(", translated)
+        rcp_only = """\
+#include <cuda_runtime.h>
+__global__ void divide(double* d) { *d = __drcp_rn(*d); }
+"""
+        hip = translate_source(rcp_only, "hip")
+        self.assertIn("cts_ddiv(", hip)
+        self.assertNotIn("cts_isqrt", hip)
         self.assertEqual(translate_source(source, "maca"), source)
 
     def test_hip_and_musa_lower_minmax_and_nextafter(self) -> None:
@@ -1646,6 +1676,22 @@ class CorpusTests(unittest.TestCase):
         self.assertIn("__fdiv_rn", maca)
         self.assertIn("__frsqrt_rn", maca)
         self.assertNotIn("cts_fdiv_rn", maca)
+
+    def test_hip_and_musa_lower_the_census_ddiv(self) -> None:
+        path = CENSUS / "ddiv" / "main.cu"
+        if not path.is_file():
+            self.skipTest("ddiv is not in the census corpus")
+        maca = translate_path(path, "maca")
+        for target in ("hip", "musa"):
+            translated = translate_path(path, target)
+            for mode in ("rn", "rz", "ru", "rd"):
+                for op in ("ddiv", "drcp", "dsqrt"):
+                    self.assertNotIn(f"__{op}_{mode}(", translated)
+            self.assertIn("cts_ddiv_rn(", translated)
+            self.assertIn("cts_dsqrt_rn(", translated)
+            self.assertIn("cts_drcp_rn(", translated)
+        self.assertIn("__ddiv_rn(", maca)
+        self.assertNotIn("cts_ddiv", maca)
 
     def test_hip_and_musa_lower_the_census_fminmax(self) -> None:
         path = CENSUS / "fminmax" / "main.cu"
@@ -3455,6 +3501,63 @@ __global__ void compare(int* bad) {
     if (__float_as_uint(cts_frsqrt_rn(gap)) != __float_as_uint(__frsqrt_rn(gap))) atomicExch(bad, 1);
     if (__float_as_uint(cts_frsqrt_rn(0.0f)) != __float_as_uint(__frsqrt_rn(0.0f))) atomicExch(bad, 1);
     if (__float_as_uint(cts_frsqrt_rn(-0.0f)) != __float_as_uint(__frsqrt_rn(-0.0f))) atomicExch(bad, 1);
+}
+int main() {
+    int* bad = nullptr;
+    if (cudaMalloc(&bad, sizeof(*bad)) != cudaSuccess) return 2;
+    if (cudaMemset(bad, 0, sizeof(*bad)) != cudaSuccess) return 2;
+    compare<<<1, 1>>>(bad);
+    if (cudaDeviceSynchronize() != cudaSuccess) return 3;
+    int mismatch = 0;
+    if (cudaMemcpy(&mismatch, bad, sizeof(mismatch), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
+    std::printf("mismatch=%d\\n", mismatch);
+    cudaFree(bad);
+    return 0;
+}
+""",
+        )
+
+    def test_double_division_helpers_agree_with_the_intrinsics(self) -> None:
+        helpers = "\n".join(
+            [
+                DARITH_PACK.strip("\n"),
+                FDIV_ISQRT.strip("\n"),
+                DDIV_DIV.strip("\n"),
+                DDIV_SQRT.strip("\n"),
+                *(helper.strip("\n") for _name, helper in DDIV_HELPERS.values()),
+            ]
+        )
+        self._nvcc_mismatch(
+            "ddiv",
+            """\
+#include <cstdio>
+#include <cuda_runtime.h>
+"""
+            + helpers
+            + """
+#define B(v) ((unsigned long long)__double_as_longlong(v))
+__global__ void compare(int* bad) {
+    const unsigned long long vals[] = {
+        0ull, 0x8000000000000000ull, 1ull, 0x000fffffffffffffull, 0x0010000000000000ull,
+        0x3ff0000000000000ull, 0x4000000000000000ull, 0x4008000000000000ull,
+        0x3ff0000000000001ull, 0x7fefffffffffffffull, 0x7ff0000000000000ull,
+        0xfff0000000000000ull, 0x7ff0000000000001ull, 0xfff8000000000002ull,
+        0xbff0000000000000ull, 0x0000000000000003ull
+    };
+    const int n = 16;
+    for (int i = 0; i < n; ++i) for (int j = 0; j < n; ++j) for (int mode = 0; mode < 4; ++mode) {
+        double x = __longlong_as_double(vals[i]);
+        double y = __longlong_as_double(vals[j]);
+        double rd = mode == 0 ? __ddiv_rn(x, y) : mode == 1 ? __ddiv_rz(x, y) : mode == 2 ? __ddiv_ru(x, y) : __ddiv_rd(x, y);
+        double gd = mode == 0 ? cts_ddiv_rn(x, y) : mode == 1 ? cts_ddiv_rz(x, y) : mode == 2 ? cts_ddiv_ru(x, y) : cts_ddiv_rd(x, y);
+        if (B(rd) != B(gd)) atomicExch(bad, 1);
+        double rr = mode == 0 ? __drcp_rn(x) : mode == 1 ? __drcp_rz(x) : mode == 2 ? __drcp_ru(x) : __drcp_rd(x);
+        double gr = mode == 0 ? cts_drcp_rn(x) : mode == 1 ? cts_drcp_rz(x) : mode == 2 ? cts_drcp_ru(x) : cts_drcp_rd(x);
+        if (B(rr) != B(gr)) atomicExch(bad, 1);
+        double rs = mode == 0 ? __dsqrt_rn(x) : mode == 1 ? __dsqrt_rz(x) : mode == 2 ? __dsqrt_ru(x) : __dsqrt_rd(x);
+        double gs = mode == 0 ? cts_dsqrt_rn(x) : mode == 1 ? cts_dsqrt_rz(x) : mode == 2 ? cts_dsqrt_ru(x) : cts_dsqrt_rd(x);
+        if (B(rs) != B(gs)) atomicExch(bad, 1);
+    }
 }
 int main() {
     int* bad = nullptr;
