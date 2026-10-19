@@ -9,6 +9,7 @@ too, so a name inside `#define` is rewritten at its definition.
 
 from __future__ import annotations
 
+import re
 import tempfile
 from pathlib import Path
 
@@ -127,6 +128,11 @@ from cuda_retarget.dialect import (
     hpred_needs_cmp,
     hpred_needs_minmax,
     hpred_needs_sign,
+    PTX_BFE_S32,
+    PTX_BFE_U32,
+    PTX_BFI,
+    PTX_LOP3,
+    PTX_PRMT,
     round_needs_bits,
     round_needs_d2f,
     round_needs_i32,
@@ -136,6 +142,11 @@ from cuda_retarget.dialect import (
 from cuda_retarget.parse import ParseError, Tok, parse_file
 
 _FULL_MASKS = {"0xffffffff", "0xffffffffu", "0xffffffffl", "0xffffffffll", "0xffffffffull"}
+_PTX_LOP3 = re.compile(r"^lop3\.b32%0,%1,%2,%3,(0[xX][0-9a-fA-F]+|[0-9]+);$")
+_PTX_BFE_U32 = re.compile(r"^bfe\.u32%0,%1,%2,%3;$")
+_PTX_BFE_S32 = re.compile(r"^bfe\.s32%0,%1,%2,%3;$")
+_PTX_BFI = re.compile(r"^bfi\.b32%0,%1,%2,%3,%4;$")
+_PTX_PRMT = re.compile(r"^prmt\.b32%0,%1,%2,%3;$")
 # Same default width as __shfl_sync: the last argument defaults to warpSize.
 _SHUFFLES = {"__shfl_sync", "__shfl_xor_sync", "__shfl_up_sync", "__shfl_down_sync"}
 _MATCHES = {"__match_any_sync": 2, "__match_all_sync": 3}
@@ -186,6 +197,11 @@ def _edits(text: str, tokens: list[Tok], dialect: Dialect) -> list[tuple[int, in
             edits.append(header[0])
             index = header[1]
             continue
+        asm = _asm_edit(text, tokens, index, dialect)
+        if asm is not None:
+            edits.append(asm[0])
+            index = asm[1]
+            continue
         call = _call_edit(text, tokens, index, dialect)
         if call is not None:
             edits.append(call)
@@ -219,6 +235,148 @@ def _header_edit(
     if name not in dialect.headers:
         return None
     return (window[0].start, window[-1].end, f"<{dialect.headers[name]}>"), index + 5
+
+
+def _asm_constraint(spelling: str) -> str:
+    if len(spelling) >= 2 and spelling[0] == '"' and spelling[-1] == '"':
+        return spelling[1:-1].strip()
+    return spelling.strip()
+
+
+def _ptx_form(body: str) -> tuple[str, int, str] | None:
+    compact = "".join(body.split())
+    lop3 = _PTX_LOP3.fullmatch(compact)
+    if lop3 is not None:
+        immediate = lop3.group(1)
+        if immediate.lower().startswith("0x"):
+            value = int(immediate, 16)
+        else:
+            value = int(immediate, 10)
+        if value > 255:
+            raise TranslateError(f"lop3.b32 immediate {immediate} is wider than 8 bits")
+        return "cts_lop3", 3, immediate
+    if _PTX_BFE_U32.fullmatch(compact):
+        return "cts_bfe_u32", 3, ""
+    if _PTX_BFE_S32.fullmatch(compact):
+        return "cts_bfe_s32", 3, ""
+    if _PTX_BFI.fullmatch(compact):
+        return "cts_bfi", 4, ""
+    if _PTX_PRMT.fullmatch(compact):
+        return "cts_prmt", 3, ""
+    return None
+
+
+def _asm_operand(
+    tokens: list[Tok], cursor: int
+) -> tuple[str, int, int, int] | None:
+    if cursor + 1 >= len(tokens) or tokens[cursor].kind != "LITERAL":
+        return None
+    if tokens[cursor + 1].spelling != "(":
+        return None
+    depth = 0
+    expr_start: int | None = None
+    for index in range(cursor + 1, len(tokens)):
+        spelling = tokens[index].spelling
+        if spelling == "(":
+            depth += 1
+            if depth == 1:
+                expr_start = tokens[index + 1].start if index + 1 < len(tokens) else None
+            continue
+        if spelling == ")":
+            depth -= 1
+            if depth == 0:
+                if expr_start is None or index == cursor + 2:
+                    return None
+                return _asm_constraint(tokens[cursor].spelling), expr_start, tokens[index - 1].end, index + 1
+            continue
+    return None
+
+
+def _operand_text(
+    text: str, tokens: list[Tok], start: int, end: int, dialect: Dialect
+) -> str:
+    edits: list[tuple[int, int, str]] = []
+    for index, token in enumerate(tokens):
+        if token.start < start or token.end > end or token.kind != "IDENTIFIER":
+            continue
+        if (
+            dialect.shuffle_width_32
+            and token.spelling == "warpSize"
+            and not _is_define_name(tokens, index)
+        ):
+            edits.append((token.start, token.end, "32"))
+            continue
+        renamed = runtime_name(token.spelling, dialect)
+        if renamed is not None:
+            edits.append((token.start, token.end, renamed))
+    data = bytearray(text.encode()[start:end])
+    for edit_start, edit_end, replacement in sorted(edits, key=lambda item: item[0], reverse=True):
+        data[edit_start - start : edit_end - start] = replacement.encode()
+    return data.decode()
+
+
+def _asm_edit(
+    text: str, tokens: list[Tok], index: int, dialect: Dialect
+) -> tuple[tuple[int, int, str], int] | None:
+    if not dialect.lower_ptx or tokens[index].spelling != "asm":
+        return None
+    cursor = index + 1
+    if cursor < len(tokens) and tokens[cursor].spelling == "volatile":
+        cursor += 1
+    if cursor >= len(tokens) or tokens[cursor].spelling != "(":
+        return None
+    cursor += 1
+    if cursor >= len(tokens) or tokens[cursor].kind != "LITERAL":
+        return None
+    literal = tokens[cursor].spelling
+    if len(literal) < 2 or literal[0] != '"' or literal[-1] != '"':
+        return None
+    cursor += 1
+    if cursor < len(tokens) and tokens[cursor].kind == "LITERAL":
+        return None
+    try:
+        form = _ptx_form(literal[1:-1])
+    except TranslateError:
+        raise
+    if form is None:
+        return None
+    helper, inputs, immediate = form
+    if cursor >= len(tokens) or tokens[cursor].spelling != ":":
+        raise TranslateError(f"inline {helper} is not a single =r output")
+    cursor += 1
+    output = _asm_operand(tokens, cursor)
+    if output is None:
+        raise TranslateError(f"inline {helper} is not a single =r output")
+    constraint, expr_start, expr_end, cursor = output
+    if constraint != "=r":
+        raise TranslateError(f"inline {helper} output constraint {constraint} is not =r")
+    if cursor < len(tokens) and tokens[cursor].spelling == ",":
+        raise TranslateError(f"inline {helper} has more than one output")
+    if cursor >= len(tokens) or tokens[cursor].spelling != ":":
+        raise TranslateError(f"inline {helper} inputs are not r operands")
+    cursor += 1
+    arguments: list[str] = []
+    for number in range(inputs):
+        if number:
+            if cursor >= len(tokens) or tokens[cursor].spelling != ",":
+                raise TranslateError(f"inline {helper} needs {inputs} r operands")
+            cursor += 1
+        operand = _asm_operand(tokens, cursor)
+        if operand is None:
+            raise TranslateError(f"inline {helper} needs {inputs} r operands")
+        in_constraint, in_start, in_end, cursor = operand
+        if in_constraint != "r":
+            raise TranslateError(f"inline {helper} input constraint {in_constraint} is not r")
+        arguments.append(_operand_text(text, tokens, in_start, in_end, dialect))
+    if cursor < len(tokens) and tokens[cursor].spelling in {",", ":"}:
+        raise TranslateError(f"inline {helper} is not the single-instruction form")
+    if cursor >= len(tokens) or tokens[cursor].spelling != ")":
+        raise TranslateError(f"inline {helper} is not the single-instruction form")
+    if immediate:
+        arguments.append(immediate)
+    destination = _operand_text(text, tokens, expr_start, expr_end, dialect)
+    replacement = f"{destination} = {helper}({', '.join(arguments)})"
+    return (tokens[index].start, tokens[cursor].end, replacement), cursor + 1
 
 
 def _call_edit(
@@ -813,6 +971,17 @@ def _helpers(dialect: Dialect, rewritten: str) -> str:
                 blocks.append(DMIN_NEXT.strip("\n"))
             for _name, helper in used:
                 blocks.append(helper.strip("\n"))
+    if dialect.lower_ptx:
+        if "cts_lop3(" in rewritten:
+            blocks.append(PTX_LOP3.strip("\n"))
+        if "cts_bfe_u32(" in rewritten:
+            blocks.append(PTX_BFE_U32.strip("\n"))
+        if "cts_bfe_s32(" in rewritten:
+            blocks.append(PTX_BFE_S32.strip("\n"))
+        if "cts_bfi(" in rewritten:
+            blocks.append(PTX_BFI.strip("\n"))
+        if "cts_prmt(" in rewritten:
+            blocks.append(PTX_PRMT.strip("\n"))
     return "\n\n".join(blocks)
 
 

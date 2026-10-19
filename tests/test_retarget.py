@@ -846,6 +846,103 @@ __global__ void divide(double* d) { *d = __drcp_rn(*d); }
         self.assertNotIn("cts_isqrt", hip)
         self.assertEqual(translate_source(source, "maca"), source)
 
+    def test_hip_and_musa_lower_inline_ptx(self) -> None:
+        source = """\
+#include <cuda_runtime.h>
+__global__ void logic(unsigned* u) {
+    unsigned a = u[0], b = u[1], c = u[2], d = 0, cudaLane = u[5];
+    asm volatile ("lop3.b32 %0, %1, %2, %3, 0x96;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
+    asm("bfe.u32 %0, %1, %2, %3;" : "=r"(u[1]) : "r"(a), "r"(b), "r"(c));
+    asm("bfe.s32 %0, %1, %2, %3;" : "=r"(u[2]) : "r"(a), "r"(b), "r"(c));
+    asm("bfi.b32 %0, %1, %2, %3, %4;" : "=r"(u[3]) : "r"(a), "r"(b), "r"(c), "r"(d));
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(u[4]) : "r"(a), "r"(b), "r"(cudaLane));
+    asm("bar.sync 0;");
+    asm("mov.b32 %0, %1;" : "=r"(d) : "r"(a));
+    u[0] = d;
+}
+"""
+        for target, lane in (("hip", "hipLane"), ("musa", "musaLane")):
+            translated = translate_source(source, target)
+            self.assertIn("d = cts_lop3(a, b, c, 0x96);", translated)
+            self.assertIn("u[1] = cts_bfe_u32(a, b, c);", translated)
+            self.assertIn("u[2] = cts_bfe_s32(a, b, c);", translated)
+            self.assertIn("u[3] = cts_bfi(a, b, c, d);", translated)
+            self.assertIn(f"u[4] = cts_prmt(a, b, {lane});", translated)
+            self.assertIn('asm("bar.sync 0;");', translated)
+            self.assertIn('asm("mov.b32 %0, %1;" : "=r"(d) : "r"(a));', translated)
+            self.assertNotIn("lop3.b32", translated)
+            self.assertNotIn("bfe.u32", translated)
+            self.assertNotIn("prmt.b32", translated)
+        spaced = """\
+#include <cuda_runtime.h>
+__device__ unsigned logic(unsigned a, unsigned b, unsigned c) {
+    unsigned d;
+    asm ( "lop3.b32  %0 , %1 , %2 , %3 , 0xF0 ;" : "=r" ( d ) : "r" ( a ) , "r" ( b ) , "r" ( c ) ) ;
+    return d;
+}
+"""
+        hip = translate_source(spaced, "hip")
+        self.assertIn("d = cts_lop3(a, b, c, 0xF0)", hip)
+        lop_only = """\
+#include <cuda_runtime.h>
+__device__ unsigned logic(unsigned a, unsigned b, unsigned c) {
+    unsigned d;
+    asm("lop3.b32 %0, %1, %2, %3, 150;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
+    return d;
+}
+"""
+        hip = translate_source(lop_only, "hip")
+        self.assertIn("cts_lop3(a, b, c, 150)", hip)
+        self.assertNotIn("cts_bfe_u32", hip)
+        self.assertNotIn("cts_bfe_s32", hip)
+        self.assertNotIn("cts_bfi", hip)
+        self.assertNotIn("cts_prmt", hip)
+        bfe_only = """\
+#include <cuda_runtime.h>
+__device__ unsigned logic(unsigned a, unsigned pos, unsigned len) {
+    unsigned d;
+    asm("bfe.u32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(pos), "r"(len));
+    return d;
+}
+"""
+        hip = translate_source(bfe_only, "hip")
+        self.assertIn("cts_bfe_u32(", hip)
+        self.assertNotIn("cts_bfe_s32", hip)
+        self.assertNotIn("cts_lop3", hip)
+        self.assertNotIn("cts_prmt", hip)
+        stayed = """\
+#include <cuda_runtime.h>
+__device__ unsigned logic(unsigned a) {
+    unsigned d;
+    asm("lop3.b32 %0, %1, %2, %3, 0x96;\\n\\tmov.b32 %0, %0;" : "=r"(d) : "r"(a), "r"(a), "r"(a));
+    return d;
+}
+"""
+        stayed_hip = translate_source(stayed, "hip")
+        self.assertIn('asm("lop3.b32 %0, %1, %2, %3, 0x96;\\n\\tmov.b32 %0, %0;"', stayed_hip)
+        self.assertNotIn("cts_lop3", stayed_hip)
+        wide = """\
+#include <cuda_runtime.h>
+__device__ unsigned logic(unsigned a, unsigned b, unsigned c) {
+    unsigned d;
+    asm("lop3.b32 %0, %1, %2, %3, 0x196;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
+    return d;
+}
+"""
+        with self.assertRaises(TranslateError):
+            translate_source(wide, "hip")
+        clobber = """\
+#include <cuda_runtime.h>
+__device__ unsigned logic(unsigned a, unsigned b, unsigned s) {
+    unsigned d;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(s) : "memory");
+    return d;
+}
+"""
+        with self.assertRaises(TranslateError):
+            translate_source(clobber, "hip")
+        self.assertEqual(translate_source(source, "maca"), source)
+
     def test_hip_and_musa_lower_minmax_and_nextafter(self) -> None:
         source = """\
 #include <cuda_runtime.h>
@@ -1692,6 +1789,28 @@ class CorpusTests(unittest.TestCase):
             self.assertIn("cts_drcp_rn(", translated)
         self.assertIn("__ddiv_rn(", maca)
         self.assertNotIn("cts_ddiv", maca)
+
+    def test_hip_and_musa_lower_the_census_ptx(self) -> None:
+        path = CENSUS / "ptx" / "main.cu"
+        if not path.is_file():
+            self.skipTest("ptx is not in the census corpus")
+        maca = translate_path(path, "maca")
+        for target in ("hip", "musa"):
+            translated = translate_path(path, target)
+            self.assertIn("cts_lop3(a, b, c, 0x96)", translated)
+            self.assertIn("cts_bfe_u32(word, p4, p8)", translated)
+            self.assertIn("cts_bfe_s32(one, p0, p1)", translated)
+            self.assertIn("cts_bfe_s32(zero, p32, p1)", translated)
+            self.assertIn("cts_bfi(src, base, p8, p8)", translated)
+            self.assertIn("cts_prmt(pa, pc, sign)", translated)
+            self.assertIn("cts_byte_perm(pa, pc, sign)", translated)
+            self.assertNotIn("lop3.b32", translated)
+            self.assertNotIn("bfe.s32", translated)
+            self.assertNotIn("prmt.b32", translated)
+            self.assertNotIn("__byte_perm(", translated)
+        self.assertIn("lop3.b32", maca)
+        self.assertIn("prmt.b32", maca)
+        self.assertNotIn("cts_lop3", maca)
 
     def test_hip_and_musa_lower_the_census_fminmax(self) -> None:
         path = CENSUS / "fminmax" / "main.cu"
@@ -4285,6 +4404,110 @@ int main() {{
     int mismatch = 0;
     if (cudaMemcpy(&mismatch, bad, sizeof(mismatch), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
     std::printf("mismatch=%d\\n", mismatch);
+    cudaFree(bad);
+    return 0;
+}}
+""",
+        )
+
+    def test_inline_ptx_helpers_agree_with_the_instructions(self) -> None:
+        from cuda_retarget.dialect import PTX_BFE_S32, PTX_BFE_U32, PTX_BFI, PTX_LOP3, PTX_PRMT
+
+        luts = (0x00, 0x01, 0x80, 0x96, 0xAA, 0xCC, 0xE4, 0xF0, 0xFF)
+        lop_checks = "\n".join(
+            f'asm("lop3.b32 %0, %1, %2, %3, {lut:#x};" : "=r"(ref) : "r"(va), "r"(vb), "r"(vc));\n'
+            f"        if (cts_lop3(va, vb, vc, {lut}) != ref) atomicAdd(bad, 1);"
+            for lut in luts
+        )
+        helpers = "\n".join(
+            helper.strip("\n") for helper in (PTX_LOP3, PTX_BFE_U32, PTX_BFE_S32, PTX_BFI, PTX_PRMT)
+        )
+        count = 16
+        self._nvcc_mismatch(
+            "ptx",
+            f"""\
+#include <cstdio>
+#include <cuda_runtime.h>
+{helpers}
+__global__ void compare(const unsigned* in, int n, int* bad) {{
+    for (int i = 0; i < n; ++i) {{
+        for (int j = 0; j < n; ++j) {{
+            for (int k = 0; k < n; ++k) {{
+                unsigned va = in[i], vb = in[j], vc = in[k];
+                unsigned ref;
+                {lop_checks}
+            }}
+        }}
+    }}
+    for (int i = 0; i < n; ++i) {{
+        unsigned value = in[i];
+        for (unsigned pos = 0; pos <= 40; ++pos) {{
+            for (unsigned len = 0; len <= 40; ++len) {{
+                volatile unsigned vpos = pos, vlen = len, vval = value;
+                unsigned ref;
+                asm("bfe.u32 %0, %1, %2, %3;" : "=r"(ref) : "r"(vval), "r"(vpos), "r"(vlen));
+                if (cts_bfe_u32(vval, vpos, vlen) != ref) atomicAdd(bad, 1);
+                asm("bfe.s32 %0, %1, %2, %3;" : "=r"(ref) : "r"(vval), "r"(vpos), "r"(vlen));
+                if (cts_bfe_s32(vval, vpos, vlen) != ref) atomicAdd(bad, 1);
+            }}
+        }}
+        unsigned widep[4] = {{0x100u, 0x104u, 0x120u, 255u}};
+        unsigned widel[5] = {{0u, 1u, 8u, 0x101u, 0x120u}};
+        for (unsigned pos : widep) {{
+            for (unsigned len : widel) {{
+                volatile unsigned vpos = pos, vlen = len, vval = value;
+                unsigned ref;
+                asm("bfe.u32 %0, %1, %2, %3;" : "=r"(ref) : "r"(vval), "r"(vpos), "r"(vlen));
+                if (cts_bfe_u32(vval, vpos, vlen) != ref) atomicAdd(bad, 1);
+                asm("bfe.s32 %0, %1, %2, %3;" : "=r"(ref) : "r"(vval), "r"(vpos), "r"(vlen));
+                if (cts_bfe_s32(vval, vpos, vlen) != ref) atomicAdd(bad, 1);
+            }}
+        }}
+    }}
+    for (int i = 0; i < n; ++i) {{
+        for (int j = 0; j < n; ++j) {{
+            unsigned src = in[i], base = in[j];
+            for (unsigned pos = 0; pos <= 40; ++pos) {{
+                for (unsigned len = 0; len <= 40; ++len) {{
+                    volatile unsigned vpos = pos, vlen = len, vsrc = src, vbase = base;
+                    unsigned ref;
+                    asm("bfi.b32 %0, %1, %2, %3, %4;" : "=r"(ref) : "r"(vsrc), "r"(vbase), "r"(vpos), "r"(vlen));
+                    if (cts_bfi(vsrc, vbase, vpos, vlen) != ref) atomicAdd(bad, 1);
+                }}
+            }}
+        }}
+    }}
+    for (int i = 0; i < n; ++i) {{
+        for (int j = 0; j < n; ++j) {{
+            unsigned a = in[i], b = in[j];
+            for (unsigned sel = 0; sel < 256; ++sel) {{
+                unsigned choices[2] = {{sel, sel + 0x10000u}};
+                for (unsigned s : choices) {{
+                    volatile unsigned va = a, vb = b, vs = s;
+                    unsigned ref;
+                    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(ref) : "r"(va), "r"(vb), "r"(vs));
+                    if (cts_prmt(va, vb, vs) != ref) atomicAdd(bad, 1);
+                }}
+            }}
+        }}
+    }}
+}}
+int main() {{
+    unsigned bits[] = {{0u, 1u, 2u, 4u, 0x80u, 0xffu, 0x80000000u, 0x7fffffffu, 0x89abcdefu,
+                        0x12345678u, 0x9abcdef0u, 0x0f0f0f0fu, 0x04030201u, 0x08070605u,
+                        0x80ff7f01u, 0xffffffffu}};
+    unsigned* in = nullptr;
+    int* bad = nullptr;
+    if (cudaMalloc(&in, sizeof(bits)) != cudaSuccess) return 2;
+    if (cudaMemcpy(in, bits, sizeof(bits), cudaMemcpyHostToDevice) != cudaSuccess) return 2;
+    if (cudaMalloc(&bad, sizeof(*bad)) != cudaSuccess) return 2;
+    if (cudaMemset(bad, 0, sizeof(*bad)) != cudaSuccess) return 2;
+    compare<<<1, 1>>>(in, {count}, bad);
+    if (cudaDeviceSynchronize() != cudaSuccess) return 3;
+    int mismatch = 0;
+    if (cudaMemcpy(&mismatch, bad, sizeof(mismatch), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
+    std::printf("mismatch=%d\\n", mismatch);
+    cudaFree(in);
     cudaFree(bad);
     return 0;
 }}

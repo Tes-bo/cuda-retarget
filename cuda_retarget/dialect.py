@@ -371,6 +371,17 @@ class Dialect:
     keeps the number when the other value is NaN, and two NaNs become
     `0x7fff`. `__hmax(+0, -0)` is `+0`. `__hmin(+0, -0)` is `-0`.
     `__hneg` and `__habs` of a NaN are `0x7fff`.
+    `lower_ptx` replaces one inline `lop3.b32`, `bfe.u32`, `bfe.s32`,
+    `bfi.b32`, or `prmt.b32` with an integer helper. The template is one
+    instruction, the output constraint is `=r`, and the inputs are `r`.
+    `lop3.b32` with immediate `0xF0` copies the first operand, `0xCC` the
+    second, and `0xAA` the third. `bfe.s32` of a one-bit field that is set
+    is all ones. A start at bit 32 copies bit 31 of the source for
+    `bfe.s32` and yields 0 for `bfe.u32`. A length of 0 is 0. `bfi.b32`
+    with a start at bit 32 leaves
+    the base. `prmt.b32` sign-replicates a selector nibble whose high bit
+    is set. `__byte_perm` copies that byte. Any other inline PTX stays
+    source.
     """
 
     name: str
@@ -403,6 +414,7 @@ class Dialect:
     lower_fdiv: bool
     lower_fmin: bool
     lower_half: bool
+    lower_ptx: bool
 
 
 DIALECTS = {
@@ -437,6 +449,7 @@ DIALECTS = {
         lower_fdiv=True,
         lower_fmin=True,
         lower_half=True,
+        lower_ptx=True,
     ),
     "musa": Dialect(
         name="musa",
@@ -469,6 +482,7 @@ DIALECTS = {
         lower_fdiv=True,
         lower_fmin=True,
         lower_half=True,
+        lower_ptx=True,
     ),
     "maca": Dialect(
         name="maca",
@@ -501,6 +515,7 @@ DIALECTS = {
         lower_fdiv=False,
         lower_fmin=False,
         lower_half=False,
+        lower_ptx=False,
     ),
 }
 
@@ -3670,6 +3685,88 @@ def hpred_needs_minmax(names: set[str]) -> bool:
 
 def hpred_needs_sign(names: set[str]) -> bool:
     return any(name.startswith(("cts_hneg", "cts_habs")) for name in names)
+
+
+# Measured on sm_70. lop3.b32 immediate 0xF0 copies a, 0xCC copies b, and
+# 0xAA copies c, so the LUT index is (a << 2) | (b << 1) | c. bfe and bfi
+# use the low 8 bits of the position and the length. A length of 0 yields 0
+# from bfe and leaves the base from bfi. A start at bit 32 or above yields 0
+# from bfe.u32. bfe.s32 then copies bit 31 of the source into every bit, so
+# a clear sign bit stays 0. bfi leaves the base. nvcc -O2 folds a constant
+# start of 32 to all ones; a start loaded from memory does not.
+# bfe.s32 sign-extends from the top bit that was actually read. prmt.b32
+# uses the same four nibbles as __byte_perm, and a nibble with bit 3 set
+# replicates the selected byte's sign to 0x00 or 0xFF.
+PTX_LOP3 = """
+static __device__ unsigned cts_lop3(unsigned a, unsigned b, unsigned c, unsigned lut) {
+    unsigned out = 0u;
+    lut &= 0xffu;
+#pragma unroll
+    for (int bit = 0; bit < 8; ++bit) {
+        if (((lut >> bit) & 1u) == 0u) continue;
+        unsigned mask = 0xffffffffu;
+        mask &= (bit & 4) ? a : ~a;
+        mask &= (bit & 2) ? b : ~b;
+        mask &= (bit & 1) ? c : ~c;
+        out |= mask;
+    }
+    return out;
+}
+"""
+
+PTX_BFE_U32 = """
+static __device__ unsigned cts_bfe_u32(unsigned value, unsigned pos, unsigned len) {
+    pos &= 0xffu;
+    len &= 0xffu;
+    if (len == 0u || pos >= 32u) return 0u;
+    unsigned kept = len;
+    if (pos + kept > 32u) kept = 32u - pos;
+    if (kept == 32u) return value;
+    return (value >> pos) & ((1u << kept) - 1u);
+}
+"""
+
+PTX_BFE_S32 = """
+static __device__ unsigned cts_bfe_s32(unsigned value, unsigned pos, unsigned len) {
+    pos &= 0xffu;
+    len &= 0xffu;
+    if (len == 0u) return 0u;
+    if (pos >= 32u) return (value & 0x80000000u) ? 0xffffffffu : 0u;
+    unsigned kept = len;
+    if (pos + kept > 32u) kept = 32u - pos;
+    if (kept == 32u) return value;
+    unsigned field = (value >> pos) & ((1u << kept) - 1u);
+    if (((value >> (pos + kept - 1u)) & 1u) != 0u) field |= ~((1u << kept) - 1u);
+    return field;
+}
+"""
+
+PTX_BFI = """
+static __device__ unsigned cts_bfi(unsigned src, unsigned base, unsigned pos, unsigned len) {
+    pos &= 0xffu;
+    len &= 0xffu;
+    if (len == 0u || pos >= 32u) return base;
+    unsigned kept = len;
+    if (pos + kept > 32u) kept = 32u - pos;
+    unsigned mask = kept == 32u ? 0xffffffffu : (((1u << kept) - 1u) << pos);
+    return (base & ~mask) | ((src << pos) & mask);
+}
+"""
+
+PTX_PRMT = """
+static __device__ unsigned cts_prmt(unsigned a, unsigned b, unsigned selector) {
+    unsigned long long source = (static_cast<unsigned long long>(b) << 32) | a;
+    unsigned out = 0u;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        unsigned nibble = (selector >> (4 * i)) & 0xfu;
+        unsigned byte = static_cast<unsigned>(source >> (8 * (nibble & 7u))) & 0xffu;
+        if ((nibble & 8u) != 0u) byte = (byte & 0x80u) ? 0xffu : 0u;
+        out |= byte << (8 * i);
+    }
+    return out;
+}
+"""
 
 
 def runtime_name(spelling: str, dialect: Dialect) -> str | None:

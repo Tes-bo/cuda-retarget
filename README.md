@@ -154,6 +154,12 @@ These are the results a prefix swap gets wrong. HIP and MUSA both get the helper
 | `__dp4a` of a `0x80` byte | `-128` signed, `128` unsigned |
 | `__byte_perm` | four bytes from `y:x`. Selector bits above bit 15 are ignored |
 | `__funnelshift_l` / `_r` | `shift & 31`. The clamp forms stop at 32 |
+| `lop3.b32` immediate `0xF0` / `0xCC` / `0xAA` | the first, second, or third operand |
+| `lop3.b32` of `1, 2, 4` with immediate `0x80` | `0`. Only a bit set in all three inputs is kept |
+| `bfe.s32` of bit 0 of `1`, length 1 | all ones. `bfe.u32` of the same field is `1` |
+| `bfe.s32` with a start at bit 32 | all ones when bit 31 is set, otherwise `0`. `bfe.u32` is `0`. A length of 0 is `0` |
+| `bfi.b32` with a start at bit 32 | the base, unchanged |
+| `prmt.b32` selector nibble `0x8` | `0` or `0xFF` from that byte's sign. `__byte_perm` copies the byte |
 
 Signed lane `0x8000` and unsigned lane `0x8000` are different numbers in the packed comparisons, min/max, and absolute differences.
 
@@ -161,7 +167,7 @@ Signed lane `0x8000` and unsigned lane `0x8000` are different numbers in the pac
 
 A later vendor compile may reject these, or give them a different meaning:
 
-- Inline PTX.
+- Inline PTX other than one `lop3.b32`, `bfe.u32`, `bfe.s32`, `bfi.b32`, or `prmt.b32` with a single `=r` output and `r` inputs. A second instruction, a predicate, a clobber list, or a different constraint stays source.
 - A shuffle that already has a width argument. That literal is kept.
 - A `__syncwarp` call that already passes a mask.
 - A 3-argument shuffle, a match call, or a vote call whose mask is not the literal `0xffffffff` (`u`, `l`, `ll`, or `ull`). A variable mask is still CUDA's width 32 on NVIDIA and the wavefront width on AMD. This rewriter does not guess which mask the programmer meant.
