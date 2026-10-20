@@ -154,6 +154,11 @@ These are the results a prefix swap gets wrong. HIP and MUSA both get the helper
 | `__dp4a` of a `0x80` byte | `-128` signed, `128` unsigned |
 | `__byte_perm` | four bytes from `y:x`. Selector bits above bit 15 are ignored |
 | `__funnelshift_l` / `_r` | `shift & 31`. The clamp forms stop at 32 |
+| `__ll2double_rn` of `2^53+1` | `4845873199050653696`. Round-up is the next double |
+| `__ll2double_rn` of `2^53+3` | the next even double `4845873199050653698`. Toward zero stays one below |
+| `__ll2double_rd` of `-(2^53+1)` | one double below the nearest-even value, `14069245235905429505` |
+| `__ull2double_rz` of the maximum unsigned value | `4895412794951729151`. Round-up reaches `2^64` |
+| `__int2double_rn(INT_MIN)` | the exact double `13970166044103278592` |
 | `lop3.b32` immediate `0xF0` / `0xCC` / `0xAA` | the first, second, or third operand |
 | `lop3.b32` of `1, 2, 4` with immediate `0x80` | `0`. Only a bit set in all three inputs is kept |
 | `bfe.s32` of bit 0 of `1`, length 1 | all ones. `bfe.u32` of the same field is `1` |

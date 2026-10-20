@@ -38,6 +38,8 @@ from cuda_retarget.dialect import (
     D2F_CORE,
     ROUND_BITS,
     ROUND_HELPERS,
+    I2D_S64,
+    I2D_U64,
     ROUND_I32,
     ROUND_I64,
     SATURATE_HELPERS,
@@ -135,6 +137,8 @@ from cuda_retarget.dialect import (
     PTX_PRMT,
     round_needs_bits,
     round_needs_d2f,
+    round_needs_i2d_s64,
+    round_needs_i2d_u64,
     round_needs_i32,
     round_needs_i64,
     runtime_name,
@@ -785,6 +789,10 @@ def _helpers(dialect: Dialect, rewritten: str) -> str:
             blocks.append(ROUND_I64.strip("\n"))
         if round_needs_d2f(names):
             blocks.append(D2F_CORE.strip("\n"))
+        if round_needs_i2d_u64(names):
+            blocks.append(I2D_U64.strip("\n"))
+        if round_needs_i2d_s64(names):
+            blocks.append(I2D_S64.strip("\n"))
         for _name, helper in used:
             blocks.append(helper.strip("\n"))
     if dialect.lower_saturate:

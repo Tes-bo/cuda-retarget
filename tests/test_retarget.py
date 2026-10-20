@@ -31,6 +31,8 @@ from cuda_retarget.dialect import (
     BIT_HELPERS,
     MUL24_HELPERS,
     D2F_CORE,
+    I2D_S64,
+    I2D_U64,
     ROUND_BITS,
     ROUND_HELPERS,
     ROUND_I32,
@@ -943,6 +945,53 @@ __device__ unsigned logic(unsigned a, unsigned b, unsigned s) {
             translate_source(clobber, "hip")
         self.assertEqual(translate_source(source, "maca"), source)
 
+    def test_hip_and_musa_lower_integer_to_double(self) -> None:
+        source = """\
+#include <cuda_runtime.h>
+__global__ void widen(int* i, unsigned* u, long long* ll, unsigned long long* ull, double* d) {
+    d[0] = __int2double_rn(*i);
+    d[1] = __uint2double_rn(*u);
+    d[2] = __ll2double_ru(*ll);
+    d[3] = __ull2double_rd(*ull);
+}
+"""
+        for target in ("hip", "musa"):
+            translated = translate_source(source, target)
+            self.assertIn("cts_int2double_rn(*i)", translated)
+            self.assertIn("cts_uint2double_rn(*u)", translated)
+            self.assertIn("cts_ll2double_ru(*ll)", translated)
+            self.assertIn("cts_ull2double_rd(*ull)", translated)
+            self.assertIn("cts_i2d_u64", translated)
+            self.assertIn("cts_i2d_s64", translated)
+            self.assertNotIn("__ll2double_ru(", translated)
+            self.assertNotIn("__ull2double_rd(", translated)
+        ll_only = """\
+#include <cuda_runtime.h>
+__global__ void widen(long long* ll, double* d) { *d = __ll2double_rz(*ll); }
+"""
+        hip = translate_source(ll_only, "hip")
+        self.assertIn("cts_i2d_s64", hip)
+        self.assertIn("cts_i2d_u64", hip)
+        self.assertNotIn("cts_ull2double_", hip)
+        self.assertNotIn("cts_int2double_", hip)
+        ull_only = """\
+#include <cuda_runtime.h>
+__global__ void widen(unsigned long long* u, double* d) { *d = __ull2double_rn(*u); }
+"""
+        hip = translate_source(ull_only, "hip")
+        self.assertIn("cts_i2d_u64", hip)
+        self.assertNotIn("cts_i2d_s64", hip)
+        self.assertNotIn("cts_ll2double_", hip)
+        exact_only = """\
+#include <cuda_runtime.h>
+__global__ void widen(int* i, double* d) { *d = __int2double_rn(*i); }
+"""
+        hip = translate_source(exact_only, "hip")
+        self.assertIn("cts_int2double_rn(*i)", hip)
+        self.assertNotIn("cts_i2d_u64", hip)
+        self.assertNotIn("cts_ll2double_", hip)
+        self.assertEqual(translate_source(source, "maca"), source)
+
     def test_hip_and_musa_lower_minmax_and_nextafter(self) -> None:
         source = """\
 #include <cuda_runtime.h>
@@ -1811,6 +1860,26 @@ class CorpusTests(unittest.TestCase):
         self.assertIn("lop3.b32", maca)
         self.assertIn("prmt.b32", maca)
         self.assertNotIn("cts_lop3", maca)
+
+    def test_hip_and_musa_lower_the_census_i2d(self) -> None:
+        path = CENSUS / "i2d" / "main.cu"
+        if not path.is_file():
+            self.skipTest("i2d is not in the census corpus")
+        maca = translate_path(path, "maca")
+        for target in ("hip", "musa"):
+            translated = translate_path(path, target)
+            self.assertIn("cts_ll2double_rn(tie)", translated)
+            self.assertIn("cts_ll2double_ru(tie)", translated)
+            self.assertIn("cts_ll2double_rd(ntie)", translated)
+            self.assertIn("cts_ull2double_rz(ullmax)", translated)
+            self.assertIn("cts_int2double_rn(imin)", translated)
+            self.assertIn("cts_uint2double_rn(umax)", translated)
+            self.assertNotIn("__ll2double_rn(", translated)
+            self.assertNotIn("__ull2double_rn(", translated)
+            self.assertNotIn("__int2double_rn(", translated)
+        self.assertIn("__ll2double_rn(", maca)
+        self.assertIn("__ull2double_rz(", maca)
+        self.assertNotIn("cts_ll2double", maca)
 
     def test_hip_and_musa_lower_the_census_fminmax(self) -> None:
         path = CENSUS / "fminmax" / "main.cu"
@@ -3317,6 +3386,8 @@ int main() {{
                 ROUND_I32.strip("\n"),
                 ROUND_I64.strip("\n"),
                 D2F_CORE.strip("\n"),
+                I2D_U64.strip("\n"),
+                I2D_S64.strip("\n"),
                 *(helper.strip("\n") for _name, helper in ROUND_HELPERS.values()),
             ]
         )
@@ -4503,6 +4574,92 @@ int main() {{
     if (cudaMalloc(&bad, sizeof(*bad)) != cudaSuccess) return 2;
     if (cudaMemset(bad, 0, sizeof(*bad)) != cudaSuccess) return 2;
     compare<<<1, 1>>>(in, {count}, bad);
+    if (cudaDeviceSynchronize() != cudaSuccess) return 3;
+    int mismatch = 0;
+    if (cudaMemcpy(&mismatch, bad, sizeof(mismatch), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
+    std::printf("mismatch=%d\\n", mismatch);
+    cudaFree(in);
+    cudaFree(bad);
+    return 0;
+}}
+""",
+        )
+
+    def test_integer_to_double_helpers_agree_with_the_intrinsics(self) -> None:
+        values = [0, 1, 2, (1 << 63) - 1, 1 << 63, (1 << 64) - 1, (1 << 64) - 2]
+        for exp in range(64):
+            base = 1 << exp
+            values.append(base)
+            values.append(base - 1)
+            if exp >= 53:
+                half = 1 << (exp - 53)
+                for delta in (1, 3, half - 1, half, half + 1, half * 2 - 1):
+                    values.append(base + delta)
+        state = 0x123456789ABCDEF
+        for _ in range(1024):
+            state = (state * 6364136223846793005 + 1) & ((1 << 64) - 1)
+            values.append(state)
+        signed = [((-value) & ((1 << 64) - 1)) for value in values if value]
+        values = list(dict.fromkeys([*values, *signed]))
+        literal = ", ".join(f"{value}ull" for value in values)
+        helpers = "\n".join(
+            helper.strip("\n")
+            for helper in (
+                I2D_U64,
+                I2D_S64,
+                *(body for name, (_call, body) in ROUND_HELPERS.items() if "2double_" in name),
+            )
+        )
+        self._nvcc_mismatch(
+            "i2d",
+            f"""\
+#include <cstdio>
+#include <cuda_runtime.h>
+{helpers}
+__device__ unsigned long long bits(double x) {{
+    union {{ double as_double; unsigned long long as_bits; }} v;
+    v.as_double = x;
+    return v.as_bits;
+}}
+__global__ void compare(const unsigned long long* in, int n, int* bad) {{
+    for (int i = 0; i < n; ++i) {{
+        volatile unsigned long long vu = in[i];
+        volatile long long vs = (long long)vu;
+        if (bits(__ull2double_rn(vu)) != bits(cts_ull2double_rn(vu))) atomicAdd(bad, 1);
+        if (bits(__ull2double_rz(vu)) != bits(cts_ull2double_rz(vu))) atomicAdd(bad, 1);
+        if (bits(__ull2double_ru(vu)) != bits(cts_ull2double_ru(vu))) atomicAdd(bad, 1);
+        if (bits(__ull2double_rd(vu)) != bits(cts_ull2double_rd(vu))) atomicAdd(bad, 1);
+        if (bits(__ll2double_rn(vs)) != bits(cts_ll2double_rn(vs))) atomicAdd(bad, 1);
+        if (bits(__ll2double_rz(vs)) != bits(cts_ll2double_rz(vs))) atomicAdd(bad, 1);
+        if (bits(__ll2double_ru(vs)) != bits(cts_ll2double_ru(vs))) atomicAdd(bad, 1);
+        if (bits(__ll2double_rd(vs)) != bits(cts_ll2double_rd(vs))) atomicAdd(bad, 1);
+    }}
+    for (unsigned step = 0; step < 65536u; ++step) {{
+        volatile int s = (int)step;
+        volatile int neg = -(int)step;
+        volatile unsigned u = step;
+        volatile unsigned hi = step << 16;
+        if (bits(__int2double_rn(s)) != bits(cts_int2double_rn(s))) atomicAdd(bad, 1);
+        if (bits(__int2double_rn(neg)) != bits(cts_int2double_rn(neg))) atomicAdd(bad, 1);
+        if (bits(__uint2double_rn(u)) != bits(cts_uint2double_rn(u))) atomicAdd(bad, 1);
+        if (bits(__uint2double_rn(hi)) != bits(cts_uint2double_rn(hi))) atomicAdd(bad, 1);
+    }}
+    volatile int imin = (int)0x80000000;
+    volatile int imax = 2147483647;
+    volatile unsigned umax = 0xffffffffu;
+    if (bits(__int2double_rn(imin)) != bits(cts_int2double_rn(imin))) atomicAdd(bad, 1);
+    if (bits(__int2double_rn(imax)) != bits(cts_int2double_rn(imax))) atomicAdd(bad, 1);
+    if (bits(__uint2double_rn(umax)) != bits(cts_uint2double_rn(umax))) atomicAdd(bad, 1);
+}}
+int main() {{
+    unsigned long long bits_in[] = {{ {literal} }};
+    unsigned long long* in = nullptr;
+    int* bad = nullptr;
+    if (cudaMalloc(&in, sizeof(bits_in)) != cudaSuccess) return 2;
+    if (cudaMemcpy(in, bits_in, sizeof(bits_in), cudaMemcpyHostToDevice) != cudaSuccess) return 2;
+    if (cudaMalloc(&bad, sizeof(*bad)) != cudaSuccess) return 2;
+    if (cudaMemset(bad, 0, sizeof(*bad)) != cudaSuccess) return 2;
+    compare<<<1, 1>>>(in, {len(values)}, bad);
     if (cudaDeviceSynchronize() != cudaSuccess) return 3;
     int mismatch = 0;
     if (cudaMemcpy(&mismatch, bad, sizeof(mismatch), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;

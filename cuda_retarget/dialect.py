@@ -302,6 +302,11 @@ class Dialect:
     the same sign. Every 32-bit integer is exact in double, so the
     int-to-float helpers round that double. A long long past 2^53 is not
     exact in double, so those helpers round from the integer bits.
+    `__int2double_rn` and `__uint2double_rn` are exact, including `INT_MIN`.
+    `__ll2double_rn` of `2^53+1` stays on `2^53`, and round-up takes the next
+    double. The same value negated, rounded toward -inf, is one double below
+    the nearest-even result. `__ull2double_rz` of the maximum unsigned value
+    is `2^64-2048`; round-up reaches `2^64`.
     `lower_saturate` replaces `__saturatef`. Values outside [0, 1] clamp,
     and a NaN or a negative zero becomes +0.
     `lower_farith` replaces `__fadd_*`, `__fsub_*`, `__fmul_*`, and
@@ -1461,6 +1466,85 @@ static __device__ float cts_round_s64(long long x, int mode) {
 """
 
 
+# Measured on sm_70. Every 32-bit integer is exact in double, so the rn-only
+# int and uint conversions are casts. A 64-bit magnitude past 2^53 rounds
+# from its bits. 2^53+1 is the tie below the odd neighbor and stays on 2^53
+# in rn. 2^53+3 is the tie above it and rounds to the even neighbor.
+# Negating swaps ru with a toward-zero magnitude and rd with a round-up
+# magnitude. The maximum unsigned value is one below 2^64, so rz stops at
+# 2^64-2048 and ru reaches 2^64.
+I2D_U64 = """
+static __device__ unsigned long long cts_i2d_u64(unsigned long long x, int mode) {
+    if (x == 0ull) return 0ull;
+    int clz = 0;
+    unsigned long long top = x;
+    while ((top >> 63) == 0ull) {
+        top <<= 1;
+        ++clz;
+    }
+    int exp = 63 - clz;
+    int shift = exp - 52;
+    unsigned long long dropped = 0ull;
+    unsigned long long mant = x;
+    if (shift > 0) {
+        dropped = x & ((1ull << shift) - 1ull);
+        mant = x >> shift;
+    } else if (shift < 0) {
+        mant = x << (unsigned)(-shift);
+    }
+    int up = 0;
+    if (shift > 0) {
+        unsigned long long half = 1ull << (shift - 1);
+        if (mode == 0) {
+            if (dropped > half || (dropped == half && (mant & 1ull))) up = 1;
+        } else if (mode == 2 && dropped) {
+            up = 1;
+        }
+    }
+    if (up) {
+        mant += 1ull;
+        if (mant == (1ull << 53)) {
+            mant >>= 1;
+            ++exp;
+        }
+    }
+    return ((unsigned long long)(exp + 1023) << 52) | (mant & ((1ull << 52) - 1ull));
+}
+"""
+
+I2D_S64 = """
+static __device__ unsigned long long cts_i2d_s64(long long x, int mode) {
+    if (x >= 0) return cts_i2d_u64((unsigned long long)x, mode);
+    unsigned long long mag = (unsigned long long)(-(x + 1)) + 1ull;
+    int mag_mode = mode;
+    if (mode == 2) mag_mode = 1;
+    else if (mode == 3) mag_mode = 2;
+    return cts_i2d_u64(mag, mag_mode) | 0x8000000000000000ull;
+}
+"""
+
+
+def _i2d_exact(stem: str, ctype: str) -> str:
+    return f"""
+static __device__ double cts_{stem}_rn({ctype} x) {{
+    return (double)x;
+}}
+"""
+
+
+def _i2d_wrap(stem: str, ctype: str, core: str, mode: str) -> str:
+    return f"""
+static __device__ double cts_{stem}_{mode}({ctype} x) {{
+    union {{
+        unsigned long long as_bits;
+        double as_double;
+    }} out;
+    out.as_bits = {core}(x, {_MODE_CODE[mode]});
+    return out.as_double;
+}}
+"""
+
+
 _DOUBLE_RZ = {
     "__double2int_rz": (
         "cts_double2int_rz",
@@ -1532,6 +1616,16 @@ for _mode in ("rn", "rz", "ru", "rd"):
         f"cts_ull2float_{_mode}",
         _to_float("ull2float", "unsigned long long", "cts_round_u64", _mode, _MODE_CODE[_mode]),
     )
+    ROUND_HELPERS[f"__ll2double_{_mode}"] = (
+        f"cts_ll2double_{_mode}",
+        _i2d_wrap("ll2double", "long long", "cts_i2d_s64", _mode),
+    )
+    ROUND_HELPERS[f"__ull2double_{_mode}"] = (
+        f"cts_ull2double_{_mode}",
+        _i2d_wrap("ull2double", "unsigned long long", "cts_i2d_u64", _mode),
+    )
+ROUND_HELPERS["__int2double_rn"] = ("cts_int2double_rn", _i2d_exact("int2double", "int"))
+ROUND_HELPERS["__uint2double_rn"] = ("cts_uint2double_rn", _i2d_exact("uint2double", "unsigned"))
 ROUND_HELPERS.update(_DOUBLE_RZ)
 
 
@@ -1551,6 +1645,18 @@ def round_needs_i32(names: set[str]) -> bool:
 
 def round_needs_i64(names: set[str]) -> bool:
     return any(name.startswith("cts_ll2float_") or name.startswith("cts_ull2float_") for name in names)
+
+
+def round_needs_i2d_u64(names: set[str]) -> bool:
+    return any(name.startswith(("cts_ll2double_", "cts_ull2double_")) for name in names)
+
+
+def round_needs_i2d_s64(names: set[str]) -> bool:
+    return any(name.startswith("cts_ll2double_") for name in names)
+
+
+def round_needs_i2d_i32(names: set[str]) -> bool:
+    return any(name.startswith(("cts_int2double_", "cts_uint2double_")) for name in names)
 
 D2F_CORE = """
 static __device__ unsigned cts_d2f_pack(int sign, int exp, unsigned long long mag, int mode) {
