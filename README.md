@@ -64,7 +64,7 @@ Comments and string literals stay. A name inside a `#define` is rewritten at the
 | `musa` | the same rule with the `musa` prefix | `musa_runtime.h` | unchanged | lowered |
 | `maca` | unchanged | `cuda_runtime.h` | unchanged | unchanged |
 
-The helpers are bitcasts and double hi/lo words, funnel shifts, `__dp4a`, packed add/sub/min/max/abs, `__byte_perm`, averages, high-half products, absolute differences, packed absolute-difference sums, comparison masks, lane predicates, packed averages, bit scans, 24-bit products, rounding conversions, double-to-float rounding, float-to-half rounding, integer and double conversions into half, half-to-integer conversions, half add, multiply, fused multiply-add, packed half2 arithmetic, half comparisons, `__saturatef`, directed float add, sub, mul, and fused multiply-add, directed double add, sub, mul, and fused multiply-add, directed float division, reciprocal, square root, and reciprocal square root, and `fmin`/`fmax`, `nextafter`, and `copysign`.
+The helpers are bitcasts and double hi/lo words, funnel shifts, `__dp4a`, packed add/sub/min/max/abs, `__byte_perm`, averages, high-half products, absolute differences, packed absolute-difference sums, comparison masks, lane predicates, packed averages, bit scans, 24-bit products, rounding conversions, double-to-float rounding, float-to-half rounding, integer and double conversions into half, half-to-integer conversions, half add, multiply, fused multiply-add, packed half2 arithmetic, half comparisons, `__saturatef`, directed float add, sub, mul, and fused multiply-add, directed double add, sub, mul, and fused multiply-add, directed float division, reciprocal, square root, and reciprocal square root, and `fmin`/`fmax`, `nextafter`, and `copysign`, and `floor`, `ceil`, `trunc`, `rint`, `nearbyint`, and `round`.
 
 Inserted helpers are `static __device__` and sit after the last `#include`.
 
@@ -165,6 +165,11 @@ These are the results a prefix swap gets wrong. HIP and MUSA both get the helper
 | `bfe.s32` with a start at bit 32 | all ones when bit 31 is set, otherwise `0`. `bfe.u32` is `0`. A length of 0 is `0` |
 | `bfi.b32` with a start at bit 32 | the base, unchanged |
 | `prmt.b32` selector nibble `0x8` | `0` or `0xFF` from that byte's sign. `__byte_perm` copies the byte |
+| `rintf(0.5)` / `roundf(0.5)` | `+0` / `1`. `nearbyintf(0.5)` matches `rintf` |
+| `rintf(2.5)` / `roundf(2.5)` | `2` / `3`. `rintf(-2.5)` is `-2` and `roundf(-2.5)` is `-3` |
+| `floorf` of a negative subnormal | `-1`. `truncf` and `ceilf` of it are `-0` |
+| a float NaN passed to `floorf` | the canonical quiet NaN `2147483647` |
+| a signaling double NaN passed to `floor` | the same payload, quieted, `9221120237041090561` |
 
 Signed lane `0x8000` and unsigned lane `0x8000` are different numbers in the packed comparisons, min/max, and absolute differences.
 

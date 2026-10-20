@@ -387,6 +387,13 @@ class Dialect:
     the base. `prmt.b32` sign-replicates a selector nibble whose high bit
     is set. `__byte_perm` copies that byte. Any other inline PTX stays
     source.
+    `lower_fround` replaces `floor`, `ceil`, `trunc`, `rint`, `nearbyint`,
+    and `round`, and the float forms. `rintf(0.5)` is `+0` and `roundf(0.5)`
+    is `1`. `rintf(2.5)` stays on `2` and `roundf(2.5)` is `3`. `floorf` of
+    a negative subnormal is `-1`, and `truncf` of it is `-0`. A float NaN
+    becomes the canonical quiet NaN `0x7fffffff`. A double NaN keeps its
+    sign and payload, and a signaling NaN is quieted. `nearbyint` has the
+    same bits as `rint`.
     """
 
     name: str
@@ -420,6 +427,7 @@ class Dialect:
     lower_fmin: bool
     lower_half: bool
     lower_ptx: bool
+    lower_fround: bool
 
 
 DIALECTS = {
@@ -455,6 +463,7 @@ DIALECTS = {
         lower_fmin=True,
         lower_half=True,
         lower_ptx=True,
+        lower_fround=True,
     ),
     "musa": Dialect(
         name="musa",
@@ -488,6 +497,7 @@ DIALECTS = {
         lower_fmin=True,
         lower_half=True,
         lower_ptx=True,
+        lower_fround=True,
     ),
     "maca": Dialect(
         name="maca",
@@ -521,6 +531,7 @@ DIALECTS = {
         lower_fmin=False,
         lower_half=False,
         lower_ptx=False,
+        lower_fround=False,
     ),
 }
 
@@ -1657,6 +1668,147 @@ def round_needs_i2d_s64(names: set[str]) -> bool:
 
 def round_needs_i2d_i32(names: set[str]) -> bool:
     return any(name.startswith(("cts_int2double_", "cts_uint2double_")) for name in names)
+
+FROUND_FLOAT = """
+static __device__ unsigned cts_frnd_encode(unsigned sign, unsigned mag) {
+    if (mag == 0u) return sign << 31;
+    unsigned e = 0u;
+    unsigned t = mag;
+    while (t > 1u) { t >>= 1u; ++e; }
+    unsigned field = (mag << (23u - e)) & 0x7fffffu;
+    return (sign << 31) | ((e + 127u) << 23) | field;
+}
+
+static __device__ unsigned cts_frnd(unsigned bits, int mode) {
+    unsigned sign = bits >> 31;
+    unsigned exp = (bits >> 23) & 0xffu;
+    unsigned frac = bits & 0x7fffffu;
+    if (exp == 0xffu) {
+        if (frac == 0u) return bits;
+        return 0x7fffffffu;
+    }
+    if (exp == 0u && frac == 0u) return bits;
+    int small = 0;
+    int kind = 0;
+    if (exp == 0u || exp < 127u) {
+        small = 1;
+        if (exp != 0u) {
+            int unbiased = (int)exp - 127;
+            if (unbiased == -1 && frac == 0u) kind = 1;
+            else if (unbiased == -1) kind = 2;
+        }
+    }
+    if (small) {
+        if (mode == 0) return sign ? cts_frnd_encode(1u, 1u) : 0u;
+        if (mode == 1) return sign ? (1u << 31) : cts_frnd_encode(0u, 1u);
+        if (mode == 2) return sign << 31;
+        if (mode == 3) return kind == 2 ? cts_frnd_encode(sign, 1u) : (sign << 31);
+        return kind == 0 ? (sign << 31) : cts_frnd_encode(sign, 1u);
+    }
+    int unbiased = (int)exp - 127;
+    if (unbiased >= 23) return bits;
+    unsigned sig = (1u << 23) | frac;
+    unsigned shift = (unsigned)(23 - unbiased);
+    unsigned dropped = sig & ((1u << shift) - 1u);
+    unsigned half = 1u << (shift - 1u);
+    unsigned base = sig >> shift;
+    if (dropped == 0u) return bits;
+    int up = 0;
+    if (mode == 0) up = sign ? 1 : 0;
+    else if (mode == 1) up = sign ? 0 : 1;
+    else if (mode == 3) up = dropped > half || (dropped == half && (base & 1u));
+    else if (mode == 4) up = dropped >= half;
+    return cts_frnd_encode(sign, base + (unsigned)up);
+}
+"""
+
+FROUND_DOUBLE = """
+static __device__ unsigned long long cts_drnd_encode(unsigned sign, unsigned long long mag) {
+    if (mag == 0ull) return (unsigned long long)sign << 63;
+    unsigned e = 0u;
+    unsigned long long t = mag;
+    while (t > 1ull) { t >>= 1ull; ++e; }
+    unsigned long long field = (mag << (52u - e)) & 0xfffffffffffffull;
+    return ((unsigned long long)sign << 63) | ((unsigned long long)(e + 1023u) << 52) | field;
+}
+
+static __device__ unsigned long long cts_drnd(unsigned long long bits, int mode) {
+    unsigned sign = (unsigned)(bits >> 63);
+    unsigned exp = (unsigned)((bits >> 52) & 0x7ffu);
+    unsigned long long frac = bits & 0xfffffffffffffull;
+    if (exp == 0x7ffu) {
+        if (frac == 0ull) return bits;
+        return bits | (1ull << 51);
+    }
+    if (exp == 0u && frac == 0ull) return bits;
+    int small = 0;
+    int kind = 0;
+    if (exp == 0u || exp < 1023u) {
+        small = 1;
+        if (exp != 0u) {
+            int unbiased = (int)exp - 1023;
+            if (unbiased == -1 && frac == 0ull) kind = 1;
+            else if (unbiased == -1) kind = 2;
+        }
+    }
+    if (small) {
+        if (mode == 0) return sign ? cts_drnd_encode(1u, 1ull) : 0ull;
+        if (mode == 1) return sign ? (1ull << 63) : cts_drnd_encode(0u, 1ull);
+        if (mode == 2) return (unsigned long long)sign << 63;
+        if (mode == 3) return kind == 2 ? cts_drnd_encode(sign, 1ull) : ((unsigned long long)sign << 63);
+        return kind == 0 ? ((unsigned long long)sign << 63) : cts_drnd_encode(sign, 1ull);
+    }
+    int unbiased = (int)exp - 1023;
+    if (unbiased >= 52) return bits;
+    unsigned long long sig = (1ull << 52) | frac;
+    unsigned shift = (unsigned)(52 - unbiased);
+    unsigned long long dropped = sig & ((1ull << shift) - 1ull);
+    unsigned long long half = 1ull << (shift - 1u);
+    unsigned long long base = sig >> shift;
+    if (dropped == 0ull) return bits;
+    int up = 0;
+    if (mode == 0) up = sign ? 1 : 0;
+    else if (mode == 1) up = sign ? 0 : 1;
+    else if (mode == 3) up = dropped > half || (dropped == half && (base & 1ull));
+    else if (mode == 4) up = dropped >= half;
+    return cts_drnd_encode(sign, base + (unsigned long long)up);
+}
+"""
+
+
+def _fround_fn(name: str, ctype: str, core: str, mode: int, bits: str) -> str:
+    return f"""
+static __device__ {ctype} {name}({ctype} value) {{
+    union {{ {ctype} f; {bits} u; }} in, out;
+    in.f = value;
+    out.u = {core}(in.u, {mode});
+    return out.f;
+}}
+"""
+
+
+FROUND_HELPERS = {
+    "floorf": ("cts_floorf", _fround_fn("cts_floorf", "float", "cts_frnd", 0, "unsigned")),
+    "ceilf": ("cts_ceilf", _fround_fn("cts_ceilf", "float", "cts_frnd", 1, "unsigned")),
+    "truncf": ("cts_truncf", _fround_fn("cts_truncf", "float", "cts_frnd", 2, "unsigned")),
+    "rintf": ("cts_rintf", _fround_fn("cts_rintf", "float", "cts_frnd", 3, "unsigned")),
+    "nearbyintf": ("cts_nearbyintf", _fround_fn("cts_nearbyintf", "float", "cts_frnd", 3, "unsigned")),
+    "roundf": ("cts_roundf", _fround_fn("cts_roundf", "float", "cts_frnd", 4, "unsigned")),
+    "floor": ("cts_floor", _fround_fn("cts_floor", "double", "cts_drnd", 0, "unsigned long long")),
+    "ceil": ("cts_ceil", _fround_fn("cts_ceil", "double", "cts_drnd", 1, "unsigned long long")),
+    "trunc": ("cts_trunc", _fround_fn("cts_trunc", "double", "cts_drnd", 2, "unsigned long long")),
+    "rint": ("cts_rint", _fround_fn("cts_rint", "double", "cts_drnd", 3, "unsigned long long")),
+    "nearbyint": ("cts_nearbyint", _fround_fn("cts_nearbyint", "double", "cts_drnd", 3, "unsigned long long")),
+    "round": ("cts_round", _fround_fn("cts_round", "double", "cts_drnd", 4, "unsigned long long")),
+}
+
+
+def fround_needs_float(names: set[str]) -> bool:
+    return any(name.endswith("f") for name in names)
+
+
+def fround_needs_double(names: set[str]) -> bool:
+    return any(not name.endswith("f") for name in names)
 
 D2F_CORE = """
 static __device__ unsigned cts_d2f_pack(int sign, int exp, unsigned long long mag, int mode) {

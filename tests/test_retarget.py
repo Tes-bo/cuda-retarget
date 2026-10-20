@@ -51,6 +51,9 @@ from cuda_retarget.dialect import (
     DMIN_MINMAX,
     DMIN_NEXT,
     FMIN_HELPERS,
+    FROUND_DOUBLE,
+    FROUND_FLOAT,
+    FROUND_HELPERS,
     FMIN_LESS,
     FMIN_MINMAX,
     FMIN_NEXT,
@@ -992,6 +995,78 @@ __global__ void widen(int* i, double* d) { *d = __int2double_rn(*i); }
         self.assertNotIn("cts_ll2double_", hip)
         self.assertEqual(translate_source(source, "maca"), source)
 
+    def test_hip_and_musa_lower_float_rounding(self) -> None:
+        source = """\
+#include <cuda_runtime.h>
+#define roundf(x) (x)
+__global__ void hold(float* f) {
+    float floorf = *f;
+    *f = floorf;
+}
+__global__ void pick(float* f, double* d) {
+    const char* label = "floorf ceilf truncf rintf nearbyintf roundf floor ceil trunc rint nearbyint round";
+    *f = floorf(*f);
+    *f = ceilf(*f);
+    *f = truncf(*f);
+    *f = rintf(*f);
+    *f = nearbyintf(*f);
+    *f = roundf(*f);
+    *d = floor(*d);
+    *d = ceil(*d);
+    *d = trunc(*d);
+    *d = rint(*d);
+    *d = nearbyint(*d);
+    *d = round(*d);
+    *f += label[0];
+}
+"""
+        for target in ("hip", "musa"):
+            translated = translate_source(source, target)
+            self.assertIn("#define roundf(x) (x)", translated)
+            self.assertIn("float floorf = *f;", translated)
+            self.assertIn("*f = floorf;", translated)
+            self.assertIn('"floorf ceilf truncf rintf nearbyintf roundf floor ceil trunc rint nearbyint round"', translated)
+            self.assertIn("cts_floorf(*f)", translated)
+            self.assertIn("cts_ceilf(*f)", translated)
+            self.assertIn("cts_truncf(*f)", translated)
+            self.assertIn("cts_rintf(*f)", translated)
+            self.assertIn("cts_nearbyintf(*f)", translated)
+            self.assertIn("cts_roundf(*f)", translated)
+            self.assertIn("cts_floor(*d)", translated)
+            self.assertIn("cts_ceil(*d)", translated)
+            self.assertIn("cts_trunc(*d)", translated)
+            self.assertIn("cts_rint(*d)", translated)
+            self.assertIn("cts_nearbyint(*d)", translated)
+            self.assertIn("cts_round(*d)", translated)
+            self.assertIn("cts_frnd", translated)
+            self.assertIn("cts_drnd", translated)
+            self.assertNotIn("(floorf(", translated)
+            self.assertNotIn("(round(", translated)
+        float_only = """\
+#include <cuda_runtime.h>
+__global__ void pick(float* f) { *f = roundf(*f); }
+"""
+        hip = translate_source(float_only, "hip")
+        self.assertIn("cts_roundf(*f)", hip)
+        self.assertIn("cts_frnd", hip)
+        self.assertNotIn("cts_drnd", hip)
+        self.assertNotIn("cts_floorf", hip)
+        double_only = """\
+#include <cuda_runtime.h>
+__global__ void pick(double* d) { *d = floor(*d); }
+"""
+        hip = translate_source(double_only, "hip")
+        self.assertIn("cts_floor(*d)", hip)
+        self.assertIn("cts_drnd", hip)
+        self.assertNotIn("cts_frnd", hip)
+        self.assertNotIn("cts_floorf", hip)
+        with self.assertRaises(TranslateError):
+            translate_source(
+                "#include <cuda_runtime.h>\n__global__ void pick(float* f) { *f = floorf(*f, *f); }\n",
+                "hip",
+            )
+        self.assertEqual(translate_source(source, "maca"), source)
+
     def test_hip_and_musa_lower_minmax_and_nextafter(self) -> None:
         source = """\
 #include <cuda_runtime.h>
@@ -1880,6 +1955,29 @@ class CorpusTests(unittest.TestCase):
         self.assertIn("__ll2double_rn(", maca)
         self.assertIn("__ull2double_rz(", maca)
         self.assertNotIn("cts_ll2double", maca)
+
+    def test_hip_and_musa_lower_the_census_fround(self) -> None:
+        path = CENSUS / "fround" / "main.cu"
+        if not path.is_file():
+            self.skipTest("fround is not in the census corpus")
+        maca = translate_path(path, "maca")
+        for target in ("hip", "musa"):
+            translated = translate_path(path, target)
+            self.assertIn("cts_rintf(half)", translated)
+            self.assertIn("cts_roundf(half)", translated)
+            self.assertIn("cts_nearbyintf(half)", translated)
+            self.assertIn("cts_floorf(nsub)", translated)
+            self.assertIn("cts_rint(dtwo)", translated)
+            self.assertIn("cts_round(dtwo)", translated)
+            self.assertIn("cts_floor(dnan)", translated)
+            self.assertIn("cts_frnd", translated)
+            self.assertIn("cts_drnd", translated)
+            self.assertNotIn("(rintf(", translated)
+            self.assertNotIn("(roundf(", translated)
+            self.assertNotIn("(nearbyint(", translated)
+        self.assertIn("(rintf(", maca)
+        self.assertIn("(round(", maca)
+        self.assertNotIn("cts_roundf", maca)
 
     def test_hip_and_musa_lower_the_census_fminmax(self) -> None:
         path = CENSUS / "fminmax" / "main.cu"
@@ -4666,6 +4764,114 @@ int main() {{
     std::printf("mismatch=%d\\n", mismatch);
     cudaFree(in);
     cudaFree(bad);
+    return 0;
+}}
+""",
+        )
+
+    def test_float_rounding_helpers_agree_with_the_intrinsics(self) -> None:
+        helpers = "\n".join(
+            part.strip("\n")
+            for part in (
+                FROUND_FLOAT,
+                FROUND_DOUBLE,
+                *(body for _name, (_call, body) in FROUND_HELPERS.items()),
+            )
+        )
+        self._nvcc_mismatch(
+            "fround",
+            f"""\
+#include <cstdio>
+#include <cuda_runtime.h>
+{helpers}
+__device__ unsigned fb(float x) {{
+    union {{ float as_float; unsigned as_bits; }} v;
+    v.as_float = x;
+    return v.as_bits;
+}}
+__device__ unsigned long long db(double x) {{
+    union {{ double as_double; unsigned long long as_bits; }} v;
+    v.as_double = x;
+    return v.as_bits;
+}}
+__device__ float fv(unsigned bits) {{
+    volatile unsigned held = bits;
+    union {{ unsigned as_bits; float as_float; }} v;
+    v.as_bits = held;
+    return v.as_float;
+}}
+__device__ double dv(unsigned long long bits) {{
+    volatile unsigned long long held = bits;
+    union {{ unsigned long long as_bits; double as_double; }} v;
+    v.as_bits = held;
+    return v.as_double;
+}}
+__device__ void mark(int* bad, unsigned long long* first, unsigned long long bits) {{
+    atomicAdd(bad, 1);
+    atomicCAS(first, 0ull, bits);
+}}
+__global__ void compare(int* bad, unsigned long long* first) {{
+    unsigned fracs[8] = {{0u, 1u, 0x400000u, 0x7fffffu, 0x2aaaaau, 0x555555u, 0x000001u, 0x7ffffeu}};
+    for (unsigned sign = 0u; sign < 2u; ++sign) {{
+        for (unsigned exp = 0u; exp < 256u; ++exp) {{
+            for (int k = 0; k < 8; ++k) {{
+                unsigned bits = (sign << 31) | (exp << 23) | fracs[k];
+                float x = fv(bits);
+                if (fb(floorf(x)) != fb(cts_floorf(x))) mark(bad, first, bits);
+                if (fb(ceilf(x)) != fb(cts_ceilf(x))) mark(bad, first, bits);
+                if (fb(truncf(x)) != fb(cts_truncf(x))) mark(bad, first, bits);
+                if (fb(rintf(x)) != fb(cts_rintf(x))) mark(bad, first, bits);
+                if (fb(nearbyintf(x)) != fb(cts_nearbyintf(x))) mark(bad, first, bits);
+                if (fb(roundf(x)) != fb(cts_roundf(x))) mark(bad, first, bits);
+            }}
+        }}
+    }}
+    for (unsigned i = 0u; i < 1048576u; ++i) {{
+        unsigned bits = i * 4099u;
+        float x = fv(bits);
+        if (fb(floorf(x)) != fb(cts_floorf(x))) mark(bad, first, bits);
+        if (fb(ceilf(x)) != fb(cts_ceilf(x))) mark(bad, first, bits);
+        if (fb(truncf(x)) != fb(cts_truncf(x))) mark(bad, first, bits);
+        if (fb(rintf(x)) != fb(cts_rintf(x))) mark(bad, first, bits);
+        if (fb(nearbyintf(x)) != fb(cts_nearbyintf(x))) mark(bad, first, bits);
+        if (fb(roundf(x)) != fb(cts_roundf(x))) mark(bad, first, bits);
+    }}
+    unsigned long long dfracs[8] = {{
+        0ull, 1ull, 1ull << 51, (1ull << 52) - 1ull, 0x0008000000000001ull,
+        0x5555555555555ull, 0x2aaaaaaaaaaaaull, (1ull << 51) - 1ull
+    }};
+    for (unsigned sign = 0u; sign < 2u; ++sign) {{
+        for (unsigned exp = 0u; exp < 2048u; ++exp) {{
+            for (int k = 0; k < 8; ++k) {{
+                unsigned long long bits = ((unsigned long long)sign << 63) | ((unsigned long long)exp << 52) | dfracs[k];
+                double x = dv(bits);
+                if (db(floor(x)) != db(cts_floor(x))) mark(bad, first, bits);
+                if (db(ceil(x)) != db(cts_ceil(x))) mark(bad, first, bits);
+                if (db(trunc(x)) != db(cts_trunc(x))) mark(bad, first, bits);
+                if (db(rint(x)) != db(cts_rint(x))) mark(bad, first, bits);
+                if (db(nearbyint(x)) != db(cts_nearbyint(x))) mark(bad, first, bits);
+                if (db(round(x)) != db(cts_round(x))) mark(bad, first, bits);
+            }}
+        }}
+    }}
+}}
+int main() {{
+    int* bad = nullptr;
+    unsigned long long* first = nullptr;
+    if (cudaMalloc(&bad, sizeof(*bad)) != cudaSuccess) return 2;
+    if (cudaMalloc(&first, sizeof(*first)) != cudaSuccess) return 2;
+    if (cudaMemset(bad, 0, sizeof(*bad)) != cudaSuccess) return 2;
+    if (cudaMemset(first, 0, sizeof(*first)) != cudaSuccess) return 2;
+    compare<<<1, 1>>>(bad, first);
+    if (cudaDeviceSynchronize() != cudaSuccess) return 3;
+    int mismatch = 0;
+    unsigned long long seen = 0;
+    if (cudaMemcpy(&mismatch, bad, sizeof(mismatch), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
+    if (cudaMemcpy(&seen, first, sizeof(seen), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
+    std::printf("mismatch=%d\\n", mismatch);
+    if (mismatch) std::printf("first=%llu\\n", seen);
+    cudaFree(bad);
+    cudaFree(first);
     return 0;
 }}
 """,
