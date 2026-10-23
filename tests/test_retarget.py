@@ -1532,6 +1532,92 @@ __global__ void pick(float* f, long n) { *f = scalblnf(*f, n); }
             )
         self.assertEqual(translate_source(source, "maca"), source)
 
+    def test_hip_and_musa_lower_abs(self) -> None:
+        source = """\
+#include <cuda_runtime.h>
+__global__ void hold(int* n) {
+    int abs = *n;
+    *n = abs;
+}
+__global__ void pick(int* n, long* w, long long* q, float* f, double* d) {
+    const char* label = "abs labs llabs fabsf fabs";
+    *n = abs(*n);
+    *w = abs(*w);
+    *q = abs(*q);
+    *w = labs(*w);
+    *q = llabs(*q);
+    *f = fabsf(*f);
+    *f = fabs(*f);
+    *d = fabs(*d);
+    *f = abs(*f);
+    *d = abs(*d);
+    *n += label[0];
+}
+"""
+        for target in ("hip", "musa"):
+            translated = translate_source(source, target)
+            self.assertIn('"abs labs llabs fabsf fabs"', translated)
+            self.assertIn("int abs = *n;", translated)
+            self.assertIn("*n = abs;", translated)
+            self.assertIn("cts_abs(*n)", translated)
+            self.assertIn("cts_abs(*w)", translated)
+            self.assertIn("cts_abs(*q)", translated)
+            self.assertIn("cts_labs(*w)", translated)
+            self.assertIn("cts_llabs(*q)", translated)
+            self.assertIn("cts_fabsf(*f)", translated)
+            self.assertIn("cts_fabs(*f)", translated)
+            self.assertIn("cts_fabs(*d)", translated)
+            self.assertIn("cts_abs(*f)", translated)
+            self.assertIn("cts_abs(*d)", translated)
+            self.assertIn("cts_absi(", translated)
+            self.assertIn("cts_absl(", translated)
+            self.assertIn("cts_fabsf_bits(", translated)
+            self.assertIn("cts_fabs_bits(", translated)
+            self.assertEqual(translated.count("static __device__ long long cts_absl("), 1)
+            self.assertNotIn("(abs(", translated)
+            self.assertNotIn("(labs(", translated)
+            self.assertNotIn("(llabs(", translated)
+            self.assertNotIn("(fabsf(", translated)
+            self.assertNotIn("(fabs(", translated)
+        only = """\
+#include <cuda_runtime.h>
+__global__ void pick(float* f) { *f = fabsf(*f); }
+"""
+        hip = translate_source(only, "hip")
+        self.assertIn("cts_fabsf_bits(", hip)
+        self.assertNotIn("cts_fabs_bits(", hip)
+        self.assertNotIn("cts_absl(", hip)
+        wide = """\
+#include <cuda_runtime.h>
+__global__ void pick(long long* q) { *q = llabs(*q); }
+"""
+        hip = translate_source(wide, "hip")
+        self.assertIn("cts_absl(", hip)
+        self.assertNotIn("cts_absi(", hip)
+        self.assertNotIn("cts_fabsf_bits(", hip)
+        defined = """\
+#include <cuda_runtime.h>
+#define abs(x) (x)
+__global__ void pick(int* n) { *n = abs(*n); }
+"""
+        hip = translate_source(defined, "hip")
+        self.assertIn("#define abs(x) (x)", hip)
+        self.assertIn("cts_abs(*n)", hip)
+        declared = """\
+#include <cuda_runtime.h>
+int abs(int x);
+__global__ void pick(int* n) { *n = abs(*n); }
+"""
+        hip = translate_source(declared, "hip")
+        self.assertIn("int abs(int x);", hip)
+        self.assertIn("cts_abs(*n)", hip)
+        with self.assertRaises(TranslateError):
+            translate_source(
+                "#include <cuda_runtime.h>\n__global__ void pick(int* n) { *n = abs(*n, 1); }\n",
+                "hip",
+            )
+        self.assertEqual(translate_source(source, "maca"), source)
+
     def test_hip_and_musa_lower_double_rounding(self) -> None:
         source = """\
 #include <cuda_runtime.h>
@@ -2540,6 +2626,40 @@ class CorpusTests(unittest.TestCase):
         self.assertIn("logbf(zero)", maca)
         self.assertIn("scalbln(done, huge)", maca)
         self.assertNotIn("cts_logbf", maca)
+
+    def test_hip_and_musa_lower_the_census_abs(self) -> None:
+        path = CENSUS / "abs" / "main.cu"
+        if not path.is_file():
+            self.skipTest("abs is not in the census corpus")
+        maca = translate_path(path, "maca")
+        for target in ("hip", "musa"):
+            translated = translate_path(path, target)
+            self.assertIn("cts_abs(zero)", translated)
+            self.assertIn("cts_abs(imin)", translated)
+            self.assertIn("cts_abs(ineg)", translated)
+            self.assertIn("cts_abs(lmin)", translated)
+            self.assertIn("cts_abs(llmin)", translated)
+            self.assertIn("cts_labs(lmin)", translated)
+            self.assertIn("cts_llabs(llmin)", translated)
+            self.assertIn("cts_fabsf(m0)", translated)
+            self.assertIn("cts_fabsf(nan)", translated)
+            self.assertIn("cts_fabsf(nnan)", translated)
+            self.assertIn("cts_fabsf(nsig)", translated)
+            self.assertIn("cts_abs(mone)", translated)
+            self.assertIn("cts_fabs(ndnan)", translated)
+            self.assertIn("cts_abs(ndnan)", translated)
+            self.assertIn("cts_absi(", translated)
+            self.assertIn("cts_absl(", translated)
+            self.assertIn("cts_fabsf_bits(", translated)
+            self.assertIn("cts_fabs_bits(", translated)
+            self.assertEqual(translated.count("static __device__ long long cts_absl("), 1)
+            self.assertNotIn("= abs(", translated)
+            self.assertNotIn("fb(fabsf(", translated)
+            self.assertNotIn("db(fabs(", translated)
+        self.assertIn("abs(imin)", maca)
+        self.assertIn("fabs(ndnan)", maca)
+        self.assertIn("llabs(llmin)", maca)
+        self.assertNotIn("cts_abs", maca)
 
     def test_hip_and_musa_lower_the_census_fminmax(self) -> None:
         path = CENSUS / "fminmax" / "main.cu"
@@ -5977,6 +6097,117 @@ int main() {
 """
         self._nvcc_mismatch(
             "scale",
+            "#include <cstdio>\n#include <cuda_runtime.h>\n" + helpers + "\n" + tail,
+        )
+
+    def test_abs_helpers_agree_with_the_intrinsics(self) -> None:
+        from cuda_retarget.dialect import ABS_HELPERS, abs_blocks
+
+        names = {name for name, _helper in ABS_HELPERS.values()}
+        blocks = abs_blocks(names, "")
+        blocks.extend(helper.strip("\n") for _name, helper in ABS_HELPERS.values())
+        helpers = "\n\n".join(blocks)
+        tail = """\
+__device__ float fv(unsigned bits) {
+    volatile unsigned held = bits;
+    union { unsigned as_bits; float as_float; } v;
+    v.as_bits = held;
+    return v.as_float;
+}
+__device__ double dv(unsigned long long bits) {
+    volatile unsigned long long held = bits;
+    union { unsigned long long as_bits; double as_double; } v;
+    v.as_bits = held;
+    return v.as_double;
+}
+__device__ int iv(unsigned bits) {
+    volatile unsigned held = bits;
+    return (int)held;
+}
+__device__ long long lv(unsigned long long bits) {
+    volatile unsigned long long held = bits;
+    return (long long)held;
+}
+__device__ unsigned fb(float x) {
+    union { float as_float; unsigned as_bits; } v;
+    v.as_float = x;
+    return v.as_bits;
+}
+__device__ unsigned long long dbits(double x) {
+    union { double as_double; unsigned long long as_bits; } v;
+    v.as_double = x;
+    return v.as_bits;
+}
+__device__ void mark(int* bad, unsigned long long* first, unsigned long long bits) {
+    atomicAdd(bad, 1);
+    atomicCAS(first, 0ull, bits ? bits : 1ull);
+}
+__global__ void sweepf(int* bad, unsigned long long* first) {
+    unsigned fr[3] = {0u, 1u, 0x7fffffu};
+    unsigned ea = blockIdx.x;
+    for (int i = 0; i < 3; ++i) for (int s = 0; s < 2; ++s) {
+        unsigned a = (ea << 23) | fr[i] | (s ? 0x80000000u : 0u);
+        float x = fv(a);
+        if (fb(fabsf(x)) != fb(cts_fabsf(x))) mark(bad, first, a);
+        if (fb(abs(x)) != fb(cts_abs(x))) mark(bad, first, a | (1ull << 32));
+        if (fb(fabs(x)) != fb(cts_fabs(x))) mark(bad, first, a | (2ull << 32));
+    }
+}
+__global__ void sweepd(int* bad, unsigned long long* first) {
+    unsigned long long fr[4] = {0ull, 1ull, 1ull << 51, 0xfffffffffffffull};
+    unsigned ea = blockIdx.x;
+    for (int i = 0; i < 4; ++i) for (int s = 0; s < 2; ++s) {
+        unsigned long long a = ((unsigned long long)ea << 52) | fr[i] | (s ? (1ull << 63) : 0ull);
+        double x = dv(a);
+        if (dbits(fabs(x)) != dbits(cts_fabs(x))) mark(bad, first, a);
+        if (dbits(abs(x)) != dbits(cts_abs(x))) mark(bad, first, a ^ 1ull);
+    }
+}
+__global__ void sweepi(int* bad, unsigned long long* first) {
+    unsigned base = (blockIdx.x * 1024u + threadIdx.x) << 12;
+    for (unsigned step = 0; step < 16u; ++step) {
+        unsigned bits = base + step * 257u;
+        int x = iv(bits);
+        if (abs(x) != cts_abs(x)) mark(bad, first, bits);
+        long long w = lv((unsigned long long)x);
+        if (abs(w) != cts_abs(w) || labs((long)w) != cts_labs((long)w) || llabs(w) != cts_llabs(w))
+            mark(bad, first, (unsigned long long)bits | (3ull << 32));
+        long long hi = lv(((unsigned long long)(unsigned)x << 32) | 0x80000000ull);
+        if (abs(hi) != cts_abs(hi) || llabs(hi) != cts_llabs(hi)) mark(bad, first, (unsigned long long)hi);
+    }
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        int lo = iv(0x80000000u);
+        long long big = lv(0x8000000000000000ull);
+        if (abs(lo) != cts_abs(lo)) mark(bad, first, 0x80000000ull);
+        if (abs((long)lo) != cts_abs((long)lo) || cts_abs((long)lo) != 2147483648ll) mark(bad, first, 2ull);
+        if (llabs(big) != cts_llabs(big) || abs(big) != cts_abs(big) || labs((long)big) != cts_labs((long)big))
+            mark(bad, first, 0x8000000000000000ull);
+    }
+}
+int main() {
+    int* bad = nullptr;
+    unsigned long long* first = nullptr;
+    if (cudaMalloc(&bad, sizeof(*bad)) != cudaSuccess) return 2;
+    if (cudaMalloc(&first, sizeof(*first)) != cudaSuccess) return 2;
+    if (cudaMemset(bad, 0, sizeof(*bad)) != cudaSuccess) return 2;
+    if (cudaMemset(first, 0, sizeof(*first)) != cudaSuccess) return 2;
+    sweepf<<<256, 1>>>(bad, first);
+    sweepd<<<2048, 1>>>(bad, first);
+    sweepi<<<1024, 256>>>(bad, first);
+    if (cudaDeviceSynchronize() != cudaSuccess) return 3;
+    int mismatch = 0;
+    unsigned long long seen = 0;
+    if (cudaMemcpy(&mismatch, bad, sizeof(mismatch), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
+    if (cudaMemcpy(&seen, first, sizeof(seen), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
+    std::printf("mismatch=%d\\n", mismatch);
+    if (mismatch) std::printf("first=%llu\\n", seen);
+    cudaFree(bad);
+    cudaFree(first);
+    return 0;
+}
+"""
+        self._nvcc_mismatch(
+            "abs",
             "#include <cstdio>\n#include <cuda_runtime.h>\n" + helpers + "\n" + tail,
         )
 

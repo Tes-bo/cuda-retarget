@@ -422,6 +422,11 @@ class Dialect:
     forms. `logb` returns the exponent as a floating-point value. Zero
     becomes `-inf` and an infinity becomes `+inf`. `scalbln` takes a
     64-bit exponent. `scalblnf(1, 2^31)` is `+inf`.
+    `lower_abs` replaces `abs`, `labs`, `llabs`, `fabsf`, and `fabs`.
+    `abs(INT_MIN)` stays `INT_MIN`. Those bits widened to `long` become
+    `2147483648`. `llabs` of `LLONG_MIN` stays `LLONG_MIN`. `fabsf` of a
+    NaN is the canonical quiet NaN. `fabs` of a negative double NaN keeps
+    the sign and payload, and a signaling NaN is quieted.
     """
 
     name: str
@@ -461,6 +466,7 @@ class Dialect:
     lower_hypot: bool
     lower_remquo: bool
     lower_scale: bool
+    lower_abs: bool
 
 
 DIALECTS = {
@@ -502,6 +508,7 @@ DIALECTS = {
         lower_hypot=True,
         lower_remquo=True,
         lower_scale=True,
+        lower_abs=True,
     ),
     "musa": Dialect(
         name="musa",
@@ -541,6 +548,7 @@ DIALECTS = {
         lower_hypot=True,
         lower_remquo=True,
         lower_scale=True,
+        lower_abs=True,
     ),
     "maca": Dialect(
         name="maca",
@@ -580,6 +588,7 @@ DIALECTS = {
         lower_hypot=False,
         lower_remquo=False,
         lower_scale=False,
+        lower_abs=False,
     ),
 }
 
@@ -2635,6 +2644,110 @@ def scale_blocks(names: set[str], already: str) -> list[str]:
         add(SCALE_LOGD, "static __device__ unsigned long long cts_logb_bits(")
     if names & {"cts_scalbn", "cts_scalbln"}:
         add(SCALE_DSCALE, "static __device__ unsigned long long cts_dscale_bits(")
+    return blocks
+
+
+# abs, labs, llabs, fabsf, and fabs. Measured on sm_70. abs(INT_MIN) is
+# INT_MIN. The same bits in a 64-bit integer become +2147483648, and
+# llabs(LLONG_MIN) is LLONG_MIN. long and long long are both 64 bits, so
+# labs and llabs share one negation. fabsf of any NaN is the canonical
+# quiet NaN. fabs of a double NaN keeps the sign and payload and quiets
+# a signaling NaN. A negative zero becomes +0.
+ABS_I32 = """
+static __device__ int cts_absi(int x) {
+    unsigned u = (unsigned)x;
+    return x < 0 ? (int)(0u - u) : x;
+}
+"""
+
+ABS_I64 = """
+static __device__ long long cts_absl(long long x) {
+    unsigned long long u = (unsigned long long)x;
+    return x < 0 ? (long long)(0ull - u) : x;
+}
+"""
+
+ABS_F = """
+static __device__ unsigned cts_fabsf_bits(unsigned bits) {
+    unsigned exp = (bits >> 23) & 0xffu;
+    if (exp == 0xffu && (bits & 0x7fffffu) != 0u) return 0x7fffffffu;
+    return bits & 0x7fffffffu;
+}
+"""
+
+ABS_D = """
+static __device__ unsigned long long cts_fabs_bits(unsigned long long bits) {
+    unsigned exp = (unsigned)((bits >> 52) & 0x7ffu);
+    if (exp == 0x7ffu && (bits & 0xfffffffffffffull) != 0ull) return bits | (1ull << 51);
+    return bits & 0x7fffffffffffffffull;
+}
+"""
+
+ABS_HELPERS = {
+    "abs": ("cts_abs", """
+static __device__ int cts_abs(int x) { return cts_absi(x); }
+static __device__ long cts_abs(long x) { return (long)cts_absl(x); }
+static __device__ long long cts_abs(long long x) { return cts_absl(x); }
+static __device__ float cts_abs(float x) {
+    union { float f; unsigned u; } in, out;
+    in.f = x;
+    out.u = cts_fabsf_bits(in.u);
+    return out.f;
+}
+static __device__ double cts_abs(double x) {
+    union { double d; unsigned long long u; } in, out;
+    in.d = x;
+    out.u = cts_fabs_bits(in.u);
+    return out.d;
+}
+"""),
+    "labs": ("cts_labs", """
+static __device__ long cts_labs(long x) { return (long)cts_absl(x); }
+"""),
+    "llabs": ("cts_llabs", """
+static __device__ long long cts_llabs(long long x) { return cts_absl(x); }
+"""),
+    "fabsf": ("cts_fabsf", """
+static __device__ float cts_fabsf(float x) {
+    union { float f; unsigned u; } in, out;
+    in.f = x;
+    out.u = cts_fabsf_bits(in.u);
+    return out.f;
+}
+"""),
+    "fabs": ("cts_fabs", """
+static __device__ float cts_fabs(float x) {
+    union { float f; unsigned u; } in, out;
+    in.f = x;
+    out.u = cts_fabsf_bits(in.u);
+    return out.f;
+}
+static __device__ double cts_fabs(double x) {
+    union { double d; unsigned long long u; } in, out;
+    in.d = x;
+    out.u = cts_fabs_bits(in.u);
+    return out.d;
+}
+"""),
+}
+
+
+def abs_blocks(names: set[str], already: str) -> list[str]:
+    blocks: list[str] = []
+
+    def add(text: str, marker: str) -> None:
+        if marker in already or any(marker in block for block in blocks):
+            return
+        blocks.append(text.strip("\n"))
+
+    if "cts_abs" in names:
+        add(ABS_I32, "static __device__ int cts_absi(")
+    if names & {"cts_abs", "cts_labs", "cts_llabs"}:
+        add(ABS_I64, "static __device__ long long cts_absl(")
+    if names & {"cts_abs", "cts_fabsf", "cts_fabs"}:
+        add(ABS_F, "static __device__ unsigned cts_fabsf_bits(")
+    if names & {"cts_abs", "cts_fabs"}:
+        add(ABS_D, "static __device__ unsigned long long cts_fabs_bits(")
     return blocks
 
 
