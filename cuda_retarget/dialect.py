@@ -413,6 +413,11 @@ class Dialect:
     is `sqrt` rounded to nearest. An infinity wins over a NaN. Any other
     NaN becomes the canonical quiet NaN. `hypotf` of `2^64` with itself
     stays finite.
+    `lower_remquo` replaces `remquo` and `remquof`. The remainder matches
+    `remainder`. The stored quotient keeps three bits of the rounded
+    integer quotient, then applies the sign of `x / y`. `remquof(15, 2)`
+    has quotient `8`, so the stored value is `0`. An invalid pair writes
+    the quotient as `0`.
     """
 
     name: str
@@ -450,6 +455,7 @@ class Dialect:
     lower_fsplit: bool
     lower_lround: bool
     lower_hypot: bool
+    lower_remquo: bool
 
 
 DIALECTS = {
@@ -489,6 +495,7 @@ DIALECTS = {
         lower_fsplit=True,
         lower_lround=True,
         lower_hypot=True,
+        lower_remquo=True,
     ),
     "musa": Dialect(
         name="musa",
@@ -526,6 +533,7 @@ DIALECTS = {
         lower_fsplit=True,
         lower_lround=True,
         lower_hypot=True,
+        lower_remquo=True,
     ),
     "maca": Dialect(
         name="maca",
@@ -563,6 +571,7 @@ DIALECTS = {
         lower_fsplit=False,
         lower_lround=False,
         lower_hypot=False,
+        lower_remquo=False,
     ),
 }
 
@@ -2338,6 +2347,144 @@ def fsplit_blocks(names: set[str], already: str) -> list[str]:
         _fsplit_add(blocks, already, DARITH_PACK, "static __device__ unsigned long long cts_dpack(")
         _fsplit_add(blocks, already, DARITH_ADD, "static __device__ unsigned long long cts_dadd(")
     return blocks
+
+
+# remquo and remquof. Measured on sm_70. The remainder matches remainder.
+# The quotient magnitude is the low 3 bits of the rounded integer
+# quotient, with the sign of x/y. remquof(15, 2) stores 0. An invalid
+# pair stores 0 and the same NaN remainder as fmod.
+REMQUO_FBITS = """
+static __device__ unsigned cts_fremquo_bits(unsigned x, unsigned y, int* quo) {
+    unsigned sxn, syn; unsigned long long sx, sy; long long ax, ay;
+    int xk = cts_fmag(x, &sxn, &sx, &ax);
+    int yk = cts_fmag(y, &syn, &sy, &ay);
+    int qsign = (int)(sxn ^ syn);
+    if (xk == 3 || yk == 3 || xk == 2 || yk == 1) { *quo = 0; return 0x7fffffffu; }
+    if (yk == 2 || xk == 1) { *quo = 0; return x; }
+    int smaller = ax < ay || (ax == ay && sx < sy);
+    if (smaller && ay >= ax + 2) { *quo = 0; return x; }
+    unsigned sign = sxn;
+    if (smaller && ay == ax) {
+        if ((sx << 1) <= sy) { *quo = 0; return x; }
+        unsigned long long rem = sy - sx;
+        *quo = qsign ? -1 : 1;
+        return rem ? cts_fenc(sign ^ 1u, rem, ax) : ((sign ^ 1u) << 31);
+    }
+    if (smaller) {
+        if (sx <= sy) { *quo = 0; return x; }
+        unsigned long long rem = (sy << 1) - sx;
+        *quo = qsign ? -1 : 1;
+        return rem ? cts_fenc(sign ^ 1u, rem, ax) : ((sign ^ 1u) << 31);
+    }
+    long long ds = ax - ay;
+    unsigned long long rem = 0ull;
+    int q = 0;
+    int width = cts_utop(sx) + 1 + (int)ds;
+    for (int i = width - 1; i >= 0; --i) {
+        rem <<= 1ull;
+        q = (q << 1) & 7;
+        if ((long long)i >= ds && ((sx >> (unsigned)(i - (int)ds)) & 1ull)) rem |= 1ull;
+        if (rem >= sy) { rem -= sy; q |= 1; }
+    }
+    if ((rem << 1) > sy || ((rem << 1) == sy && (q & 1))) {
+        rem = sy - rem;
+        sign ^= 1u;
+        q = (q + 1) & 7;
+    }
+    *quo = qsign ? -q : q;
+    if (rem == 0ull) return sign << 31;
+    return cts_fenc(sign, rem, ay);
+}
+"""
+
+REMQUO_DBITS = """
+static __device__ unsigned long long cts_dremquo_bits(unsigned long long x, unsigned long long y, int* quo) {
+    unsigned sxn, syn; unsigned long long sx, sy; long long ax, ay;
+    int xk = cts_dmag(x, &sxn, &sx, &ax);
+    int yk = cts_dmag(y, &syn, &sy, &ay);
+    int qsign = (int)(sxn ^ syn);
+    if (yk == 3) { *quo = 0; return y | (1ull << 51); }
+    if (xk == 3) { *quo = 0; return x | (1ull << 51); }
+    if (xk == 2 || yk == 1) { *quo = 0; return 0xfff8000000000000ull; }
+    if (yk == 2 || xk == 1) { *quo = 0; return x; }
+    int smaller = ax < ay || (ax == ay && sx < sy);
+    if (smaller && ay >= ax + 2) { *quo = 0; return x; }
+    unsigned sign = sxn;
+    if (smaller && ay == ax) {
+        if ((sx << 1) <= sy) { *quo = 0; return x; }
+        unsigned long long rem = sy - sx;
+        *quo = qsign ? -1 : 1;
+        return rem ? cts_denc(sign ^ 1u, rem, ax) : ((unsigned long long)(sign ^ 1u) << 63);
+    }
+    if (smaller) {
+        if (sx <= sy) { *quo = 0; return x; }
+        unsigned long long rem = (sy << 1) - sx;
+        *quo = qsign ? -1 : 1;
+        return rem ? cts_denc(sign ^ 1u, rem, ax) : ((unsigned long long)(sign ^ 1u) << 63);
+    }
+    long long ds = ax - ay;
+    unsigned long long rem = 0ull;
+    int q = 0;
+    int width = cts_utop(sx) + 1 + (int)ds;
+    for (int i = width - 1; i >= 0; --i) {
+        rem <<= 1ull;
+        q = (q << 1) & 7;
+        if ((long long)i >= ds && ((sx >> (unsigned)(i - (int)ds)) & 1ull)) rem |= 1ull;
+        if (rem >= sy) { rem -= sy; q |= 1; }
+    }
+    if ((rem << 1) > sy || ((rem << 1) == sy && (q & 1))) {
+        rem = sy - rem;
+        sign ^= 1u;
+        q = (q + 1) & 7;
+    }
+    *quo = qsign ? -q : q;
+    if (rem == 0ull) return (unsigned long long)sign << 63;
+    return cts_denc(sign, rem, ay);
+}
+"""
+
+REMQUO_HELPERS = {
+    "remquof": ("cts_remquof", """
+static __device__ float cts_remquof(float x, float y, int* quo) {
+    union { float f; unsigned u; } a, b, out;
+    a.f = x;
+    b.f = y;
+    out.u = cts_fremquo_bits(a.u, b.u, quo);
+    return out.f;
+}
+"""),
+    "remquo": ("cts_remquo", """
+static __device__ double cts_remquo(double x, double y, int* quo) {
+    union { double d; unsigned long long u; } a, b, out;
+    a.d = x;
+    b.d = y;
+    out.u = cts_dremquo_bits(a.u, b.u, quo);
+    return out.d;
+}
+"""),
+}
+
+
+def remquo_blocks(names: set[str], already: str) -> list[str]:
+    blocks: list[str] = []
+
+    def add(text: str, marker: str) -> None:
+        if marker in already or any(marker in block for block in blocks):
+            return
+        blocks.append(text.strip("\n"))
+
+    if names & {"cts_remquof", "cts_remquo"}:
+        add(FSPLIT_TOP, "static __device__ int cts_utop(")
+    if "cts_remquof" in names:
+        add(FSPLIT_FMAG, "static __device__ int cts_fmag(")
+        add(FSPLIT_FENC, "static __device__ unsigned cts_fenc(")
+        add(REMQUO_FBITS, "static __device__ unsigned cts_fremquo_bits(")
+    if "cts_remquo" in names:
+        add(FSPLIT_DMAG, "static __device__ int cts_dmag(")
+        add(FSPLIT_DENC, "static __device__ unsigned long long cts_denc(")
+        add(REMQUO_DBITS, "static __device__ unsigned long long cts_dremquo_bits(")
+    return blocks
+
 
 # lrint, lround, llrint, and llround. Measured on sm_70. long and long long
 # are both 64 bits, so each pair shares one conversion. A NaN is LLONG_MIN.

@@ -1362,6 +1362,84 @@ __global__ void pick(float* f) { *f = hypotf(*f, *f); }
             )
         self.assertEqual(translate_source(source, "maca"), source)
 
+    def test_hip_and_musa_lower_remquo(self) -> None:
+        source = """\
+#include <cuda_runtime.h>
+__global__ void hold(int* q) {
+    int remquof = *q;
+    *q = remquof;
+}
+__global__ void pick(float* f, double* d, int* q) {
+    const char* label = "remquof remquo";
+    *f = remquof(*f, *f, q);
+    *d = remquo(*d, *d, q);
+    *f += label[0];
+}
+"""
+        for target in ("hip", "musa"):
+            translated = translate_source(source, target)
+            self.assertIn('"remquof remquo"', translated)
+            self.assertIn("int remquof = *q;", translated)
+            self.assertIn("*q = remquof;", translated)
+            self.assertIn("cts_remquof(*f, *f, q)", translated)
+            self.assertIn("cts_remquo(*d, *d, q)", translated)
+            self.assertIn("cts_fremquo_bits(", translated)
+            self.assertIn("cts_dremquo_bits(", translated)
+            self.assertEqual(translated.count("static __device__ int cts_utop("), 1)
+            self.assertNotIn("(remquof(", translated)
+            self.assertNotIn("(remquo(", translated)
+        only = """\
+#include <cuda_runtime.h>
+__global__ void pick(float* f, int* q) { *f = remquof(*f, 1.0f, q); }
+"""
+        hip = translate_source(only, "hip")
+        self.assertIn("cts_remquof(*f, 1.0f, q)", hip)
+        self.assertIn("cts_fremquo_bits(", hip)
+        self.assertNotIn("cts_dremquo_bits(", hip)
+        self.assertNotIn("cts_dmag(", hip)
+        double_only = """\
+#include <cuda_runtime.h>
+__global__ void pick(double* d, int* q) { *d = remquo(*d, 1.0, q); }
+"""
+        hip = translate_source(double_only, "hip")
+        self.assertIn("cts_dremquo_bits(", hip)
+        self.assertNotIn("cts_fremquo_bits(", hip)
+        self.assertNotIn("cts_fmag(", hip)
+        shared = """\
+#include <cuda_runtime.h>
+__global__ void pick(float* f, int* q) {
+    *f = remainderf(*f, *f);
+    *f = remquof(*f, *f, q);
+}
+"""
+        hip = translate_source(shared, "hip")
+        self.assertEqual(hip.count("static __device__ int cts_fmag("), 1)
+        self.assertEqual(hip.count("static __device__ unsigned cts_fenc("), 1)
+        self.assertIn("cts_fremf_bits(", hip)
+        self.assertIn("cts_fremquo_bits(", hip)
+        defined = """\
+#include <cuda_runtime.h>
+#define remquof(x, y, q) (x)
+__global__ void pick(float* f, int* q) { *f = remquof(*f, *f, q); }
+"""
+        hip = translate_source(defined, "hip")
+        self.assertIn("#define remquof(x, y, q) (x)", hip)
+        self.assertIn("cts_remquof(*f, *f, q)", hip)
+        declared = """\
+#include <cuda_runtime.h>
+float remquof(float x, float y, int* q);
+__global__ void pick(float* f, int* q) { *f = remquof(*f, *f, q); }
+"""
+        hip = translate_source(declared, "hip")
+        self.assertIn("float remquof(float x, float y, int* q);", hip)
+        self.assertIn("cts_remquof(*f, *f, q)", hip)
+        with self.assertRaises(TranslateError):
+            translate_source(
+                "#include <cuda_runtime.h>\n__global__ void pick(float* f) { *f = remquof(*f, *f); }\n",
+                "hip",
+            )
+        self.assertEqual(translate_source(source, "maca"), source)
+
     def test_hip_and_musa_lower_double_rounding(self) -> None:
         source = """\
 #include <cuda_runtime.h>
@@ -2296,6 +2374,37 @@ class CorpusTests(unittest.TestCase):
         self.assertIn("hypotf(inf, nan)", maca)
         self.assertIn("norm4df(big, big, big, big)", maca)
         self.assertNotIn("cts_hypotf", maca)
+
+    def test_hip_and_musa_lower_the_census_remquo(self) -> None:
+        path = CENSUS / "remquo" / "main.cu"
+        if not path.is_file():
+            self.skipTest("remquo is not in the census corpus")
+        maca = translate_path(path, "maca")
+        for target in ("hip", "musa"):
+            translated = translate_path(path, target)
+            self.assertIn("cts_remquof(seven, two, &q)", translated)
+            self.assertIn("cts_remquof(fifteen, two, &q)", translated)
+            self.assertIn("cts_remquof(sixteen, one, &q)", translated)
+            self.assertIn("cts_remquof(fifteen, one, &q)", translated)
+            self.assertIn("cts_remquof(odd, two, &q)", translated)
+            self.assertIn("cts_remquof(nseven, two, &q)", translated)
+            self.assertIn("cts_remquof(nan, two, &q)", translated)
+            self.assertIn("cts_remquof(inf, two, &q)", translated)
+            self.assertIn("cts_remquof(seven, zero, &q)", translated)
+            self.assertIn("cts_remquof(n16, one, &q)", translated)
+            self.assertIn("cts_remquo(dseven, dtwo, &q)", translated)
+            self.assertIn("cts_remquo(dnan, dtwo, &q)", translated)
+            self.assertIn("cts_remquo(done, dzero, &q)", translated)
+            self.assertIn("cts_remquo(dfifteen, done, &q)", translated)
+            self.assertIn("cts_remquo(dsixteen, done, &q)", translated)
+            self.assertIn("cts_fremquo_bits(", translated)
+            self.assertIn("cts_dremquo_bits(", translated)
+            self.assertEqual(translated.count("static __device__ int cts_utop("), 1)
+            self.assertNotIn("fb(remquof(", translated)
+            self.assertNotIn("db(remquo(", translated)
+        self.assertIn("remquof(seven, two, &q)", maca)
+        self.assertIn("remquo(dnan, dtwo, &q)", maca)
+        self.assertNotIn("cts_remquof", maca)
 
     def test_hip_and_musa_lower_the_census_fminmax(self) -> None:
         path = CENSUS / "fminmax" / "main.cu"
@@ -5535,6 +5644,108 @@ int main() {
 """
         self._nvcc_mismatch(
             "hypot",
+            "#include <cstdio>\n#include <cuda_runtime.h>\n" + helpers + "\n" + tail,
+        )
+
+    def test_remquo_helpers_agree_with_the_intrinsics(self) -> None:
+        from cuda_retarget.dialect import REMQUO_HELPERS, remquo_blocks
+
+        names = {name for name, _helper in REMQUO_HELPERS.values()}
+        blocks = remquo_blocks(names, "")
+        blocks.extend(helper.strip("\n") for _name, helper in REMQUO_HELPERS.values())
+        helpers = "\n\n".join(blocks)
+        tail = """\
+__device__ float fv(unsigned bits) {
+    volatile unsigned held = bits;
+    union { unsigned as_bits; float as_float; } v;
+    v.as_bits = held;
+    return v.as_float;
+}
+__device__ double dv(unsigned long long bits) {
+    volatile unsigned long long held = bits;
+    union { unsigned long long as_bits; double as_double; } v;
+    v.as_bits = held;
+    return v.as_double;
+}
+__device__ unsigned fb(float x) {
+    union { float as_float; unsigned as_bits; } v;
+    v.as_float = x;
+    return v.as_bits;
+}
+__device__ unsigned long long db(double x) {
+    union { double as_double; unsigned long long as_bits; } v;
+    v.as_double = x;
+    return v.as_bits;
+}
+__device__ void mark(int* bad, unsigned long long* first, unsigned long long bits) {
+    atomicAdd(bad, 1);
+    atomicCAS(first, 0ull, bits ? bits : 1ull);
+}
+__global__ void edges(int* bad, unsigned long long* first) {
+    unsigned xs[8] = {0x40e00000u, 0x40000000u, 0x41700000u, 0x41800000u, 0x3f800000u, 0x4b000001u, 0xc0e00000u, 0xc1800000u};
+    unsigned pairs[6][2] = {{0,1},{2,1},{3,4},{2,4},{5,1},{6,1}};
+    for (int n = 0; n < 6; ++n) {
+        unsigned a = xs[pairs[n][0]], b = xs[pairs[n][1]];
+        int qh = 99, qr = 77;
+        if (fb(cts_remquof(fv(a), fv(b), &qh)) != fb(remquof(fv(a), fv(b), &qr)) || qh != qr)
+            mark(bad, first, a | ((unsigned long long)b << 32));
+    }
+    unsigned long long da = 0x7ff0000000000001ull, dbits = 0x4000000000000000ull;
+    int qh = 99, qr = 77;
+    if (db(cts_remquo(dv(da), dv(dbits), &qh)) != db(remquo(dv(da), dv(dbits), &qr)) || qh != qr)
+        mark(bad, first, da);
+}
+__global__ void sweepf(int* bad, unsigned long long* first) {
+    unsigned fr[2] = {0u, 1u};
+    unsigned ea = blockIdx.x;
+    for (unsigned eb = threadIdx.x; eb < 256u; eb += blockDim.x) {
+        for (int i = 0; i < 2; ++i) for (int j = 0; j < 2; ++j) for (int s = 0; s < 4; ++s) {
+            unsigned a = (ea << 23) | fr[i] | ((s & 1) ? 0x80000000u : 0u);
+            unsigned b = (eb << 23) | fr[j] | ((s & 2) ? 0x80000000u : 0u);
+            int qh = 99, qr = 77;
+            if (fb(cts_remquof(fv(a), fv(b), &qh)) != fb(remquof(fv(a), fv(b), &qr)) || qh != qr)
+                mark(bad, first, a | ((unsigned long long)b << 32));
+        }
+    }
+}
+__global__ void sweepd(int* bad, unsigned long long* first) {
+    unsigned long long fr[2] = {0ull, 1ull};
+    unsigned ea = (blockIdx.x * 17u) % 2048u;
+    for (unsigned step = threadIdx.x; step < 64u; step += blockDim.x) {
+        unsigned eb = (step * 32u + (blockIdx.x & 31u)) % 2048u;
+        for (int i = 0; i < 2; ++i) for (int j = 0; j < 2; ++j) for (int s = 0; s < 4; ++s) {
+            unsigned long long a = ((unsigned long long)ea << 52) | fr[i] | ((s & 1) ? (1ull << 63) : 0ull);
+            unsigned long long b = ((unsigned long long)eb << 52) | fr[j] | ((s & 2) ? (1ull << 63) : 0ull);
+            int qh = 99, qr = 77;
+            if (db(cts_remquo(dv(a), dv(b), &qh)) != db(remquo(dv(a), dv(b), &qr)) || qh != qr)
+                mark(bad, first, a ^ b);
+        }
+    }
+}
+int main() {
+    int* bad = nullptr;
+    unsigned long long* first = nullptr;
+    if (cudaMalloc(&bad, sizeof(*bad)) != cudaSuccess) return 2;
+    if (cudaMalloc(&first, sizeof(*first)) != cudaSuccess) return 2;
+    if (cudaMemset(bad, 0, sizeof(*bad)) != cudaSuccess) return 2;
+    if (cudaMemset(first, 0, sizeof(*first)) != cudaSuccess) return 2;
+    edges<<<1, 1>>>(bad, first);
+    sweepf<<<256, 256>>>(bad, first);
+    sweepd<<<128, 128>>>(bad, first);
+    if (cudaDeviceSynchronize() != cudaSuccess) return 3;
+    int mismatch = 0;
+    unsigned long long seen = 0;
+    if (cudaMemcpy(&mismatch, bad, sizeof(mismatch), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
+    if (cudaMemcpy(&seen, first, sizeof(seen), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
+    std::printf("mismatch=%d\\n", mismatch);
+    if (mismatch) std::printf("first=%llu\\n", seen);
+    cudaFree(bad);
+    cudaFree(first);
+    return 0;
+}
+"""
+        self._nvcc_mismatch(
+            "remquo",
             "#include <cstdio>\n#include <cuda_runtime.h>\n" + helpers + "\n" + tail,
         )
 

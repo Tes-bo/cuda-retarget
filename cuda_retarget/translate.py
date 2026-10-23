@@ -59,6 +59,7 @@ from cuda_retarget.dialect import (
     FSPLIT_HELPERS,
     HYPOT_HELPERS,
     LROUND_HELPERS,
+    REMQUO_HELPERS,
     fround_needs_double,
     fround_needs_float,
     fsplit_arity,
@@ -66,6 +67,7 @@ from cuda_retarget.dialect import (
     hypot_arity,
     hypot_blocks,
     lround_blocks,
+    remquo_blocks,
     FMIN_LESS,
     FMIN_MINMAX,
     FMIN_NEXT,
@@ -645,6 +647,16 @@ def _call_edit(
             raise TranslateError(f"{token.spelling} must have {hypot_arity(token.spelling)} arguments")
         replacement, _helper = HYPOT_HELPERS[token.spelling]
         return (token.start, token.end, replacement)
+    if dialect.lower_remquo and token.spelling in REMQUO_HELPERS:
+        if _is_define_name(tokens, index) or _is_declared_here(tokens, index):
+            return None
+        parsed = _arguments(tokens, index + 1)
+        if parsed is None:
+            return None
+        if len(parsed[0]) != 3:
+            raise TranslateError(f"{token.spelling} must have three arguments")
+        replacement, _helper = REMQUO_HELPERS[token.spelling]
+        return (token.start, token.end, replacement)
     if dialect.lower_darith and token.spelling in DARITH_HELPERS:
         parsed = _arguments(tokens, index + 1)
         arity = 3 if token.spelling.startswith("__fma_") else 2
@@ -1061,6 +1073,13 @@ def _helpers(dialect: Dialect, rewritten: str) -> str:
         names = {name for name, _helper in used}
         if names:
             blocks.extend(hypot_blocks(names, "\n".join(blocks)))
+            for _name, helper in used:
+                blocks.append(helper.strip("\n"))
+    if dialect.lower_remquo:
+        used = [(name, helper) for name, helper in REMQUO_HELPERS.values() if f"{name}(" in rewritten]
+        names = {name for name, _helper in used}
+        if names:
+            blocks.extend(remquo_blocks(names, "\n".join(blocks)))
             for _name, helper in used:
                 blocks.append(helper.strip("\n"))
     if dialect.lower_ptx:
