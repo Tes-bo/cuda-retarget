@@ -56,8 +56,11 @@ from cuda_retarget.dialect import (
     FROUND_DOUBLE,
     FROUND_FLOAT,
     FROUND_HELPERS,
+    FSPLIT_HELPERS,
     fround_needs_double,
     fround_needs_float,
+    fsplit_arity,
+    fsplit_blocks,
     FMIN_LESS,
     FMIN_MINMAX,
     FMIN_NEXT,
@@ -607,6 +610,16 @@ def _call_edit(
             raise TranslateError(f"{token.spelling} must have one argument")
         replacement, _helper = FROUND_HELPERS[token.spelling]
         return (token.start, token.end, replacement)
+    if dialect.lower_fsplit and token.spelling in FSPLIT_HELPERS:
+        if _is_define_name(tokens, index) or _is_declared_here(tokens, index):
+            return None
+        parsed = _arguments(tokens, index + 1)
+        if parsed is None:
+            return None
+        if len(parsed[0]) != fsplit_arity(token.spelling):
+            raise TranslateError(f"{token.spelling} must have {fsplit_arity(token.spelling)} arguments")
+        replacement, _helper = FSPLIT_HELPERS[token.spelling]
+        return (token.start, token.end, replacement)
     if dialect.lower_darith and token.spelling in DARITH_HELPERS:
         parsed = _arguments(tokens, index + 1)
         arity = 3 if token.spelling.startswith("__fma_") else 2
@@ -1002,6 +1015,13 @@ def _helpers(dialect: Dialect, rewritten: str) -> str:
                 blocks.append(FROUND_FLOAT.strip("\n"))
             if fround_needs_double(names):
                 blocks.append(FROUND_DOUBLE.strip("\n"))
+            for _name, helper in used:
+                blocks.append(helper.strip("\n"))
+    if dialect.lower_fsplit:
+        used = [(name, helper) for name, helper in FSPLIT_HELPERS.values() if f"{name}(" in rewritten]
+        names = {name for name, _helper in used}
+        if names:
+            blocks.extend(fsplit_blocks(names, "\n".join(blocks)))
             for _name, helper in used:
                 blocks.append(helper.strip("\n"))
     if dialect.lower_ptx:

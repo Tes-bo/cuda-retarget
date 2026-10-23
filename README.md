@@ -64,7 +64,7 @@ Comments and string literals stay. A name inside a `#define` is rewritten at the
 | `musa` | the same rule with the `musa` prefix | `musa_runtime.h` | unchanged | lowered |
 | `maca` | unchanged | `cuda_runtime.h` | unchanged | unchanged |
 
-The helpers are bitcasts and double hi/lo words, funnel shifts, `__dp4a`, packed add/sub/min/max/abs, `__byte_perm`, averages, high-half products, absolute differences, packed absolute-difference sums, comparison masks, lane predicates, packed averages, bit scans, 24-bit products, rounding conversions, double-to-float rounding, float-to-half rounding, integer and double conversions into half, half-to-integer conversions, half add, multiply, fused multiply-add, packed half2 arithmetic, half comparisons, `__saturatef`, directed float add, sub, mul, and fused multiply-add, directed double add, sub, mul, and fused multiply-add, directed float division, reciprocal, square root, and reciprocal square root, and `fmin`/`fmax`, `nextafter`, and `copysign`, and `floor`, `ceil`, `trunc`, `rint`, `nearbyint`, and `round`.
+The helpers are bitcasts and double hi/lo words, funnel shifts, `__dp4a`, packed add/sub/min/max/abs, `__byte_perm`, averages, high-half products, absolute differences, packed absolute-difference sums, comparison masks, lane predicates, packed averages, bit scans, 24-bit products, rounding conversions, double-to-float rounding, float-to-half rounding, integer and double conversions into half, half-to-integer conversions, half add, multiply, fused multiply-add, packed half2 arithmetic, half comparisons, `__saturatef`, directed float add, sub, mul, and fused multiply-add, directed double add, sub, mul, and fused multiply-add, directed float division, reciprocal, square root, and reciprocal square root, and `fmin`/`fmax`, `nextafter`, and `copysign`, and `floor`, `ceil`, `trunc`, `rint`, `nearbyint`, and `round`, and `frexp`, `ilogb`, `modf`, `ldexp`, `fmod`, `remainder`, and `fdim`.
 
 Inserted helpers are `static __device__` and sit after the last `#include`.
 
@@ -170,6 +170,11 @@ These are the results a prefix swap gets wrong. HIP and MUSA both get the helper
 | `floorf` of a negative subnormal | `-1`. `truncf` and `ceilf` of it are `-0` |
 | a float NaN passed to `floorf` | the canonical quiet NaN `2147483647` |
 | a signaling double NaN passed to `floor` | the same payload, quieted, `9221120237041090561` |
+| `frexpf` of the smallest subnormal | `0.5` with exponent `-148`. `ilogbf(0)` is `INT_MIN` and infinity is `INT_MAX` |
+| `ldexpf(1, -150)` | `+0`. One bit above that power is the smallest subnormal |
+| `remainderf(7, 2)` / `fmodf(7, 2)` | `-1` / `1` |
+| `fdimf` of two infinities with the same sign | `+0`. Opposite signs stay infinite |
+| `fmod(1, 0)` | the negative quiet NaN `18444492273895866368` |
 
 Signed lane `0x8000` and unsigned lane `0x8000` are different numbers in the packed comparisons, min/max, and absolute differences.
 

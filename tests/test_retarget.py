@@ -1136,6 +1136,81 @@ __global__ void pick(double* d) { *d = nextafter(*d, 1.0); }
         self.assertNotIn("cts_fless", hip)
         self.assertEqual(translate_source(source, "maca"), source)
 
+    def test_hip_and_musa_lower_float_split(self) -> None:
+        source = """\
+#include <cuda_runtime.h>
+__global__ void hold(float* f) {
+    float fmodf = *f;
+    *f = fmodf;
+}
+__global__ void pick(float* f, double* d, int* e) {
+    const char* label = "frexpf ilogbf modff ldexpf fmodf remainderf fdimf frexp ilogb modf ldexp fmod remainder fdim";
+    float fi;
+    double di;
+    *f = frexpf(*f, e);
+    *e = ilogbf(*f);
+    *f = modff(*f, &fi);
+    *f = ldexpf(*f, *e);
+    *f = fmodf(*f, 3.0f);
+    *f = remainderf(*f, 3.0f);
+    *f = fdimf(*f, fi);
+    *d = frexp(*d, e);
+    *e = ilogb(*d);
+    *d = modf(*d, &di);
+    *d = ldexp(*d, *e);
+    *d = fmod(*d, 3.0);
+    *d = remainder(*d, 3.0);
+    *d = fdim(*d, di);
+    *f += label[0];
+}
+"""
+        for target in ("hip", "musa"):
+            translated = translate_source(source, target)
+            self.assertIn('"frexpf ilogbf modff ldexpf fmodf remainderf fdimf frexp ilogb modf ldexp fmod remainder fdim"', translated)
+            self.assertIn("float fmodf = *f;", translated)
+            self.assertIn("*f = fmodf;", translated)
+            self.assertIn("cts_frexpf(*f, e)", translated)
+            self.assertIn("cts_ilogbf(*f)", translated)
+            self.assertIn("cts_modff(*f, &fi)", translated)
+            self.assertIn("cts_ldexpf(*f, *e)", translated)
+            self.assertIn("cts_fmodf(*f, 3.0f)", translated)
+            self.assertIn("cts_remainderf(*f, 3.0f)", translated)
+            self.assertIn("cts_fdimf(*f, fi)", translated)
+            self.assertIn("cts_frexp(*d, e)", translated)
+            self.assertIn("cts_ilogb(*d)", translated)
+            self.assertIn("cts_modf(*d, &di)", translated)
+            self.assertIn("cts_ldexp(*d, *e)", translated)
+            self.assertIn("cts_fmod(*d, 3.0)", translated)
+            self.assertIn("cts_remainder(*d, 3.0)", translated)
+            self.assertIn("cts_fdim(*d, di)", translated)
+            self.assertIn("cts_fremf_bits", translated)
+            self.assertIn("cts_drem_bits", translated)
+            self.assertNotIn("(frexpf(", translated)
+            self.assertNotIn("(fmodf(", translated)
+            self.assertNotIn("(remainder(", translated)
+        float_only = """\
+#include <cuda_runtime.h>
+__global__ void pick(float* f) { *f = fdimf(*f, 1.0f); }
+"""
+        hip = translate_source(float_only, "hip")
+        self.assertIn("cts_fdimf(*f, 1.0f)", hip)
+        self.assertNotIn("cts_fdim(", hip)
+        self.assertNotIn("cts_drem_bits", hip)
+        double_only = """\
+#include <cuda_runtime.h>
+__global__ void pick(double* d) { *d = fmod(*d, 2.0); }
+"""
+        hip = translate_source(double_only, "hip")
+        self.assertIn("cts_fmod(*d, 2.0)", hip)
+        self.assertNotIn("cts_fmodf(", hip)
+        self.assertNotIn("cts_fremf_bits", hip)
+        with self.assertRaises(TranslateError):
+            translate_source(
+                "#include <cuda_runtime.h>\n__global__ void pick(float* f) { *f = fmodf(*f); }\n",
+                "hip",
+            )
+        self.assertEqual(translate_source(source, "maca"), source)
+
     def test_hip_and_musa_lower_double_rounding(self) -> None:
         source = """\
 #include <cuda_runtime.h>
@@ -1978,6 +2053,35 @@ class CorpusTests(unittest.TestCase):
         self.assertIn("(rintf(", maca)
         self.assertIn("(round(", maca)
         self.assertNotIn("cts_roundf", maca)
+
+    def test_hip_and_musa_lower_the_census_fsplit(self) -> None:
+        path = CENSUS / "fsplit" / "main.cu"
+        if not path.is_file():
+            self.skipTest("fsplit is not in the census corpus")
+        maca = translate_path(path, "maca")
+        for target in ("hip", "musa"):
+            translated = translate_path(path, target)
+            self.assertIn("cts_frexpf(sub, &fexp)", translated)
+            self.assertIn("cts_ilogbf(zero)", translated)
+            self.assertIn("cts_ldexpf(one, -150)", translated)
+            self.assertIn("cts_ldexpf(eps, -150)", translated)
+            self.assertIn("cts_modff(ninf, &ip)", translated)
+            self.assertIn("cts_fmodf(seven, two)", translated)
+            self.assertIn("cts_remainderf(seven, two)", translated)
+            self.assertIn("cts_fdimf(pinf, pinf)", translated)
+            self.assertIn("cts_frexp(dsub, &dexp)", translated)
+            self.assertIn("cts_fmod(done, dzero)", translated)
+            self.assertIn("cts_remainder(dseven, dtwo)", translated)
+            self.assertIn("cts_fmod(dnan, done)", translated)
+            self.assertIn("cts_fmod(done, dnan5)", translated)
+            self.assertIn("cts_fremf_bits", translated)
+            self.assertIn("cts_drem_bits", translated)
+            self.assertNotIn("(frexpf(", translated)
+            self.assertNotIn("(remainderf(", translated)
+            self.assertNotIn("(fmod(", translated)
+        self.assertIn("(frexpf(", maca)
+        self.assertIn("(remainder(", maca)
+        self.assertNotIn("cts_frexpf", maca)
 
     def test_hip_and_musa_lower_the_census_fminmax(self) -> None:
         path = CENSUS / "fminmax" / "main.cu"
@@ -4851,6 +4955,143 @@ __global__ void compare(int* bad, unsigned long long* first) {{
                 if (db(rint(x)) != db(cts_rint(x))) mark(bad, first, bits);
                 if (db(nearbyint(x)) != db(cts_nearbyint(x))) mark(bad, first, bits);
                 if (db(round(x)) != db(cts_round(x))) mark(bad, first, bits);
+            }}
+        }}
+    }}
+}}
+int main() {{
+    int* bad = nullptr;
+    unsigned long long* first = nullptr;
+    if (cudaMalloc(&bad, sizeof(*bad)) != cudaSuccess) return 2;
+    if (cudaMalloc(&first, sizeof(*first)) != cudaSuccess) return 2;
+    if (cudaMemset(bad, 0, sizeof(*bad)) != cudaSuccess) return 2;
+    if (cudaMemset(first, 0, sizeof(*first)) != cudaSuccess) return 2;
+    compare<<<1, 1>>>(bad, first);
+    if (cudaDeviceSynchronize() != cudaSuccess) return 3;
+    int mismatch = 0;
+    unsigned long long seen = 0;
+    if (cudaMemcpy(&mismatch, bad, sizeof(mismatch), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
+    if (cudaMemcpy(&seen, first, sizeof(seen), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
+    std::printf("mismatch=%d\\n", mismatch);
+    if (mismatch) std::printf("first=%llu\\n", seen);
+    cudaFree(bad);
+    cudaFree(first);
+    return 0;
+}}
+""",
+        )
+
+    def test_float_split_helpers_agree_with_the_intrinsics(self) -> None:
+        from cuda_retarget.dialect import FSPLIT_HELPERS, fsplit_blocks
+
+        names = {name for name, _helper in FSPLIT_HELPERS.values()}
+        blocks = fsplit_blocks(names, "")
+        blocks.extend(helper.strip("\n") for _name, helper in FSPLIT_HELPERS.values())
+        helpers = "\n\n".join(blocks)
+        self._nvcc_mismatch(
+            "fsplit",
+            f"""\
+#include <cstdio>
+#include <cuda_runtime.h>
+{helpers}
+__device__ unsigned fb(float x) {{
+    union {{ float as_float; unsigned as_bits; }} v;
+    v.as_float = x;
+    return v.as_bits;
+}}
+__device__ unsigned long long db(double x) {{
+    union {{ double as_double; unsigned long long as_bits; }} v;
+    v.as_double = x;
+    return v.as_bits;
+}}
+__device__ float fv(unsigned bits) {{
+    volatile unsigned held = bits;
+    union {{ unsigned as_bits; float as_float; }} v;
+    v.as_bits = held;
+    return v.as_float;
+}}
+__device__ double dv(unsigned long long bits) {{
+    volatile unsigned long long held = bits;
+    union {{ unsigned long long as_bits; double as_double; }} v;
+    v.as_bits = held;
+    return v.as_double;
+}}
+__device__ int iv(int bits) {{
+    volatile int held = bits;
+    return held;
+}}
+__device__ void mark(int* bad, unsigned long long* first, unsigned long long bits) {{
+    atomicAdd(bad, 1);
+    atomicCAS(first, 0ull, bits ? bits : 1ull);
+}}
+__device__ void checkf(unsigned bits, unsigned yb, int* bad, unsigned long long* first) {{
+    float x = fv(bits);
+    float y = fv(yb);
+    int e1 = 7;
+    int e2 = 9;
+    if (fb(frexpf(x, &e1)) != fb(cts_frexpf(x, &e2)) || e1 != e2) mark(bad, first, bits);
+    if (ilogbf(x) != cts_ilogbf(x)) mark(bad, first, bits);
+    float ip1 = 1.0f;
+    float ip2 = 2.0f;
+    if (fb(modff(x, &ip1)) != fb(cts_modff(x, &ip2)) || fb(ip1) != fb(ip2)) mark(bad, first, bits);
+    int expos[8] = {{0, 1, -1, 128, -149, -150, 2147483647, (int)0x80000000}};
+    for (int t = 0; t < 8; ++t) {{
+        int e = iv(expos[t]);
+        if (fb(ldexpf(x, e)) != fb(cts_ldexpf(x, e))) mark(bad, first, bits);
+    }}
+    if (fb(fmodf(x, y)) != fb(cts_fmodf(x, y))) mark(bad, first, bits);
+    if (fb(remainderf(x, y)) != fb(cts_remainderf(x, y))) mark(bad, first, bits);
+    if (fb(fdimf(x, y)) != fb(cts_fdimf(x, y))) mark(bad, first, bits);
+}}
+__device__ void checkd(unsigned long long bits, unsigned long long yb, int* bad, unsigned long long* first) {{
+    double x = dv(bits);
+    double y = dv(yb);
+    int e1 = 7;
+    int e2 = 9;
+    if (db(frexp(x, &e1)) != db(cts_frexp(x, &e2)) || e1 != e2) mark(bad, first, bits);
+    if (ilogb(x) != cts_ilogb(x)) mark(bad, first, bits);
+    double ip1 = 1.0;
+    double ip2 = 2.0;
+    if (db(modf(x, &ip1)) != db(cts_modf(x, &ip2)) || db(ip1) != db(ip2)) mark(bad, first, bits);
+    int expos[8] = {{0, 1, -1, 1024, -1074, -1075, 2147483647, (int)0x80000000}};
+    for (int t = 0; t < 8; ++t) {{
+        int e = iv(expos[t]);
+        if (db(ldexp(x, e)) != db(cts_ldexp(x, e))) mark(bad, first, bits);
+    }}
+    if (db(fmod(x, y)) != db(cts_fmod(x, y))) mark(bad, first, bits);
+    if (db(remainder(x, y)) != db(cts_remainder(x, y))) mark(bad, first, bits);
+    if (db(fdim(x, y)) != db(cts_fdim(x, y))) mark(bad, first, bits);
+}}
+__global__ void compare(int* bad, unsigned long long* first) {{
+    unsigned edges[8] = {{0u, 0x80000000u, 1u, 0x7f800000u, 0xff800000u, 0x7fc00001u, 0x7f800001u, 0x3f800001u}};
+    for (int i = 0; i < 8; ++i) {{
+        for (int j = 0; j < 8; ++j) checkf(edges[i], edges[j], bad, first);
+    }}
+    unsigned fracs[4] = {{0u, 1u, 0x7fffffu, 0x400000u}};
+    for (unsigned sign = 0u; sign < 2u; ++sign) {{
+        for (unsigned exp = 0u; exp < 256u; ++exp) {{
+            for (int k = 0; k < 4; ++k) {{
+                unsigned bits = (sign << 31) | (exp << 23) | fracs[k];
+                unsigned yb = ((sign ^ 1u) << 31) | (((exp * 5u + 1u) & 255u) << 23) | fracs[(k + 1) & 3];
+                checkf(bits, yb, bad, first);
+            }}
+        }}
+    }}
+    unsigned long long dedges[8] = {{
+        0ull, 0x8000000000000000ull, 1ull, 0x7ff0000000000000ull, 0xfff0000000000000ull,
+        0x7ff8000000000001ull, 0x7ff0000000000001ull, 0x7ff8000000000005ull
+    }};
+    for (int i = 0; i < 8; ++i) {{
+        for (int j = 0; j < 8; ++j) checkd(dedges[i], dedges[j], bad, first);
+    }}
+    unsigned long long dfracs[3] = {{0ull, 1ull, (1ull << 52) - 1ull}};
+    for (unsigned sign = 0u; sign < 2u; ++sign) {{
+        for (unsigned exp = 0u; exp < 2048u; exp += 17u) {{
+            for (int k = 0; k < 3; ++k) {{
+                unsigned long long bits = ((unsigned long long)sign << 63) | ((unsigned long long)exp << 52) | dfracs[k];
+                unsigned exp2 = (exp * 7u + 3u) & 2047u;
+                unsigned long long yb = ((unsigned long long)(sign ^ 1u) << 63) | ((unsigned long long)exp2 << 52) | dfracs[(k + 1) % 3];
+                checkd(bits, yb, bad, first);
             }}
         }}
     }}

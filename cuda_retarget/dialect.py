@@ -394,6 +394,14 @@ class Dialect:
     becomes the canonical quiet NaN `0x7fffffff`. A double NaN keeps its
     sign and payload, and a signaling NaN is quieted. `nearbyint` has the
     same bits as `rint`.
+    `lower_fsplit` replaces `frexp`, `ldexp`, `ilogb`, `modf`, `fmod`,
+    `remainder`, and `fdim`, and the float forms. `frexpf` of the smallest
+    subnormal is `0.5` with exponent `-148`. `ilogbf(0)` is `INT_MIN` and
+    `ilogbf` of infinity is `INT_MAX`. `ldexpf(1, -150)` is `+0`, and one
+    bit above that power is the smallest subnormal. `remainderf(7, 2)` is
+    `-1` while `fmodf(7, 2)` is `1`. `fdimf` of two infinities with the
+    same sign is `+0`. A float NaN becomes `0x7fffffff`. A double NaN
+    keeps its sign and payload. `fmod(1, 0)` is the negative quiet NaN.
     """
 
     name: str
@@ -428,6 +436,7 @@ class Dialect:
     lower_half: bool
     lower_ptx: bool
     lower_fround: bool
+    lower_fsplit: bool
 
 
 DIALECTS = {
@@ -464,6 +473,7 @@ DIALECTS = {
         lower_half=True,
         lower_ptx=True,
         lower_fround=True,
+        lower_fsplit=True,
     ),
     "musa": Dialect(
         name="musa",
@@ -498,6 +508,7 @@ DIALECTS = {
         lower_half=True,
         lower_ptx=True,
         lower_fround=True,
+        lower_fsplit=True,
     ),
     "maca": Dialect(
         name="maca",
@@ -532,6 +543,7 @@ DIALECTS = {
         lower_half=False,
         lower_ptx=False,
         lower_fround=False,
+        lower_fsplit=False,
     ),
 }
 
@@ -1809,6 +1821,504 @@ def fround_needs_float(names: set[str]) -> bool:
 
 def fround_needs_double(names: set[str]) -> bool:
     return any(not name.endswith("f") for name in names)
+
+# frexp, ldexp, ilogb, modf, fmod, remainder, and fdim.
+# Measured on sm_70. Float NaNs become 0x7fffffff. A double NaN keeps its
+# sign and payload, and a signaling NaN is quieted. fmod and remainder of
+# an infinity or a zero divisor are the canonical float NaN, or the
+# negative quiet double NaN. remainderf(7, 2) is -1. fdim of two infinities
+# with the same sign is +0.
+FSPLIT_TOP = """
+static __device__ int cts_utop(unsigned long long mag) {
+    int n = 0;
+    while (mag > 1ull) { mag >>= 1ull; ++n; }
+    return n;
+}
+"""
+
+FSPLIT_FMAG = """
+static __device__ int cts_fmag(unsigned bits, unsigned* sign, unsigned long long* sig, long long* scale) {
+    *sign = bits >> 31;
+    unsigned exp = (bits >> 23) & 0xffu;
+    unsigned frac = bits & 0x7fffffu;
+    if (exp == 0xffu) return frac ? 3 : 2;
+    if (exp == 0u) {
+        if (frac == 0u) return 1;
+        *sig = frac;
+        *scale = -149;
+        return 0;
+    }
+    *sig = (1ull << 23) | frac;
+    *scale = (long long)exp - 127 - 23;
+    return 0;
+}
+"""
+
+FSPLIT_FENC = """
+static __device__ unsigned cts_fenc(unsigned sign, unsigned long long mag, long long scale) {
+    if (mag == 0ull) return sign << 31;
+    int top = cts_utop(mag);
+    long long unbiased = (long long)top + scale;
+    unsigned long long sig;
+    if (top > 23) {
+        int shift = top - 23;
+        unsigned long long lost = mag & ((1ull << shift) - 1ull);
+        sig = mag >> shift;
+        unsigned long long half = 1ull << (shift - 1);
+        if (lost > half || (lost == half && (sig & 1ull))) {
+            sig += 1ull;
+            if (sig == (1ull << 24)) { sig >>= 1ull; unbiased += 1; }
+        }
+    } else if (top < 23) {
+        sig = mag << (unsigned)(23 - top);
+    } else {
+        sig = mag;
+    }
+    if (unbiased > 127) return (sign << 31) | 0x7f800000u;
+    if (unbiased >= -126) {
+        return (sign << 31) | ((unsigned)(unbiased + 127) << 23) | ((unsigned)sig & 0x7fffffu);
+    }
+    long long sh = -126 - unbiased;
+    if (sh >= 25) return sign << 31;
+    unsigned long long lost = sig & ((1ull << (unsigned)sh) - 1ull);
+    unsigned long long field = sig >> (unsigned)sh;
+    unsigned long long half = 1ull << (unsigned)(sh - 1);
+    if (lost > half || (lost == half && (field & 1ull))) field += 1ull;
+    if (field >= (1ull << 23)) return (sign << 31) | 0x00800000u;
+    return (sign << 31) | (unsigned)field;
+}
+"""
+
+FSPLIT_FREXPF = """
+static __device__ unsigned cts_frexpf_bits(unsigned bits, int* expo) {
+    unsigned sign; unsigned long long sig; long long scale;
+    int kind = cts_fmag(bits, &sign, &sig, &scale);
+    if (kind == 3) { *expo = 0; return 0x7fffffffu; }
+    if (kind != 0) { *expo = 0; return bits; }
+    int top = cts_utop(sig);
+    *expo = top + (int)scale + 1;
+    unsigned field = (unsigned)((sig << (unsigned)(23 - top)) & 0x7fffffu);
+    return (sign << 31) | (126u << 23) | field;
+}
+"""
+
+FSPLIT_ILOGBF = """
+static __device__ int cts_ilogbf_bits(unsigned bits) {
+    unsigned sign; unsigned long long sig; long long scale;
+    int kind = cts_fmag(bits, &sign, &sig, &scale);
+    if (kind == 3 || kind == 1) return (int)0x80000000;
+    if (kind == 2) return 2147483647;
+    return cts_utop(sig) + (int)scale;
+}
+"""
+
+FSPLIT_LDEXPF = """
+static __device__ unsigned cts_ldexpf_bits(unsigned bits, int expo) {
+    unsigned sign; unsigned long long sig; long long scale;
+    int kind = cts_fmag(bits, &sign, &sig, &scale);
+    if (kind == 3) return 0x7fffffffu;
+    if (kind != 0) return bits;
+    return cts_fenc(sign, sig, scale + (long long)expo);
+}
+"""
+
+FSPLIT_MODFF = """
+static __device__ unsigned cts_modff_bits(unsigned bits, unsigned* ipart) {
+    unsigned sign; unsigned long long sig; long long scale;
+    int kind = cts_fmag(bits, &sign, &sig, &scale);
+    if (kind == 3) { *ipart = 0x7fffffffu; return 0x7fffffffu; }
+    if (kind == 1) { *ipart = bits; return bits; }
+    if (kind == 2) { *ipart = bits; return sign << 31; }
+    if (scale >= 0) { *ipart = bits; return sign << 31; }
+    int sh = (int)(-scale);
+    if (sh >= cts_utop(sig) + 1) { *ipart = sign << 31; return bits; }
+    *ipart = cts_fenc(sign, sig >> (unsigned)sh, 0);
+    unsigned long long frac = sig & ((1ull << (unsigned)sh) - 1ull);
+    return cts_fenc(sign, frac, scale);
+}
+"""
+
+FSPLIT_FREMF = """
+static __device__ unsigned cts_fremf_bits(unsigned x, unsigned y, int nearest) {
+    unsigned sxn, syn; unsigned long long sx, sy; long long ax, ay;
+    int xk = cts_fmag(x, &sxn, &sx, &ax);
+    int yk = cts_fmag(y, &syn, &sy, &ay);
+    if (xk == 3 || yk == 3 || xk == 2 || yk == 1) return 0x7fffffffu;
+    if (yk == 2 || xk == 1) return x;
+    int smaller = ax < ay || (ax == ay && sx < sy);
+    if (smaller && !nearest) return x;
+    if (smaller && ay >= ax + 2) return x;
+    unsigned sign = sxn;
+    if (smaller && ay == ax) {
+        if ((sx << 1) <= sy) return x;
+        unsigned long long rem = sy - sx;
+        return rem ? cts_fenc(sign ^ 1u, rem, ax) : ((sign ^ 1u) << 31);
+    }
+    if (smaller) {
+        if (sx <= sy) return x;
+        unsigned long long rem = (sy << 1) - sx;
+        return rem ? cts_fenc(sign ^ 1u, rem, ax) : ((sign ^ 1u) << 31);
+    }
+    long long ds = ax - ay;
+    unsigned long long rem = 0ull;
+    int parity = 0;
+    int width = cts_utop(sx) + 1 + (int)ds;
+    for (int i = width - 1; i >= 0; --i) {
+        rem <<= 1ull;
+        if ((long long)i >= ds && ((sx >> (unsigned)(i - (int)ds)) & 1ull)) rem |= 1ull;
+        if (rem >= sy) { rem -= sy; parity = 1; }
+        else parity = 0;
+    }
+    if (nearest && ((rem << 1) > sy || ((rem << 1) == sy && parity))) {
+        rem = sy - rem;
+        sign ^= 1u;
+    }
+    if (rem == 0ull) return sign << 31;
+    return cts_fenc(sign, rem, ay);
+}
+"""
+
+FSPLIT_DMAG = """
+static __device__ int cts_dmag(unsigned long long bits, unsigned* sign, unsigned long long* sig, long long* scale) {
+    *sign = (unsigned)(bits >> 63);
+    unsigned exp = (unsigned)((bits >> 52) & 0x7ffu);
+    unsigned long long frac = bits & 0xfffffffffffffull;
+    if (exp == 0x7ffu) return frac ? 3 : 2;
+    if (exp == 0u) {
+        if (frac == 0ull) return 1;
+        *sig = frac;
+        *scale = -1074;
+        return 0;
+    }
+    *sig = (1ull << 52) | frac;
+    *scale = (long long)exp - 1023 - 52;
+    return 0;
+}
+"""
+
+FSPLIT_DENC = """
+static __device__ unsigned long long cts_denc(unsigned sign, unsigned long long mag, long long scale) {
+    if (mag == 0ull) return (unsigned long long)sign << 63;
+    int top = cts_utop(mag);
+    long long unbiased = (long long)top + scale;
+    unsigned long long sig;
+    if (top > 52) {
+        int shift = top - 52;
+        unsigned long long lost = mag & ((1ull << shift) - 1ull);
+        sig = mag >> shift;
+        unsigned long long half = 1ull << (shift - 1);
+        if (lost > half || (lost == half && (sig & 1ull))) {
+            sig += 1ull;
+            if (sig == (1ull << 53)) { sig >>= 1ull; unbiased += 1; }
+        }
+    } else if (top < 52) {
+        sig = mag << (unsigned)(52 - top);
+    } else {
+        sig = mag;
+    }
+    if (unbiased > 1023) return ((unsigned long long)sign << 63) | 0x7ff0000000000000ull;
+    if (unbiased >= -1022) {
+        return ((unsigned long long)sign << 63) | ((unsigned long long)(unbiased + 1023) << 52) | (sig & 0xfffffffffffffull);
+    }
+    long long sh = -1022 - unbiased;
+    if (sh >= 54) return (unsigned long long)sign << 63;
+    unsigned long long lost = sig & ((1ull << (unsigned)sh) - 1ull);
+    unsigned long long field = sig >> (unsigned)sh;
+    unsigned long long half = 1ull << (unsigned)(sh - 1);
+    if (lost > half || (lost == half && (field & 1ull))) field += 1ull;
+    if (field >= (1ull << 52)) return ((unsigned long long)sign << 63) | (1ull << 52);
+    return ((unsigned long long)sign << 63) | field;
+}
+"""
+
+FSPLIT_FREXP = """
+static __device__ unsigned long long cts_frexp_bits(unsigned long long bits, int* expo) {
+    unsigned sign; unsigned long long sig; long long scale;
+    int kind = cts_dmag(bits, &sign, &sig, &scale);
+    if (kind == 3) { *expo = 0; return bits | (1ull << 51); }
+    if (kind != 0) { *expo = 0; return bits; }
+    int top = cts_utop(sig);
+    *expo = top + (int)scale + 1;
+    unsigned long long field = (sig << (unsigned)(52 - top)) & 0xfffffffffffffull;
+    return ((unsigned long long)sign << 63) | (1022ull << 52) | field;
+}
+"""
+
+FSPLIT_ILOGB = """
+static __device__ int cts_ilogb_bits(unsigned long long bits) {
+    unsigned sign; unsigned long long sig; long long scale;
+    int kind = cts_dmag(bits, &sign, &sig, &scale);
+    if (kind == 3 || kind == 1) return (int)0x80000000;
+    if (kind == 2) return 2147483647;
+    return cts_utop(sig) + (int)scale;
+}
+"""
+
+FSPLIT_LDEXP = """
+static __device__ unsigned long long cts_ldexp_bits(unsigned long long bits, int expo) {
+    unsigned sign; unsigned long long sig; long long scale;
+    int kind = cts_dmag(bits, &sign, &sig, &scale);
+    if (kind == 3) return bits | (1ull << 51);
+    if (kind != 0) return bits;
+    return cts_denc(sign, sig, scale + (long long)expo);
+}
+"""
+
+FSPLIT_MODF = """
+static __device__ unsigned long long cts_modf_bits(unsigned long long bits, unsigned long long* ipart) {
+    unsigned sign; unsigned long long sig; long long scale;
+    int kind = cts_dmag(bits, &sign, &sig, &scale);
+    if (kind == 3) { unsigned long long nan = bits | (1ull << 51); *ipart = nan; return nan; }
+    if (kind == 1) { *ipart = bits; return bits; }
+    if (kind == 2) { *ipart = bits; return (unsigned long long)sign << 63; }
+    if (scale >= 0) { *ipart = bits; return (unsigned long long)sign << 63; }
+    int sh = (int)(-scale);
+    if (sh >= cts_utop(sig) + 1) { *ipart = (unsigned long long)sign << 63; return bits; }
+    *ipart = cts_denc(sign, sig >> (unsigned)sh, 0);
+    unsigned long long frac = sig & ((1ull << (unsigned)sh) - 1ull);
+    return cts_denc(sign, frac, scale);
+}
+"""
+
+FSPLIT_DREM = """
+static __device__ unsigned long long cts_drem_bits(unsigned long long x, unsigned long long y, int nearest) {
+    unsigned sxn, syn; unsigned long long sx, sy; long long ax, ay;
+    int xk = cts_dmag(x, &sxn, &sx, &ax);
+    int yk = cts_dmag(y, &syn, &sy, &ay);
+    if (yk == 3) return y | (1ull << 51);
+    if (xk == 3) return x | (1ull << 51);
+    if (xk == 2 || yk == 1) return 0xfff8000000000000ull;
+    if (yk == 2 || xk == 1) return x;
+    int smaller = ax < ay || (ax == ay && sx < sy);
+    if (smaller && !nearest) return x;
+    if (smaller && ay >= ax + 2) return x;
+    unsigned sign = sxn;
+    if (smaller && ay == ax) {
+        if ((sx << 1) <= sy) return x;
+        unsigned long long rem = sy - sx;
+        return rem ? cts_denc(sign ^ 1u, rem, ax) : ((unsigned long long)(sign ^ 1u) << 63);
+    }
+    if (smaller) {
+        if (sx <= sy) return x;
+        unsigned long long rem = (sy << 1) - sx;
+        return rem ? cts_denc(sign ^ 1u, rem, ax) : ((unsigned long long)(sign ^ 1u) << 63);
+    }
+    long long ds = ax - ay;
+    unsigned long long rem = 0ull;
+    int parity = 0;
+    int width = cts_utop(sx) + 1 + (int)ds;
+    for (int i = width - 1; i >= 0; --i) {
+        rem <<= 1ull;
+        if ((long long)i >= ds && ((sx >> (unsigned)(i - (int)ds)) & 1ull)) rem |= 1ull;
+        if (rem >= sy) { rem -= sy; parity = 1; }
+        else parity = 0;
+    }
+    if (nearest && ((rem << 1) > sy || ((rem << 1) == sy && parity))) {
+        rem = sy - rem;
+        sign ^= 1u;
+    }
+    if (rem == 0ull) return (unsigned long long)sign << 63;
+    return cts_denc(sign, rem, ay);
+}
+"""
+
+FSPLIT_FDIM = """
+static __device__ float cts_fdimf(float a, float b) {
+    union { float f; unsigned u; } x, y, out;
+    x.f = a;
+    y.f = b;
+    int na = ((x.u >> 23) & 0xffu) == 0xffu && (x.u & 0x7fffffu);
+    int nb = ((y.u >> 23) & 0xffu) == 0xffu && (y.u & 0x7fffffu);
+    if (na || nb) { out.u = 0x7fffffffu; return out.f; }
+    if (!cts_fless(y.u, x.u)) return 0.0f;
+    out.u = cts_fadd(x.u, y.u ^ 0x80000000u, 0);
+    return out.f;
+}
+"""
+
+FSPLIT_DDIM = """
+static __device__ double cts_fdim(double a, double b) {
+    union { double d; unsigned long long u; } x, y, out;
+    x.d = a;
+    y.d = b;
+    if (cts_disnan(x.u) || cts_disnan(y.u)) {
+        out.u = cts_dquiet(cts_disnan(y.u) ? y.u : x.u);
+        return out.d;
+    }
+    if (!cts_dless(y.u, x.u)) return 0.0;
+    out.u = cts_dadd(x.u, y.u ^ 0x8000000000000000ull, 0);
+    return out.d;
+}
+"""
+
+
+FSPLIT_HELPERS = {
+    "frexpf": ("cts_frexpf", """
+static __device__ float cts_frexpf(float value, int* expo) {
+    union { float f; unsigned u; } in, out;
+    in.f = value;
+    out.u = cts_frexpf_bits(in.u, expo);
+    return out.f;
+}
+"""),
+    "ldexpf": ("cts_ldexpf", """
+static __device__ float cts_ldexpf(float value, int expo) {
+    union { float f; unsigned u; } in, out;
+    in.f = value;
+    out.u = cts_ldexpf_bits(in.u, expo);
+    return out.f;
+}
+"""),
+    "ilogbf": ("cts_ilogbf", """
+static __device__ int cts_ilogbf(float value) {
+    union { float f; unsigned u; } in;
+    in.f = value;
+    return cts_ilogbf_bits(in.u);
+}
+"""),
+    "modff": ("cts_modff", """
+static __device__ float cts_modff(float value, float* ipart) {
+    union { float f; unsigned u; } in, out, ip;
+    in.f = value;
+    out.u = cts_modff_bits(in.u, &ip.u);
+    *ipart = ip.f;
+    return out.f;
+}
+"""),
+    "fmodf": ("cts_fmodf", """
+static __device__ float cts_fmodf(float x, float y) {
+    union { float f; unsigned u; } a, b, out;
+    a.f = x;
+    b.f = y;
+    out.u = cts_fremf_bits(a.u, b.u, 0);
+    return out.f;
+}
+"""),
+    "remainderf": ("cts_remainderf", """
+static __device__ float cts_remainderf(float x, float y) {
+    union { float f; unsigned u; } a, b, out;
+    a.f = x;
+    b.f = y;
+    out.u = cts_fremf_bits(a.u, b.u, 1);
+    return out.f;
+}
+"""),
+    "fdimf": ("cts_fdimf", FSPLIT_FDIM),
+    "frexp": ("cts_frexp", """
+static __device__ double cts_frexp(double value, int* expo) {
+    union { double d; unsigned long long u; } in, out;
+    in.d = value;
+    out.u = cts_frexp_bits(in.u, expo);
+    return out.d;
+}
+"""),
+    "ldexp": ("cts_ldexp", """
+static __device__ double cts_ldexp(double value, int expo) {
+    union { double d; unsigned long long u; } in, out;
+    in.d = value;
+    out.u = cts_ldexp_bits(in.u, expo);
+    return out.d;
+}
+"""),
+    "ilogb": ("cts_ilogb", """
+static __device__ int cts_ilogb(double value) {
+    union { double d; unsigned long long u; } in;
+    in.d = value;
+    return cts_ilogb_bits(in.u);
+}
+"""),
+    "modf": ("cts_modf", """
+static __device__ double cts_modf(double value, double* ipart) {
+    union { double d; unsigned long long u; } in, out, ip;
+    in.d = value;
+    out.u = cts_modf_bits(in.u, &ip.u);
+    *ipart = ip.d;
+    return out.d;
+}
+"""),
+    "fmod": ("cts_fmod", """
+static __device__ double cts_fmod(double x, double y) {
+    union { double d; unsigned long long u; } a, b, out;
+    a.d = x;
+    b.d = y;
+    out.u = cts_drem_bits(a.u, b.u, 0);
+    return out.d;
+}
+"""),
+    "remainder": ("cts_remainder", """
+static __device__ double cts_remainder(double x, double y) {
+    union { double d; unsigned long long u; } a, b, out;
+    a.d = x;
+    b.d = y;
+    out.u = cts_drem_bits(a.u, b.u, 1);
+    return out.d;
+}
+"""),
+    "fdim": ("cts_fdim", FSPLIT_DDIM),
+}
+
+_FSPLIT_FLOAT_MAG = {"cts_frexpf", "cts_ldexpf", "cts_ilogbf", "cts_modff", "cts_fmodf", "cts_remainderf"}
+_FSPLIT_FLOAT_ENC = {"cts_ldexpf", "cts_modff", "cts_fmodf", "cts_remainderf"}
+_FSPLIT_DOUBLE_MAG = {"cts_frexp", "cts_ldexp", "cts_ilogb", "cts_modf", "cts_fmod", "cts_remainder"}
+_FSPLIT_DOUBLE_ENC = {"cts_ldexp", "cts_modf", "cts_fmod", "cts_remainder"}
+
+_FSPLIT_FLOAT_BITS = {
+    "cts_frexpf": FSPLIT_FREXPF,
+    "cts_ldexpf": FSPLIT_LDEXPF,
+    "cts_ilogbf": FSPLIT_ILOGBF,
+    "cts_modff": FSPLIT_MODFF,
+}
+_FSPLIT_DOUBLE_BITS = {
+    "cts_frexp": FSPLIT_FREXP,
+    "cts_ldexp": FSPLIT_LDEXP,
+    "cts_ilogb": FSPLIT_ILOGB,
+    "cts_modf": FSPLIT_MODF,
+}
+
+
+def fsplit_arity(spelling: str) -> int:
+    return 1 if spelling in ("ilogbf", "ilogb") else 2
+
+
+def _fsplit_add(blocks: list[str], already: str, text: str, marker: str) -> None:
+    if marker in already or any(marker in block for block in blocks):
+        return
+    blocks.append(text.strip("\n"))
+
+
+def fsplit_blocks(names: set[str], already: str) -> list[str]:
+    blocks: list[str] = []
+    if names & (_FSPLIT_FLOAT_MAG | _FSPLIT_DOUBLE_MAG):
+        _fsplit_add(blocks, already, FSPLIT_TOP, "static __device__ int cts_utop(")
+    if names & _FSPLIT_FLOAT_MAG:
+        _fsplit_add(blocks, already, FSPLIT_FMAG, "static __device__ int cts_fmag(")
+    if names & _FSPLIT_FLOAT_ENC:
+        _fsplit_add(blocks, already, FSPLIT_FENC, "static __device__ unsigned cts_fenc(")
+    for name, text in _FSPLIT_FLOAT_BITS.items():
+        if name in names:
+            marker = "static __device__ int cts_ilogbf_bits(" if name == "cts_ilogbf" else f"static __device__ unsigned {name}_bits("
+            _fsplit_add(blocks, already, text, marker)
+    if names & {"cts_fmodf", "cts_remainderf"}:
+        _fsplit_add(blocks, already, FSPLIT_FREMF, "static __device__ unsigned cts_fremf_bits(")
+    if names & _FSPLIT_DOUBLE_MAG:
+        _fsplit_add(blocks, already, FSPLIT_DMAG, "static __device__ int cts_dmag(")
+    if names & _FSPLIT_DOUBLE_ENC:
+        _fsplit_add(blocks, already, FSPLIT_DENC, "static __device__ unsigned long long cts_denc(")
+    for name, text in _FSPLIT_DOUBLE_BITS.items():
+        if name in names:
+            marker = "static __device__ int cts_ilogb_bits(" if name == "cts_ilogb" else f"static __device__ unsigned long long {name}_bits("
+            _fsplit_add(blocks, already, text, marker)
+    if names & {"cts_fmod", "cts_remainder"}:
+        _fsplit_add(blocks, already, FSPLIT_DREM, "static __device__ unsigned long long cts_drem_bits(")
+    if "cts_fdimf" in names:
+        _fsplit_add(blocks, already, FMIN_LESS, "static __device__ int cts_fless(")
+        _fsplit_add(blocks, already, FARITH_PACK, "static __device__ unsigned cts_fpack(")
+        _fsplit_add(blocks, already, FARITH_ADD, "static __device__ unsigned cts_fadd(")
+    if "cts_fdim" in names:
+        _fsplit_add(blocks, already, DMIN_LESS, "static __device__ int cts_dless(")
+        _fsplit_add(blocks, already, DARITH_PACK, "static __device__ unsigned long long cts_dpack(")
+        _fsplit_add(blocks, already, DARITH_ADD, "static __device__ unsigned long long cts_dadd(")
+    return blocks
 
 D2F_CORE = """
 static __device__ unsigned cts_d2f_pack(int sign, int exp, unsigned long long mag, int mode) {
