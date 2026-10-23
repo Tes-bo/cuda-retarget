@@ -1211,6 +1211,88 @@ __global__ void pick(double* d) { *d = fmod(*d, 2.0); }
             )
         self.assertEqual(translate_source(source, "maca"), source)
 
+    def test_hip_and_musa_lower_integer_rounding(self) -> None:
+        source = """\
+#include <cuda_runtime.h>
+__global__ void hold(float* f) {
+    float lrintf = *f;
+    *f = lrintf;
+}
+__global__ void pick(float* f, double* d) {
+    const char* label = "lrintf lroundf llrintf llroundf lrint lround llrint llround";
+    long n = lrintf(*f) + lroundf(*f);
+    long long w = llrintf(*f) + llroundf(*f);
+    n += lrint(*d) + lround(*d);
+    w += llrint(*d) + llround(*d);
+    *f += label[0] + n + w;
+}
+"""
+        for target in ("hip", "musa"):
+            translated = translate_source(source, target)
+            self.assertIn('"lrintf lroundf llrintf llroundf lrint lround llrint llround"', translated)
+            self.assertIn("float lrintf = *f;", translated)
+            self.assertIn("*f = lrintf;", translated)
+            self.assertIn("cts_lrintf(*f)", translated)
+            self.assertIn("cts_lroundf(*f)", translated)
+            self.assertIn("cts_llrintf(*f)", translated)
+            self.assertIn("cts_llroundf(*f)", translated)
+            self.assertIn("cts_lrint(*d)", translated)
+            self.assertIn("cts_lround(*d)", translated)
+            self.assertIn("cts_llrint(*d)", translated)
+            self.assertIn("cts_llround(*d)", translated)
+            self.assertIn("cts_f2ll(", translated)
+            self.assertIn("cts_d2ll(", translated)
+            self.assertNotIn("(lrintf(", translated)
+            self.assertNotIn("(lroundf(", translated)
+            self.assertNotIn("(llrintf(", translated)
+            self.assertNotIn("(llroundf(", translated)
+            self.assertNotIn("(lrint(", translated)
+            self.assertNotIn("(lround(", translated)
+            self.assertNotIn("(llrint(", translated)
+            self.assertNotIn("(llround(", translated)
+        float_only = """\
+#include <cuda_runtime.h>
+__global__ void pick(float* f) { long long n = llrintf(*f); *f = (float)n; }
+"""
+        hip = translate_source(float_only, "hip")
+        self.assertIn("cts_llrintf(*f)", hip)
+        self.assertIn("cts_f2ll(", hip)
+        self.assertNotIn("cts_d2ll(", hip)
+        self.assertNotIn("cts_lrintf(", hip)
+        self.assertNotIn("cts_lroundf(", hip)
+        double_only = """\
+#include <cuda_runtime.h>
+__global__ void pick(double* d) { long n = lround(*d); *d = (double)n; }
+"""
+        hip = translate_source(double_only, "hip")
+        self.assertIn("cts_lround(*d)", hip)
+        self.assertIn("cts_d2ll(", hip)
+        self.assertNotIn("cts_f2ll(", hip)
+        self.assertNotIn("cts_lroundf(", hip)
+        self.assertNotIn("cts_lrint(", hip)
+        defined = """\
+#include <cuda_runtime.h>
+#define lrintf(x) (x)
+__global__ void pick(float* f) { *f = lrintf(*f); }
+"""
+        hip = translate_source(defined, "hip")
+        self.assertIn("#define lrintf(x) (x)", hip)
+        self.assertIn("cts_lrintf(*f)", hip)
+        declared = """\
+#include <cuda_runtime.h>
+long lrintf(float x);
+__global__ void pick(float* f) { *f = (float)lrintf(*f); }
+"""
+        hip = translate_source(declared, "hip")
+        self.assertIn("long lrintf(float x);", hip)
+        self.assertIn("cts_lrintf(*f)", hip)
+        with self.assertRaises(TranslateError):
+            translate_source(
+                "#include <cuda_runtime.h>\n__global__ void pick(float* f) { *f = lrintf(*f, 1); }\n",
+                "hip",
+            )
+        self.assertEqual(translate_source(source, "maca"), source)
+
     def test_hip_and_musa_lower_double_rounding(self) -> None:
         source = """\
 #include <cuda_runtime.h>
@@ -2082,6 +2164,44 @@ class CorpusTests(unittest.TestCase):
         self.assertIn("(frexpf(", maca)
         self.assertIn("(remainder(", maca)
         self.assertNotIn("cts_frexpf", maca)
+
+    def test_hip_and_musa_lower_the_census_lround(self) -> None:
+        path = CENSUS / "lround" / "main.cu"
+        if not path.is_file():
+            self.skipTest("lround is not in the census corpus")
+        maca = translate_path(path, "maca")
+        for target in ("hip", "musa"):
+            translated = translate_path(path, target)
+            self.assertIn("cts_lrintf(fv(f + 0))", translated)
+            self.assertIn("cts_lroundf(fv(f + 0))", translated)
+            self.assertIn("cts_lroundf(fv(f + 1))", translated)
+            self.assertIn("cts_lrintf(fv(f + 2))", translated)
+            self.assertIn("cts_lroundf(fv(f + 2))", translated)
+            self.assertIn("cts_lroundf(fv(f + 3))", translated)
+            self.assertIn("cts_llrintf(fv(f + 2))", translated)
+            self.assertIn("cts_llroundf(fv(f + 2))", translated)
+            self.assertIn("cts_lrint(dv(d + 0))", translated)
+            self.assertIn("cts_lround(dv(d + 0))", translated)
+            self.assertIn("cts_lrint(dv(d + 1))", translated)
+            self.assertIn("cts_lrint(dv(d + 2))", translated)
+            self.assertIn("cts_lrint(dv(d + 3))", translated)
+            self.assertIn("cts_lrint(dv(d + 4))", translated)
+            self.assertIn("cts_llrint(dv(d + 2))", translated)
+            self.assertIn("cts_llround(dv(d + 3))", translated)
+            self.assertIn("cts_f2ll(", translated)
+            self.assertIn("cts_d2ll(", translated)
+            self.assertNotIn("= lrintf(", translated)
+            self.assertNotIn("= lroundf(", translated)
+            self.assertNotIn("= llrintf(", translated)
+            self.assertNotIn("= llroundf(", translated)
+            self.assertNotIn("= lrint(", translated)
+            self.assertNotIn("= lround(", translated)
+            self.assertNotIn("= llrint(", translated)
+            self.assertNotIn("= llround(", translated)
+        self.assertIn("lrintf(fv(f + 0))", maca)
+        self.assertIn("lround(dv(d + 0))", maca)
+        self.assertIn("llround(dv(d + 3))", maca)
+        self.assertNotIn("cts_lrintf", maca)
 
     def test_hip_and_musa_lower_the_census_fminmax(self) -> None:
         path = CENSUS / "fminmax" / "main.cu"
@@ -5116,6 +5236,137 @@ int main() {{
     return 0;
 }}
 """,
+        )
+
+    def test_integer_rounding_helpers_agree_with_the_intrinsics(self) -> None:
+        from cuda_retarget.dialect import LROUND_HELPERS, lround_blocks
+
+        names = {name for name, _helper in LROUND_HELPERS.values()}
+        blocks = lround_blocks(names, "")
+        blocks.extend(helper.strip("\n") for _name, helper in LROUND_HELPERS.values())
+        helpers = "\n\n".join(blocks)
+        tail = """\
+__device__ float fv(unsigned bits) {
+    volatile unsigned held = bits;
+    union { unsigned as_bits; float as_float; } v;
+    v.as_bits = held;
+    return v.as_float;
+}
+__device__ double dv(unsigned long long bits) {
+    volatile unsigned long long held = bits;
+    union { unsigned long long as_bits; double as_double; } v;
+    v.as_bits = held;
+    return v.as_double;
+}
+__device__ void mark(int* bad, unsigned long long* first, unsigned long long bits) {
+    atomicAdd(bad, 1);
+    atomicCAS(first, 0ull, bits ? bits : 1ull);
+}
+__device__ void checkf(unsigned bits, int* bad, unsigned long long* first) {
+    float x = fv(bits);
+    if ((long long)lrintf(x) != (long long)cts_lrintf(x)) mark(bad, first, bits);
+    if ((long long)lroundf(x) != (long long)cts_lroundf(x)) mark(bad, first, bits | (1ull << 32));
+    if (llrintf(x) != cts_llrintf(x)) mark(bad, first, bits | (2ull << 32));
+    if (llroundf(x) != cts_llroundf(x)) mark(bad, first, bits | (3ull << 32));
+}
+__device__ void checkd(unsigned long long bits, int* bad, unsigned long long* first) {
+    double x = dv(bits);
+    if ((long long)lrint(x) != (long long)cts_lrint(x)) mark(bad, first, bits);
+    if ((long long)lround(x) != (long long)cts_lround(x)) mark(bad, first, bits ^ 0x1000000000000000ull);
+    if (llrint(x) != cts_llrint(x)) mark(bad, first, bits ^ 0x2000000000000000ull);
+    if (llround(x) != cts_llround(x)) mark(bad, first, bits ^ 0x3000000000000000ull);
+}
+__global__ void edges(int* bad, unsigned long long* first) {
+    unsigned fbits[16] = {
+        0u, 0x80000000u, 1u, 0x3f000000u, 0xbf000000u, 0x3f000001u, 0x3fc00000u, 0x40200000u,
+        0xc0200000u, 0x40600000u, 0x4f000000u, 0xcf000000u, 0x5effffffu, 0x5f000000u, 0x7f800000u, 0x7fc00001u
+    };
+    for (int i = 0; i < 16; ++i) checkf(fbits[i], bad, first);
+    checkf(0xdf000000u, bad, first);
+    checkf(0xdf000001u, bad, first);
+    checkf(0x5f000001u, bad, first);
+    checkf(0x7f7fffffu, bad, first);
+    checkf(0xff7fffffu, bad, first);
+    checkf(0x7f800001u, bad, first);
+    checkf(0xffc00005u, bad, first);
+    checkf(0x4effffffu, bad, first);
+    checkf(0xceffffffu, bad, first);
+    checkf(0xdeffffffu, bad, first);
+    unsigned long long dbits[16] = {
+        0ull, 0x8000000000000000ull, 1ull, 0x3fe0000000000000ull, 0xbfe0000000000000ull,
+        0x4004000000000000ull, 0xc004000000000000ull, 0x4320000000000001ull, 0xc320000000000001ull,
+        0x432fffffffffffffull, 0xc32fffffffffffffull, 0x4330000000000000ull, 0x4330000000000001ull,
+        0x4340000000000000ull, 0x43d0000000000000ull, 0x43dfffffffffffffull
+    };
+    for (int i = 0; i < 16; ++i) checkd(dbits[i], bad, first);
+    checkd(0xc3dfffffffffffffull, bad, first);
+    checkd(0x43e0000000000000ull, bad, first);
+    checkd(0xc3e0000000000000ull, bad, first);
+    checkd(0x43f0000000000000ull, bad, first);
+    checkd(0xc3f0000000000000ull, bad, first);
+    checkd(0x7ff0000000000000ull, bad, first);
+    checkd(0xfff0000000000000ull, bad, first);
+    checkd(0x7fefffffffffffffull, bad, first);
+    checkd(0xffefffffffffffffull, bad, first);
+    checkd(0x7ff8000000000001ull, bad, first);
+    checkd(0x7ff0000000000001ull, bad, first);
+    checkd(0xfff8000000000005ull, bad, first);
+}
+__global__ void sweepf(int* bad, unsigned long long* first) {
+    unsigned exp = blockIdx.x;
+    for (unsigned frac = threadIdx.x; frac < (1u << 23); frac += blockDim.x) {
+        checkf((exp << 23) | frac, bad, first);
+        checkf(0x80000000u | (exp << 23) | frac, bad, first);
+    }
+}
+__global__ void sweepd(int* bad, unsigned long long* first) {
+    unsigned exp = blockIdx.x;
+    unsigned long long fracs[6];
+    int n = 0;
+    fracs[n++] = 0ull;
+    fracs[n++] = 1ull;
+    fracs[n++] = (1ull << 52) - 1ull;
+    if (exp > 0u && exp < 0x7ffu) {
+        int unbiased = (int)exp - 1023;
+        if (unbiased >= 0 && unbiased < 52) {
+            unsigned shift = (unsigned)(52 - unbiased);
+            unsigned long long half = 1ull << (shift - 1u);
+            fracs[n++] = half;
+            if (half > 0ull) fracs[n++] = half - 1ull;
+            fracs[n++] = half + 1ull;
+        }
+    }
+    for (int k = 0; k < n; ++k) {
+        unsigned long long bits = ((unsigned long long)exp << 52) | fracs[k];
+        checkd(bits, bad, first);
+        checkd(0x8000000000000000ull | bits, bad, first);
+    }
+}
+int main() {
+    int* bad = nullptr;
+    unsigned long long* first = nullptr;
+    if (cudaMalloc(&bad, sizeof(*bad)) != cudaSuccess) return 2;
+    if (cudaMalloc(&first, sizeof(*first)) != cudaSuccess) return 2;
+    if (cudaMemset(bad, 0, sizeof(*bad)) != cudaSuccess) return 2;
+    if (cudaMemset(first, 0, sizeof(*first)) != cudaSuccess) return 2;
+    edges<<<1, 1>>>(bad, first);
+    sweepd<<<2048, 1>>>(bad, first);
+    sweepf<<<256, 256>>>(bad, first);
+    if (cudaDeviceSynchronize() != cudaSuccess) return 3;
+    int mismatch = 0;
+    unsigned long long seen = 0;
+    if (cudaMemcpy(&mismatch, bad, sizeof(mismatch), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
+    if (cudaMemcpy(&seen, first, sizeof(seen), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
+    std::printf("mismatch=%d\\n", mismatch);
+    if (mismatch) std::printf("first=%llu\\n", seen);
+    cudaFree(bad);
+    cudaFree(first);
+    return 0;
+}
+"""
+        self._nvcc_mismatch(
+            "lround",
+            "#include <cstdio>\n#include <cuda_runtime.h>\n" + helpers + "\n" + tail,
         )
 
 

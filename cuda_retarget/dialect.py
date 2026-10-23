@@ -402,6 +402,12 @@ class Dialect:
     `-1` while `fmodf(7, 2)` is `1`. `fdimf` of two infinities with the
     same sign is `+0`. A float NaN becomes `0x7fffffff`. A double NaN
     keeps its sign and payload. `fmod(1, 0)` is the negative quiet NaN.
+    `lower_lround` replaces `lrint`, `lround`, `llrint`, and `llround`,
+    and the float forms. `long` and `long long` are both 64 bits, so each
+    pair shares one conversion. `lrintf(0.5)` is `0` and `lroundf(0.5)` is
+    `1`. `lrintf(2.5)` is `2` and `lroundf(2.5)` is `3`. `lrintf` of `2^31`
+    is `2147483648`. A NaN is `LLONG_MIN`. `2^63` saturates to `LLONG_MAX`,
+    and `-2^63` is `LLONG_MIN`.
     """
 
     name: str
@@ -437,6 +443,7 @@ class Dialect:
     lower_ptx: bool
     lower_fround: bool
     lower_fsplit: bool
+    lower_lround: bool
 
 
 DIALECTS = {
@@ -474,6 +481,7 @@ DIALECTS = {
         lower_ptx=True,
         lower_fround=True,
         lower_fsplit=True,
+        lower_lround=True,
     ),
     "musa": Dialect(
         name="musa",
@@ -509,6 +517,7 @@ DIALECTS = {
         lower_ptx=True,
         lower_fround=True,
         lower_fsplit=True,
+        lower_lround=True,
     ),
     "maca": Dialect(
         name="maca",
@@ -544,6 +553,7 @@ DIALECTS = {
         lower_ptx=False,
         lower_fround=False,
         lower_fsplit=False,
+        lower_lround=False,
     ),
 }
 
@@ -2319,6 +2329,135 @@ def fsplit_blocks(names: set[str], already: str) -> list[str]:
         _fsplit_add(blocks, already, DARITH_PACK, "static __device__ unsigned long long cts_dpack(")
         _fsplit_add(blocks, already, DARITH_ADD, "static __device__ unsigned long long cts_dadd(")
     return blocks
+
+# lrint, lround, llrint, and llround. Measured on sm_70. long and long long
+# are both 64 bits, so each pair shares one conversion. A NaN is LLONG_MIN.
+# A magnitude of 2^63 or more saturates to LLONG_MAX, and -2^63 is
+# LLONG_MIN. lrint ties to even. lround steps a tie away from zero.
+LROUND_F2LL = """
+static __device__ long long cts_f2ll(unsigned bits, int away) {
+    unsigned sign = bits >> 31;
+    unsigned exp = (bits >> 23) & 0xffu;
+    unsigned frac = bits & 0x7fffffu;
+    const long long kmin = (long long)0x8000000000000000ull;
+    const long long kmax = 9223372036854775807ll;
+    if (exp == 0xffu) {
+        if (frac != 0u) return kmin;
+        return sign ? kmin : kmax;
+    }
+    int small = 0;
+    int kind = 0;
+    if (exp == 0u || exp < 127u) {
+        small = 1;
+        if (exp != 0u) {
+            int unbiased = (int)exp - 127;
+            if (unbiased == -1 && frac == 0u) kind = 1;
+            else if (unbiased == -1) kind = 2;
+        }
+    }
+    if (small) {
+        int mag = away ? (kind == 0 ? 0 : 1) : (kind == 2 ? 1 : 0);
+        if (mag == 0) return 0;
+        return sign ? -1ll : 1ll;
+    }
+    int unbiased = (int)exp - 127;
+    if (unbiased >= 63) return sign ? kmin : kmax;
+    if (unbiased >= 23) {
+        unsigned long long sig = (1ull << 23) | frac;
+        unsigned long long mag = sig << (unsigned)(unbiased - 23);
+        return sign ? -(long long)mag : (long long)mag;
+    }
+    unsigned long long sig = (1ull << 23) | frac;
+    unsigned shift = (unsigned)(23 - unbiased);
+    unsigned long long dropped = sig & ((1ull << shift) - 1ull);
+    unsigned long long half = 1ull << (shift - 1u);
+    unsigned long long base = sig >> shift;
+    if (dropped == 0ull) return sign ? -(long long)base : (long long)base;
+    int up = away ? (dropped >= half) : (dropped > half || (dropped == half && (base & 1ull)));
+    unsigned long long mag = base + (unsigned long long)up;
+    return sign ? -(long long)mag : (long long)mag;
+}
+"""
+
+LROUND_D2LL = """
+static __device__ long long cts_d2ll(unsigned long long bits, int away) {
+    unsigned sign = (unsigned)(bits >> 63);
+    unsigned exp = (unsigned)((bits >> 52) & 0x7ffull);
+    unsigned long long frac = bits & ((1ull << 52) - 1ull);
+    const long long kmin = (long long)0x8000000000000000ull;
+    const long long kmax = 9223372036854775807ll;
+    if (exp == 0x7ffu) {
+        if (frac != 0ull) return kmin;
+        return sign ? kmin : kmax;
+    }
+    int small = 0;
+    int kind = 0;
+    if (exp == 0u || exp < 1023u) {
+        small = 1;
+        if (exp != 0u) {
+            int unbiased = (int)exp - 1023;
+            if (unbiased == -1 && frac == 0ull) kind = 1;
+            else if (unbiased == -1) kind = 2;
+        }
+    }
+    if (small) {
+        int mag = away ? (kind == 0 ? 0 : 1) : (kind == 2 ? 1 : 0);
+        if (mag == 0) return 0;
+        return sign ? -1ll : 1ll;
+    }
+    int unbiased = (int)exp - 1023;
+    if (unbiased >= 63) return sign ? kmin : kmax;
+    if (unbiased >= 52) {
+        unsigned long long sig = (1ull << 52) | frac;
+        unsigned long long mag = sig << (unsigned)(unbiased - 52);
+        return sign ? -(long long)mag : (long long)mag;
+    }
+    unsigned long long sig = (1ull << 52) | frac;
+    unsigned shift = (unsigned)(52 - unbiased);
+    unsigned long long dropped = sig & ((1ull << shift) - 1ull);
+    unsigned long long half = 1ull << (shift - 1u);
+    unsigned long long base = sig >> shift;
+    if (dropped == 0ull) return sign ? -(long long)base : (long long)base;
+    int up = away ? (dropped >= half) : (dropped > half || (dropped == half && (base & 1ull)));
+    unsigned long long mag = base + (unsigned long long)up;
+    return sign ? -(long long)mag : (long long)mag;
+}
+"""
+
+
+def _lround_fn(name: str, ctype: str, core: str, away: int, bits: str, ret: str) -> str:
+    return f"""
+static __device__ {ret} {name}({ctype} value) {{
+    union {{ {ctype} f; {bits} u; }} in;
+    in.f = value;
+    return ({ret}){core}(in.u, {away});
+}}
+"""
+
+
+LROUND_HELPERS = {
+    "lrintf": ("cts_lrintf", _lround_fn("cts_lrintf", "float", "cts_f2ll", 0, "unsigned", "long")),
+    "lroundf": ("cts_lroundf", _lround_fn("cts_lroundf", "float", "cts_f2ll", 1, "unsigned", "long")),
+    "llrintf": ("cts_llrintf", _lround_fn("cts_llrintf", "float", "cts_f2ll", 0, "unsigned", "long long")),
+    "llroundf": ("cts_llroundf", _lround_fn("cts_llroundf", "float", "cts_f2ll", 1, "unsigned", "long long")),
+    "lrint": ("cts_lrint", _lround_fn("cts_lrint", "double", "cts_d2ll", 0, "unsigned long long", "long")),
+    "lround": ("cts_lround", _lround_fn("cts_lround", "double", "cts_d2ll", 1, "unsigned long long", "long")),
+    "llrint": ("cts_llrint", _lround_fn("cts_llrint", "double", "cts_d2ll", 0, "unsigned long long", "long long")),
+    "llround": ("cts_llround", _lround_fn("cts_llround", "double", "cts_d2ll", 1, "unsigned long long", "long long")),
+}
+
+_LROUND_FLOAT = {"cts_lrintf", "cts_lroundf", "cts_llrintf", "cts_llroundf"}
+_LROUND_DOUBLE = {"cts_lrint", "cts_lround", "cts_llrint", "cts_llround"}
+
+
+def lround_blocks(names: set[str], already: str) -> list[str]:
+    blocks: list[str] = []
+    if names & _LROUND_FLOAT and "static __device__ long long cts_f2ll(" not in already:
+        blocks.append(LROUND_F2LL.strip("\n"))
+    if names & _LROUND_DOUBLE and "static __device__ long long cts_d2ll(" not in already:
+        blocks.append(LROUND_D2LL.strip("\n"))
+    return blocks
+
 
 D2F_CORE = """
 static __device__ unsigned cts_d2f_pack(int sign, int exp, unsigned long long mag, int mode) {
