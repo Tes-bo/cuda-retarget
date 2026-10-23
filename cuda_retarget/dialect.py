@@ -408,6 +408,11 @@ class Dialect:
     `1`. `lrintf(2.5)` is `2` and `lroundf(2.5)` is `3`. `lrintf` of `2^31`
     is `2147483648`. A NaN is `LLONG_MIN`. `2^63` saturates to `LLONG_MAX`,
     and `-2^63` is `LLONG_MIN`.
+    `lower_hypot` replaces `hypotf`, `norm3df`, and `norm4df`. The largest
+    magnitude is scaled, the squares are summed with an fma, and the root
+    is `sqrt` rounded to nearest. An infinity wins over a NaN. Any other
+    NaN becomes the canonical quiet NaN. `hypotf` of `2^64` with itself
+    stays finite.
     """
 
     name: str
@@ -444,6 +449,7 @@ class Dialect:
     lower_fround: bool
     lower_fsplit: bool
     lower_lround: bool
+    lower_hypot: bool
 
 
 DIALECTS = {
@@ -482,6 +488,7 @@ DIALECTS = {
         lower_fround=True,
         lower_fsplit=True,
         lower_lround=True,
+        lower_hypot=True,
     ),
     "musa": Dialect(
         name="musa",
@@ -518,6 +525,7 @@ DIALECTS = {
         lower_fround=True,
         lower_fsplit=True,
         lower_lround=True,
+        lower_hypot=True,
     ),
     "maca": Dialect(
         name="maca",
@@ -554,6 +562,7 @@ DIALECTS = {
         lower_fround=False,
         lower_fsplit=False,
         lower_lround=False,
+        lower_hypot=False,
     ),
 }
 
@@ -2456,6 +2465,191 @@ def lround_blocks(names: set[str], already: str) -> list[str]:
         blocks.append(LROUND_F2LL.strip("\n"))
     if names & _LROUND_DOUBLE and "static __device__ long long cts_d2ll(" not in already:
         blocks.append(LROUND_D2LL.strip("\n"))
+    return blocks
+
+
+# hypotf, norm3df, and norm4df. nvcc scales the largest magnitude, squares
+# with an fma, and takes sqrt.rn. An infinity wins over a NaN. Any other
+# NaN becomes the canonical quiet NaN. hypotf(2^64, 2^64) stays finite.
+HYPOT_NAN = """
+static __device__ int cts_fnan(unsigned x) {
+    return ((x >> 23) & 0xffu) == 255u && (x & 0x7fffffu) != 0u;
+}
+"""
+
+HYPOT_MINMAX = """
+static __device__ unsigned cts_minf(unsigned a, unsigned b) {
+    if (cts_fnan(a)) return b;
+    if (cts_fnan(b)) return a;
+    return a < b ? a : b;
+}
+\nstatic __device__ unsigned cts_maxf(unsigned a, unsigned b) {
+    if (cts_fnan(a)) return b;
+    if (cts_fnan(b)) return a;
+    return a > b ? a : b;
+}
+"""
+
+HYPOT_BITS = """
+static __device__ unsigned cts_scale_sqrt2(unsigned lo, unsigned hi) {
+    unsigned mask = hi & 0xFE000000u;
+    unsigned scale = 0x7E800000u - mask;
+    unsigned s_lo = cts_fmul(lo, scale, 0);
+    unsigned s_hi = cts_fmul(hi, scale, 0);
+    unsigned sq = cts_fmul(s_lo, s_lo, 0);
+    unsigned sum = cts_ffma(s_hi, s_hi, sq, 0);
+    unsigned root = cts_fsqrt(sum, 0);
+    return cts_fmul(root, mask | 0x00800000u, 0);
+}
+\nstatic __device__ unsigned cts_hypotf_bits(unsigned a, unsigned b) {
+    unsigned aa = a & 0x7fffffffu;
+    unsigned bb = b & 0x7fffffffu;
+    unsigned lo = bb, hi = aa;
+    if ((int)aa < (int)bb) { lo = aa; hi = bb; }
+    unsigned result = cts_scale_sqrt2(lo, hi);
+    if (lo == 0x7f800000u) return 0x7f800000u;
+    if (cts_fnan(aa) || cts_fnan(bb)) return 0x7fffffffu;
+    if (lo == 0u) return hi;
+    return result;
+}
+"""
+
+NORM3_BITS = """
+static __device__ unsigned cts_norm3_bits(unsigned a, unsigned b, unsigned c) {
+    unsigned x = a & 0x7fffffffu, y = b & 0x7fffffffu, z = c & 0x7fffffffu;
+    unsigned sum = cts_fadd(cts_fadd(x, y, 0), z, 0);
+    unsigned mn = cts_minf(x, y);
+    unsigned mx = cts_maxf(x, y);
+    unsigned mid = cts_minf(mx, z);
+    unsigned largest = cts_maxf(mx, z);
+    unsigned mask = largest & 0xFE000000u;
+    unsigned scale = 0x7E800000u - mask;
+    unsigned sm = cts_fmul(mid, scale, 0);
+    unsigned sl = cts_fmul(mn, scale, 0);
+    unsigned sh = cts_fmul(largest, scale, 0);
+    unsigned sq = cts_fmul(sm, sm, 0);
+    unsigned acc = cts_ffma(sl, sl, sq, 0);
+    acc = cts_ffma(sh, sh, acc, 0);
+    unsigned scaled = cts_fmul(cts_fsqrt(acc, 0), mask | 0x00800000u, 0);
+    int gt = !cts_fnan(sum) && !cts_fnan(largest) && sum > largest;
+    unsigned result = gt ? scaled : sum;
+    if (largest == 0x7f800000u) result = 0x7f800000u;
+    return result;
+}
+"""
+
+NORM4_BITS = """
+static __device__ unsigned cts_norm4_bits(unsigned a, unsigned b, unsigned c, unsigned d) {
+    unsigned x = a & 0x7fffffffu, y = b & 0x7fffffffu, z = c & 0x7fffffffu, w = d & 0x7fffffffu;
+    unsigned sum = cts_fadd(z, cts_fadd(cts_fadd(x, y, 0), w, 0), 0);
+    unsigned mn = cts_minf(x, y);
+    unsigned mx = cts_maxf(x, y);
+    unsigned mid = cts_minf(mx, z);
+    unsigned top3 = cts_maxf(mx, z);
+    unsigned mid4 = cts_minf(top3, w);
+    unsigned largest = cts_maxf(top3, w);
+    unsigned mask = largest & 0xFE000000u;
+    unsigned scale = 0x7E800000u - mask;
+    unsigned s0 = cts_fmul(mid4, scale, 0);
+    unsigned s1 = cts_fmul(mid, scale, 0);
+    unsigned s2 = cts_fmul(mn, scale, 0);
+    unsigned s3 = cts_fmul(largest, scale, 0);
+    unsigned acc = cts_fmul(s0, s0, 0);
+    acc = cts_ffma(s1, s1, acc, 0);
+    acc = cts_ffma(s2, s2, acc, 0);
+    acc = cts_ffma(s3, s3, acc, 0);
+    unsigned scaled = cts_fmul(cts_fsqrt(acc, 0), mask | 0x00800000u, 0);
+    int gt = !cts_fnan(sum) && !cts_fnan(largest) && sum > largest;
+    unsigned result = gt ? scaled : sum;
+    if (largest == 0x7f800000u) result = 0x7f800000u;
+    return result;
+}
+"""
+
+
+HYPOT_HELPERS = {
+    "hypotf": (
+        "cts_hypotf",
+        """
+static __device__ float cts_hypotf(float x, float y) {
+    union { float f; unsigned u; } a, b, out;
+    a.f = x;
+    b.f = y;
+    out.u = cts_hypotf_bits(a.u, b.u);
+    return out.f;
+}
+""",
+    ),
+    "norm3df": (
+        "cts_norm3df",
+        """
+static __device__ float cts_norm3df(float x, float y, float z) {
+    union { float f; unsigned u; } a, b, c, out;
+    a.f = x;
+    b.f = y;
+    c.f = z;
+    out.u = cts_norm3_bits(a.u, b.u, c.u);
+    return out.f;
+}
+""",
+    ),
+    "norm4df": (
+        "cts_norm4df",
+        """
+static __device__ float cts_norm4df(float x, float y, float z, float w) {
+    union { float f; unsigned u; } a, b, c, d, out;
+    a.f = x;
+    b.f = y;
+    c.f = z;
+    d.f = w;
+    out.u = cts_norm4_bits(a.u, b.u, c.u, d.u);
+    return out.f;
+}
+""",
+    ),
+}
+
+_HYPOT_NAMES = {"cts_hypotf"}
+_NORM3_NAMES = {"cts_norm3df"}
+_NORM4_NAMES = {"cts_norm4df"}
+
+
+def hypot_arity(name: str) -> int:
+    if name == "norm4df":
+        return 4
+    if name == "norm3df":
+        return 3
+    return 2
+
+
+def hypot_blocks(names: set[str], already: str) -> list[str]:
+    blocks: list[str] = []
+    joined = already
+
+    def add(text: str, marker: str) -> None:
+        nonlocal joined
+        if marker not in joined:
+            piece = text.strip("\n")
+            blocks.append(piece)
+            joined += "\n" + piece
+
+    if names & (_HYPOT_NAMES | _NORM3_NAMES | _NORM4_NAMES):
+        add(FARITH_PACK, "static __device__ unsigned cts_fpack(")
+        add(FARITH_ADD, "static __device__ unsigned cts_fadd(")
+        add(FARITH_MUL, "static __device__ unsigned cts_fmul(")
+        add(FARITH_FMA, "static __device__ unsigned cts_ffma(")
+        add(FDIV_ROUND, "static __device__ unsigned cts_fround(")
+        add(FDIV_ISQRT, "static __device__ unsigned long long cts_isqrt(")
+        add(FDIV_SQRT, "static __device__ unsigned cts_fsqrt(")
+        add(HYPOT_NAN, "static __device__ int cts_fnan(")
+    if names & _HYPOT_NAMES:
+        add(HYPOT_BITS, "static __device__ unsigned cts_scale_sqrt2(")
+    if names & (_NORM3_NAMES | _NORM4_NAMES):
+        add(HYPOT_MINMAX, "static __device__ unsigned cts_minf(")
+    if names & _NORM3_NAMES:
+        add(NORM3_BITS, "static __device__ unsigned cts_norm3_bits(")
+    if names & _NORM4_NAMES:
+        add(NORM4_BITS, "static __device__ unsigned cts_norm4_bits(")
     return blocks
 
 

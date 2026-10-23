@@ -1293,6 +1293,75 @@ __global__ void pick(float* f) { *f = (float)lrintf(*f); }
             )
         self.assertEqual(translate_source(source, "maca"), source)
 
+    def test_hip_and_musa_lower_hypot(self) -> None:
+        source = """\
+#include <cuda_runtime.h>
+__global__ void hold(float* f) {
+    float hypotf = *f;
+    *f = hypotf;
+}
+__global__ void pick(float* f) {
+    const char* label = "hypotf norm3df norm4df";
+    *f = hypotf(*f, *f);
+    *f = norm3df(*f, *f, *f);
+    *f = norm4df(*f, *f, *f, *f);
+    *f += label[0];
+}
+"""
+        for target in ("hip", "musa"):
+            translated = translate_source(source, target)
+            self.assertIn('"hypotf norm3df norm4df"', translated)
+            self.assertIn("float hypotf = *f;", translated)
+            self.assertIn("*f = hypotf;", translated)
+            self.assertIn("cts_hypotf(*f, *f)", translated)
+            self.assertIn("cts_norm3df(*f, *f, *f)", translated)
+            self.assertIn("cts_norm4df(*f, *f, *f, *f)", translated)
+            self.assertIn("cts_fsqrt(", translated)
+            self.assertIn("cts_ffma(", translated)
+            self.assertNotIn("(hypotf(", translated)
+            self.assertNotIn("(norm3df(", translated)
+            self.assertNotIn("(norm4df(", translated)
+        only = """\
+#include <cuda_runtime.h>
+__global__ void pick(float* f) { *f = hypotf(*f, 1.0f); }
+"""
+        hip = translate_source(only, "hip")
+        self.assertIn("cts_hypotf(*f, 1.0f)", hip)
+        self.assertIn("cts_hypotf_bits(", hip)
+        self.assertNotIn("cts_norm3_bits(", hip)
+        self.assertNotIn("cts_norm4_bits(", hip)
+        self.assertNotIn("cts_minf(", hip)
+        norm_only = """\
+#include <cuda_runtime.h>
+__global__ void pick(float* f) { *f = norm4df(*f, *f, *f, *f); }
+"""
+        hip = translate_source(norm_only, "hip")
+        self.assertIn("cts_norm4_bits(", hip)
+        self.assertNotIn("cts_hypotf_bits(", hip)
+        self.assertNotIn("cts_norm3_bits(", hip)
+        defined = """\
+#include <cuda_runtime.h>
+#define hypotf(x, y) (x)
+__global__ void pick(float* f) { *f = hypotf(*f, *f); }
+"""
+        hip = translate_source(defined, "hip")
+        self.assertIn("#define hypotf(x, y) (x)", hip)
+        self.assertIn("cts_hypotf(*f, *f)", hip)
+        declared = """\
+#include <cuda_runtime.h>
+float hypotf(float x, float y);
+__global__ void pick(float* f) { *f = hypotf(*f, *f); }
+"""
+        hip = translate_source(declared, "hip")
+        self.assertIn("float hypotf(float x, float y);", hip)
+        self.assertIn("cts_hypotf(*f, *f)", hip)
+        with self.assertRaises(TranslateError):
+            translate_source(
+                "#include <cuda_runtime.h>\n__global__ void pick(float* f) { *f = norm3df(*f, *f); }\n",
+                "hip",
+            )
+        self.assertEqual(translate_source(source, "maca"), source)
+
     def test_hip_and_musa_lower_double_rounding(self) -> None:
         source = """\
 #include <cuda_runtime.h>
@@ -2202,6 +2271,31 @@ class CorpusTests(unittest.TestCase):
         self.assertIn("lround(dv(d + 0))", maca)
         self.assertIn("llround(dv(d + 3))", maca)
         self.assertNotIn("cts_lrintf", maca)
+
+    def test_hip_and_musa_lower_the_census_hypot(self) -> None:
+        path = CENSUS / "hypot" / "main.cu"
+        if not path.is_file():
+            self.skipTest("hypot is not in the census corpus")
+        maca = translate_path(path, "maca")
+        for target in ("hip", "musa"):
+            translated = translate_path(path, target)
+            self.assertIn("cts_hypotf(inf, nan)", translated)
+            self.assertIn("cts_hypotf(nan, nan)", translated)
+            self.assertIn("cts_hypotf(m0, m0)", translated)
+            self.assertIn("cts_hypotf(big, big)", translated)
+            self.assertIn("sqrtf(big * big + big * big)", translated)
+            self.assertIn("cts_hypotf(m1, zero)", translated)
+            self.assertIn("cts_hypotf(one, one)", translated)
+            self.assertIn("cts_norm3df(inf, nan, nan)", translated)
+            self.assertIn("cts_norm4df(big, big, big, big)", translated)
+            self.assertIn("cts_norm3df(one, one, one)", translated)
+            self.assertIn("cts_fsqrt(", translated)
+            self.assertNotIn("fb(hypotf(", translated)
+            self.assertNotIn("fb(norm3df(", translated)
+            self.assertNotIn("fb(norm4df(", translated)
+        self.assertIn("hypotf(inf, nan)", maca)
+        self.assertIn("norm4df(big, big, big, big)", maca)
+        self.assertNotIn("cts_hypotf", maca)
 
     def test_hip_and_musa_lower_the_census_fminmax(self) -> None:
         path = CENSUS / "fminmax" / "main.cu"
@@ -5366,6 +5460,81 @@ int main() {
 """
         self._nvcc_mismatch(
             "lround",
+            "#include <cstdio>\n#include <cuda_runtime.h>\n" + helpers + "\n" + tail,
+        )
+
+    def test_hypot_helpers_agree_with_the_intrinsics(self) -> None:
+        from cuda_retarget.dialect import HYPOT_HELPERS, hypot_blocks
+
+        names = {name for name, _helper in HYPOT_HELPERS.values()}
+        blocks = hypot_blocks(names, "")
+        blocks.extend(helper.strip("\n") for _name, helper in HYPOT_HELPERS.values())
+        helpers = "\n\n".join(blocks)
+        tail = """\
+__device__ float fv(unsigned bits) {
+    volatile unsigned held = bits;
+    union { unsigned as_bits; float as_float; } v;
+    v.as_bits = held;
+    return v.as_float;
+}
+__device__ unsigned fb(float x) {
+    union { float as_float; unsigned as_bits; } v;
+    v.as_float = x;
+    return v.as_bits;
+}
+__device__ void mark(int* bad, unsigned long long* first, unsigned long long bits) {
+    atomicAdd(bad, 1);
+    atomicCAS(first, 0ull, bits ? bits : 1ull);
+}
+__global__ void edges(int* bad, unsigned long long* first) {
+    unsigned vals[8] = {0u, 0x80000000u, 1u, 0x7f800000u, 0xff800000u, 0x7fc00001u, 0x5f800000u, 0x7f7fffffu};
+    for (int i = 0; i < 8; ++i) for (int j = 0; j < 8; ++j) {
+        if (fb(hypotf(fv(vals[i]), fv(vals[j]))) != fb(cts_hypotf(fv(vals[i]), fv(vals[j]))))
+            mark(bad, first, vals[i] | ((unsigned long long)vals[j] << 32));
+        for (int k = 0; k < 8; ++k) {
+            if (fb(norm3df(fv(vals[i]), fv(vals[j]), fv(vals[k]))) != fb(cts_norm3df(fv(vals[i]), fv(vals[j]), fv(vals[k]))))
+                mark(bad, first, (2ull << 56) | vals[i]);
+        }
+    }
+}
+__global__ void sweep(int* bad, unsigned long long* first) {
+    unsigned fr[2] = {0u, 0x7fffffu};
+    unsigned ea = blockIdx.x;
+    for (unsigned eb = threadIdx.x; eb < 256u; eb += blockDim.x) {
+        for (int i = 0; i < 2; ++i) for (int j = 0; j < 2; ++j) {
+            unsigned a = (ea << 23) | fr[i];
+            unsigned b = (eb << 23) | fr[j];
+            unsigned c = (((ea * 3u + eb) & 255u) << 23) | fr[i];
+            float x = fv(a), y = fv(b), z = fv(c);
+            if (fb(hypotf(x, y)) != fb(cts_hypotf(x, y))) mark(bad, first, a | ((unsigned long long)b << 32));
+            if (fb(norm3df(x, y, z)) != fb(cts_norm3df(x, y, z))) mark(bad, first, (2ull << 56) | a);
+            if (fb(norm4df(x, y, z, x)) != fb(cts_norm4df(x, y, z, x))) mark(bad, first, (3ull << 56) | a);
+        }
+    }
+}
+int main() {
+    int* bad = nullptr;
+    unsigned long long* first = nullptr;
+    if (cudaMalloc(&bad, sizeof(*bad)) != cudaSuccess) return 2;
+    if (cudaMalloc(&first, sizeof(*first)) != cudaSuccess) return 2;
+    if (cudaMemset(bad, 0, sizeof(*bad)) != cudaSuccess) return 2;
+    if (cudaMemset(first, 0, sizeof(*first)) != cudaSuccess) return 2;
+    edges<<<1, 1>>>(bad, first);
+    sweep<<<256, 256>>>(bad, first);
+    if (cudaDeviceSynchronize() != cudaSuccess) return 3;
+    int mismatch = 0;
+    unsigned long long seen = 0;
+    if (cudaMemcpy(&mismatch, bad, sizeof(mismatch), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
+    if (cudaMemcpy(&seen, first, sizeof(seen), cudaMemcpyDeviceToHost) != cudaSuccess) return 4;
+    std::printf("mismatch=%d\\n", mismatch);
+    if (mismatch) std::printf("first=%llu\\n", seen);
+    cudaFree(bad);
+    cudaFree(first);
+    return 0;
+}
+"""
+        self._nvcc_mismatch(
+            "hypot",
             "#include <cstdio>\n#include <cuda_runtime.h>\n" + helpers + "\n" + tail,
         )
 

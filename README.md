@@ -64,7 +64,7 @@ Comments and string literals stay. A name inside a `#define` is rewritten at the
 | `musa` | the same rule with the `musa` prefix | `musa_runtime.h` | unchanged | lowered |
 | `maca` | unchanged | `cuda_runtime.h` | unchanged | unchanged |
 
-The helpers are bitcasts and double hi/lo words, funnel shifts, `__dp4a`, packed add/sub/min/max/abs, `__byte_perm`, averages, high-half products, absolute differences, packed absolute-difference sums, comparison masks, lane predicates, packed averages, bit scans, 24-bit products, rounding conversions, double-to-float rounding, float-to-half rounding, integer and double conversions into half, half-to-integer conversions, half add, multiply, fused multiply-add, packed half2 arithmetic, half comparisons, `__saturatef`, directed float add, sub, mul, and fused multiply-add, directed double add, sub, mul, and fused multiply-add, directed float division, reciprocal, square root, and reciprocal square root, and `fmin`/`fmax`, `nextafter`, and `copysign`, and `floor`, `ceil`, `trunc`, `rint`, `nearbyint`, and `round`, and `frexp`, `ilogb`, `modf`, `ldexp`, `fmod`, `remainder`, and `fdim`, and `lrint`, `lround`, `llrint`, and `llround`.
+The helpers are bitcasts and double hi/lo words, funnel shifts, `__dp4a`, packed add/sub/min/max/abs, `__byte_perm`, averages, high-half products, absolute differences, packed absolute-difference sums, comparison masks, lane predicates, packed averages, bit scans, 24-bit products, rounding conversions, double-to-float rounding, float-to-half rounding, integer and double conversions into half, half-to-integer conversions, half add, multiply, fused multiply-add, packed half2 arithmetic, half comparisons, `__saturatef`, directed float add, sub, mul, and fused multiply-add, directed double add, sub, mul, and fused multiply-add, directed float division, reciprocal, square root, and reciprocal square root, and `fmin`/`fmax`, `nextafter`, and `copysign`, and `floor`, `ceil`, `trunc`, `rint`, `nearbyint`, and `round`, and `frexp`, `ilogb`, `modf`, `ldexp`, `fmod`, `remainder`, and `fdim`, and `lrint`, `lround`, `llrint`, and `llround`, and `hypotf`, `norm3df`, and `norm4df`.
 
 Inserted helpers are `static __device__` and sit after the last `#include`.
 
@@ -181,6 +181,10 @@ These are the results a prefix swap gets wrong. HIP and MUSA both get the helper
 | a float NaN passed to `lrintf` | `LLONG_MIN` |
 | `lrint` of `2^51 + 0.5` / `lround` of it | `2251799813685248` / `2251799813685249` |
 | `lrint` of `2^63` / `-2^63` | `LLONG_MAX` / `LLONG_MIN` |
+| `hypotf(+inf, NaN)` | `+inf`. A finite NaN argument becomes the canonical quiet NaN |
+| `hypotf(2^64, 2^64)` | `1605698803`. The square of `2^64` overflows before a square root |
+| `norm4df` of four `2^64` values | `2^65` |
+| `norm3df(+inf, NaN, NaN)` | `+inf` |
 
 Signed lane `0x8000` and unsigned lane `0x8000` are different numbers in the packed comparisons, min/max, and absolute differences.
 
@@ -194,6 +198,7 @@ A later vendor compile may reject these, or give them a different meaning:
 - A 3-argument shuffle, a match call, or a vote call whose mask is not the literal `0xffffffff` (`u`, `l`, `ll`, or `ull`). A variable mask is still CUDA's width 32 on NVIDIA and the wavefront width on AMD. This rewriter does not guess which mask the programmer meant.
 - `lane & 31` and any other width arithmetic.
 - The 5-argument CUDA Graph instantiate call. It is renamed, and its arguments stay. The `0` there is a buffer size, not flags.
+- `hypot`, `rhypot`, `norm3d`, and `norm4d`, and the reciprocal forms `rhypotf`, `rnorm3df`, and `rnorm4df`. nvcc lowers those with `rsqrt.approx`.
 
 ## Run
 
