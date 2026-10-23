@@ -418,6 +418,10 @@ class Dialect:
     integer quotient, then applies the sign of `x / y`. `remquof(15, 2)`
     has quotient `8`, so the stored value is `0`. An invalid pair writes
     the quotient as `0`.
+    `lower_scale` replaces `logb`, `scalbn`, and `scalbln`, and the float
+    forms. `logb` returns the exponent as a floating-point value. Zero
+    becomes `-inf` and an infinity becomes `+inf`. `scalbln` takes a
+    64-bit exponent. `scalblnf(1, 2^31)` is `+inf`.
     """
 
     name: str
@@ -456,6 +460,7 @@ class Dialect:
     lower_lround: bool
     lower_hypot: bool
     lower_remquo: bool
+    lower_scale: bool
 
 
 DIALECTS = {
@@ -496,6 +501,7 @@ DIALECTS = {
         lower_lround=True,
         lower_hypot=True,
         lower_remquo=True,
+        lower_scale=True,
     ),
     "musa": Dialect(
         name="musa",
@@ -534,6 +540,7 @@ DIALECTS = {
         lower_lround=True,
         lower_hypot=True,
         lower_remquo=True,
+        lower_scale=True,
     ),
     "maca": Dialect(
         name="maca",
@@ -572,6 +579,7 @@ DIALECTS = {
         lower_lround=False,
         lower_hypot=False,
         lower_remquo=False,
+        lower_scale=False,
     ),
 }
 
@@ -2483,6 +2491,150 @@ def remquo_blocks(names: set[str], already: str) -> list[str]:
         add(FSPLIT_DMAG, "static __device__ int cts_dmag(")
         add(FSPLIT_DENC, "static __device__ unsigned long long cts_denc(")
         add(REMQUO_DBITS, "static __device__ unsigned long long cts_dremquo_bits(")
+    return blocks
+
+
+# logb, scalbn, and scalbln, and the float forms. Measured on sm_70.
+# logb returns the unbiased exponent as a float or a double. Zero is
+# -inf and an infinity is +inf. A float NaN is canonical. A double NaN
+# keeps its sign and payload, and a signaling NaN is quieted. scalbn
+# matches ldexp. scalbln takes a 64-bit exponent and saturates it.
+SCALE_LOGF = """
+static __device__ unsigned cts_logbf_bits(unsigned bits) {
+    unsigned sign; unsigned long long sig; long long scale;
+    int kind = cts_fmag(bits, &sign, &sig, &scale);
+    if (kind == 3) return 0x7fffffffu;
+    if (kind == 1) return 0xff800000u;
+    if (kind == 2) return 0x7f800000u;
+    int expo = cts_utop(sig) + (int)scale;
+    if (expo == 0) return 0u;
+    unsigned esign = expo < 0 ? 1u : 0u;
+    unsigned long long mag = expo < 0 ? (unsigned long long)(-expo) : (unsigned long long)expo;
+    return cts_fenc(esign, mag, 0);
+}
+"""
+
+SCALE_LOGD = """
+static __device__ unsigned long long cts_logb_bits(unsigned long long bits) {
+    unsigned sign; unsigned long long sig; long long scale;
+    int kind = cts_dmag(bits, &sign, &sig, &scale);
+    if (kind == 3) return bits | (1ull << 51);
+    if (kind == 1) return 0xfff0000000000000ull;
+    if (kind == 2) return 0x7ff0000000000000ull;
+    int expo = cts_utop(sig) + (int)scale;
+    if (expo == 0) return 0ull;
+    unsigned esign = expo < 0 ? 1u : 0u;
+    unsigned long long mag = expo < 0 ? (unsigned long long)(-expo) : (unsigned long long)expo;
+    return cts_denc(esign, mag, 0);
+}
+"""
+
+SCALE_FSCALE = """
+static __device__ unsigned cts_fscale_bits(unsigned bits, long long expo) {
+    unsigned sign; unsigned long long sig; long long scale;
+    int kind = cts_fmag(bits, &sign, &sig, &scale);
+    if (kind == 3) return 0x7fffffffu;
+    if (kind != 0) return bits;
+    if (expo > 4096) return (sign << 31) | 0x7f800000u;
+    if (expo < -4096) return sign << 31;
+    return cts_fenc(sign, sig, scale + expo);
+}
+"""
+
+SCALE_DSCALE = """
+static __device__ unsigned long long cts_dscale_bits(unsigned long long bits, long long expo) {
+    unsigned sign; unsigned long long sig; long long scale;
+    int kind = cts_dmag(bits, &sign, &sig, &scale);
+    if (kind == 3) return bits | (1ull << 51);
+    if (kind != 0) return bits;
+    if (expo > 4096) return ((unsigned long long)sign << 63) | 0x7ff0000000000000ull;
+    if (expo < -4096) return (unsigned long long)sign << 63;
+    return cts_denc(sign, sig, scale + expo);
+}
+"""
+
+SCALE_HELPERS = {
+    "logbf": ("cts_logbf", """
+static __device__ float cts_logbf(float value) {
+    union { float f; unsigned u; } in, out;
+    in.f = value;
+    out.u = cts_logbf_bits(in.u);
+    return out.f;
+}
+"""),
+    "logb": ("cts_logb", """
+static __device__ double cts_logb(double value) {
+    union { double d; unsigned long long u; } in, out;
+    in.d = value;
+    out.u = cts_logb_bits(in.u);
+    return out.d;
+}
+"""),
+    "scalbnf": ("cts_scalbnf", """
+static __device__ float cts_scalbnf(float value, int expo) {
+    union { float f; unsigned u; } in, out;
+    in.f = value;
+    out.u = cts_fscale_bits(in.u, expo);
+    return out.f;
+}
+"""),
+    "scalbn": ("cts_scalbn", """
+static __device__ double cts_scalbn(double value, int expo) {
+    union { double d; unsigned long long u; } in, out;
+    in.d = value;
+    out.u = cts_dscale_bits(in.u, expo);
+    return out.d;
+}
+"""),
+    "scalblnf": ("cts_scalblnf", """
+static __device__ float cts_scalblnf(float value, long expo) {
+    union { float f; unsigned u; } in, out;
+    in.f = value;
+    out.u = cts_fscale_bits(in.u, expo);
+    return out.f;
+}
+"""),
+    "scalbln": ("cts_scalbln", """
+static __device__ double cts_scalbln(double value, long expo) {
+    union { double d; unsigned long long u; } in, out;
+    in.d = value;
+    out.u = cts_dscale_bits(in.u, expo);
+    return out.d;
+}
+"""),
+}
+
+
+def scale_arity(spelling: str) -> int:
+    return 1 if spelling in ("logbf", "logb") else 2
+
+
+def scale_blocks(names: set[str], already: str) -> list[str]:
+    blocks: list[str] = []
+
+    def add(text: str, marker: str) -> None:
+        if marker in already or any(marker in block for block in blocks):
+            return
+        blocks.append(text.strip("\n"))
+
+    float_names = {"cts_logbf", "cts_scalbnf", "cts_scalblnf"}
+    double_names = {"cts_logb", "cts_scalbn", "cts_scalbln"}
+    if names & (float_names | double_names):
+        add(FSPLIT_TOP, "static __device__ int cts_utop(")
+    if names & float_names:
+        add(FSPLIT_FMAG, "static __device__ int cts_fmag(")
+        add(FSPLIT_FENC, "static __device__ unsigned cts_fenc(")
+    if "cts_logbf" in names:
+        add(SCALE_LOGF, "static __device__ unsigned cts_logbf_bits(")
+    if names & {"cts_scalbnf", "cts_scalblnf"}:
+        add(SCALE_FSCALE, "static __device__ unsigned cts_fscale_bits(")
+    if names & double_names:
+        add(FSPLIT_DMAG, "static __device__ int cts_dmag(")
+        add(FSPLIT_DENC, "static __device__ unsigned long long cts_denc(")
+    if "cts_logb" in names:
+        add(SCALE_LOGD, "static __device__ unsigned long long cts_logb_bits(")
+    if names & {"cts_scalbn", "cts_scalbln"}:
+        add(SCALE_DSCALE, "static __device__ unsigned long long cts_dscale_bits(")
     return blocks
 
 

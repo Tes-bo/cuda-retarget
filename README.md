@@ -64,7 +64,7 @@ Comments and string literals stay. A name inside a `#define` is rewritten at the
 | `musa` | the same rule with the `musa` prefix | `musa_runtime.h` | unchanged | lowered |
 | `maca` | unchanged | `cuda_runtime.h` | unchanged | unchanged |
 
-The helpers are bitcasts and double hi/lo words, funnel shifts, `__dp4a`, packed add/sub/min/max/abs, `__byte_perm`, averages, high-half products, absolute differences, packed absolute-difference sums, comparison masks, lane predicates, packed averages, bit scans, 24-bit products, rounding conversions, double-to-float rounding, float-to-half rounding, integer and double conversions into half, half-to-integer conversions, half add, multiply, fused multiply-add, packed half2 arithmetic, half comparisons, `__saturatef`, directed float add, sub, mul, and fused multiply-add, directed double add, sub, mul, and fused multiply-add, directed float division, reciprocal, square root, and reciprocal square root, and `fmin`/`fmax`, `nextafter`, and `copysign`, and `floor`, `ceil`, `trunc`, `rint`, `nearbyint`, and `round`, and `frexp`, `ilogb`, `modf`, `ldexp`, `fmod`, `remainder`, and `fdim`, and `lrint`, `lround`, `llrint`, and `llround`, and `hypotf`, `norm3df`, and `norm4df`, and `remquo` and `remquof`.
+The helpers are bitcasts and double hi/lo words, funnel shifts, `__dp4a`, packed add/sub/min/max/abs, `__byte_perm`, averages, high-half products, absolute differences, packed absolute-difference sums, comparison masks, lane predicates, packed averages, bit scans, 24-bit products, rounding conversions, double-to-float rounding, float-to-half rounding, integer and double conversions into half, half-to-integer conversions, half add, multiply, fused multiply-add, packed half2 arithmetic, half comparisons, `__saturatef`, directed float add, sub, mul, and fused multiply-add, directed double add, sub, mul, and fused multiply-add, directed float division, reciprocal, square root, and reciprocal square root, and `fmin`/`fmax`, `nextafter`, and `copysign`, and `floor`, `ceil`, `trunc`, `rint`, `nearbyint`, and `round`, and `frexp`, `ilogb`, `modf`, `ldexp`, `fmod`, `remainder`, and `fdim`, and `lrint`, `lround`, `llrint`, and `llround`, and `hypotf`, `norm3df`, and `norm4df`, and `remquo` and `remquof`, and `logb`, `scalbn`, and `scalbln`.
 
 Inserted helpers are `static __device__` and sit after the last `#include`.
 
@@ -191,6 +191,14 @@ These are the results a prefix swap gets wrong. HIP and MUSA both get the helper
 | `remquof(2^23 + 1, 2)` | remainder `1`, quotient `0` |
 | an invalid `remquof` | the canonical quiet NaN, and the quotient is written as `0` |
 | `remquo(1, 0)` | the negative quiet NaN `18444492273895866368`, quotient `0` |
+| `logbf(0)` and `logbf(-0)` | `-inf`, bits `4286578688` |
+| `logbf(+inf)` and `logbf(-inf)` | `+inf` |
+| `logbf` of the smallest subnormal | `-149`, bits `3272933376` |
+| a float NaN passed to `logbf` | the canonical quiet NaN `2147483647` |
+| `scalbnf(-0, 4)` | `-0` |
+| `scalbnf(0.5, -126)` | `2^-127`, bits `4194304` |
+| `scalblnf(1, 2^31)` | `+inf`. The exponent is a 64-bit `long` |
+| a signaling double NaN passed to `logb` | the same payload, quieted, `9221120237041090561` |
 
 Signed lane `0x8000` and unsigned lane `0x8000` are different numbers in the packed comparisons, min/max, and absolute differences.
 
